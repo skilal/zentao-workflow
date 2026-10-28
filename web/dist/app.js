@@ -246,8 +246,10 @@ function WorkflowApp() {
           h(React.Fragment, null,
             snapshot.blockers?.length > 0 && h(Alert, { type: "warning", showIcon: true, message: "有待补充的需求资料", description: h("div", null, snapshot.blockers.map((text, index) => h("div", { key: index }, text))), style: { marginBottom: 20 } }),
             snapshot.sources.map((source, index) => h("div", { className: "source-block", key: `${source.kind}:${source.id}` },
-              h("div", { className: "source-heading" }, index > 0 && h(Tag, null, "关联资料"), h("strong", null, source.title), h(Typography.Text, { type: "secondary" }, `${TYPE_NAMES[source.kind]} #${source.id}`)),
-              h("pre", { className: "description-text" }, plainDescription(source.content) || "该工作项没有有效描述，请在计划前补充目标和验收标准。"))),
+              h("div", { className: "source-heading" }, index > 0 && h(Tag, null, "关联资料"), h("strong", null, source.title), h(Typography.Text, { type: "secondary" }, `${TYPE_NAMES[source.kind]} #${source.id}`),
+                source.version != null && h(Tag, null, `关联版本 ${source.version}`)),
+              source.note && h(Typography.Text, { type: "secondary" }, source.note),
+              h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")))),
             h("div", { className: "attachment-grid" }, snapshot.materials.map(material => {
               const url = `/api/material?session=${encodeURIComponent(state.id)}&file_id=${material.file_id}`;
               return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),

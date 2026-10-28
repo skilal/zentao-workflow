@@ -193,7 +193,12 @@ class ZentaoClient:
         primary = self.detail(item["kind"], item["id"])
         related = []
         story_id = identifier(primary.get("story"))
-        if item["kind"] != "story" and story_id:
+        if item["kind"] == "task" and story_id:
+            related.append({"kind": "story", "origin": "task", "version": primary.get("storyVersion"),
+                            "data": {"id": story_id, "title": primary.get("storyTitle", ""),
+                                     "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
+                                     "files": primary.get("storyFiles", [])}})
+        elif item["kind"] != "story" and story_id:
             related.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
         from_bug = identifier(primary.get("fromBug"))
         if item["kind"] == "task" and from_bug:
@@ -208,10 +213,14 @@ class ZentaoClient:
                 if data.get(key):
                     parsed = parse_description(data[key])
                     parsers.append(parsed)
-                    content.append(f"【{key}】\n{parsed.text()}")
-            sources.append({"kind": document["kind"], "id": data["id"],
-                            "title": data.get("title", data.get("name", "")),
-                            "content": "\n\n".join(content), "raw": data})
+                    if item["kind"] != "task" or parsed.text() or parsed.images:
+                        content.append(f"【{key}】\n{parsed.text()}")
+            source = {"kind": document["kind"], "id": data["id"],
+                      "title": data.get("title", data.get("name", "")),
+                      "content": "\n\n".join(content), "raw": data}
+            if document.get("origin") == "task":
+                source.update(origin="task", version=document["version"], note="来自任务详情的关联需求资料")
+            sources.append(source)
             image_urls = {unescape(url) for parser in parsers for url in parser.images}
             links = {unescape(url) for parser in parsers for url in parser.links}
             feishu.extend(sorted(url for url in links if urlparse(url).hostname and
