@@ -193,14 +193,14 @@ class ZentaoClient:
         primary = self.detail(item["kind"], item["id"])
         related = []
         story_id = identifier(primary.get("story"))
-        if item["kind"] == "task" and story_id:
+        from_bug = identifier(primary.get("fromBug"))
+        if item["kind"] == "task" and not from_bug and story_id:
             related.append({"kind": "story", "origin": "task", "version": primary.get("storyVersion"),
                             "data": {"id": story_id, "title": primary.get("storyTitle", ""),
                                      "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
                                      "files": primary.get("storyFiles", [])}})
         elif item["kind"] != "story" and story_id:
             related.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
-        from_bug = identifier(primary.get("fromBug"))
         if item["kind"] == "task" and from_bug:
             related.append({"kind": "bug", "data": self.detail("bug", from_bug, require_assignee=False)})
         materials, sources, blockers, feishu = [], [], [], []

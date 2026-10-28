@@ -143,13 +143,54 @@ class TaskCollectionChecks(TestCase):
         self.assertEqual([call.args[0] for call in request.call_args_list], ["api.php/v1/bugs/1", "api.php/v1/stories/2"])
         self.assertEqual(len(snapshot["sources"]), 2)
 
-    def test_task_source_bug_still_loads_bug_detail(self):
+    def test_task_source_bug_preserves_related_story_and_materials(self):
         self.task["fromBug"] = 7
+        self.task["bugSteps"] = "示例步骤"
+        for key in ("storySpec", "storyVerify", "storyFiles"):
+            self.task.pop(key)
+        story = {"id": 2872, "title": "需求接口标题", "version": 2,
+                 "spec": '范围包含边界值<img src="/index.php?m=file&amp;f=read&amp;t=png&amp;fileID=100">',
+                 "verify": "空范围不增加筛选条件",
+                 "files": {"99": {"id": 99, "extension": "txt", "title": "验收说明"}}}
+        bug = {"id": 7, "title": "来源 Bug", "steps": "示例步骤"}
+        responses = [self.task, story, bug, ("脱敏验收说明".encode(), "text/plain"), (b"simulated image", "image/png")]
+        with patch.object(self.client, "_fetch", side_effect=responses) as request:
+            snapshot = self.client.collect(self.item, self.directory)
+        self.assertEqual([call.args[0] for call in request.call_args_list],
+                         ["api.php/v1/tasks/4228", "api.php/v1/stories/2872", "api.php/v1/bugs/7",
+                          "api.php/v1/files/99", "api.php/v1/files/100"])
+        related = snapshot["sources"][1]
+        self.assertEqual(related["title"], "需求接口标题")
+        self.assertIn("范围包含边界值", related["content"])
+        self.assertIn("空范围不增加筛选条件", related["content"])
+        self.assertNotIn("origin", related)
+        self.assertNotIn("version", related)
+        self.assertNotIn("note", related)
+        self.assertEqual(snapshot["sources"][-1]["kind"], "bug")
+        self.assertEqual(snapshot["blockers"], [])
+        self.assertEqual(snapshot["materials"][0]["text"], "脱敏验收说明")
+        self.assertTrue(snapshot["materials"][1]["image"])
+        self.assertTrue(all(Path(material["path"]).is_file() for material in snapshot["materials"]))
+
+    def test_task_source_bug_without_story_only_loads_bug(self):
+        self.task.update(fromBug=7, story=0)
+        for key in ("storySpec", "storyVerify", "storyFiles"):
+            self.task.pop(key)
         bug = {"id": 7, "title": "来源 Bug", "steps": "示例步骤"}
         with patch.object(self.client, "_fetch", side_effect=[self.task, bug]) as request:
             snapshot = self.client.collect(self.item, self.directory)
         self.assertEqual([call.args[0] for call in request.call_args_list], ["api.php/v1/tasks/4228", "api.php/v1/bugs/7"])
-        self.assertEqual(snapshot["sources"][-1]["kind"], "bug")
+        self.assertEqual([source["kind"] for source in snapshot["sources"]], ["task", "bug"])
+
+    def test_task_source_bug_story_failure_stops_collection(self):
+        self.task["fromBug"] = 7
+        for key in ("storySpec", "storyVerify", "storyFiles"):
+            self.task.pop(key)
+        with patch.object(self.client, "_fetch", side_effect=[self.task, WorkflowError("模拟关联需求不可读")]) as request:
+            with self.assertRaisesRegex(WorkflowError, "模拟关联需求不可读"):
+                self.client.collect(self.item, self.directory)
+        self.assertEqual([call.args[0] for call in request.call_args_list],
+                         ["api.php/v1/tasks/4228", "api.php/v1/stories/2872"])
 
     def test_public_snapshot_preserves_metadata_and_old_snapshots(self):
         with patch.object(self.client, "_fetch", return_value=self.task):
