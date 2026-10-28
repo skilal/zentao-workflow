@@ -1,0 +1,29 @@
+{
+  "zentao": {
+    "base_url": "http://127.0.0.1:8000",
+    "account": "请填写禅道账号",
+    "timeout_seconds": 20,
+    "page_size": 50,
+    "max_attachment_mb": 20,
+    "excluded_statuses": ["closed", "cancel", "cancelled", "done"]
+  },
+  "repositories": [
+    {"name": "服务端", "path": "D:/projects/server"},
+    {"name": "前端", "path": "D:/projects/web"}
+  ],
+  "codex": {
+    "command": ["codex.cmd", "app-server"],
+    "model": "",
+    "reasoning_effort": "high",
+    "rpc_timeout_seconds": 90
+  },
+  "review": {
+    "prompt_file": "prompts/review.md",
+    "max_fix_rounds": 3
+  },
+  "feishu_enabled": false,
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8765
+  }
+}

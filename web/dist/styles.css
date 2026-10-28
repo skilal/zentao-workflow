@@ -1,0 +1,78 @@
+:root { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; color: #1f2329; background: #f4f6f9; font-synthesis: none; }
+body { margin: 0; }
+button, input, textarea { font: inherit; }
+.initial-loading { padding: 72px; color: #667085; }
+.app-layout { min-height: 100vh; }
+.app-sider { position: fixed !important; inset: 0 auto 0 0; z-index: 20; border-right: 1px solid #edf0f4; background: #fff !important; }
+.brand { display: flex; align-items: center; gap: 10px; height: 80px; padding: 0 22px; border-bottom: 1px solid #f0f0f0; }
+.brand-mark { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 8px; background: #1b8fff; color: white; font-size: 22px; font-weight: 600; }
+.brand-title { font-size: 16px; font-weight: 600; letter-spacing: .3px; }
+.brand-subtitle { margin-top: 3px; font-size: 11px; color: #8a94a6; letter-spacing: 1px; }
+.navigation { padding: 18px 10px; border: 0 !important; }
+.navigation .ant-menu-item { height: 44px; line-height: 44px; margin-bottom: 7px; }
+.nav-icon { display: inline-flex; align-items: center; width: 18px; font-size: 17px; color: #728098; }
+.sider-foot { position: absolute; bottom: 22px; left: 22px; right: 20px; border-top: 1px solid #edf0f4; padding-top: 17px; color: #687386; font-size: 12px; }
+.sider-foot strong { display: block; margin-bottom: 7px; color: #3f4b5d; font-size: 13px; font-weight: 500; }
+.main-layout { margin-left: 214px; min-width: 0; }
+.app-header { display: flex; align-items: center; justify-content: space-between; height: 64px; padding: 0 28px; background: #fff; border-bottom: 1px solid #edf0f4; }
+.header-section { display: flex; align-items: center; gap: 16px; }
+.header-caption { color: #98a2b3; font-size: 13px; }
+.page-content { padding: 24px 28px 18px; }
+.page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 19px; }
+.page-heading h1 { margin: 0 0 7px; font-size: 23px; font-weight: 600; letter-spacing: -.4px; }
+.page-subtitle { color: #7a8597; font-size: 13px; line-height: 1.7; }
+.workflow-strip { margin-bottom: 22px; border-color: #e9edf3; }
+.workflow-strip .ant-card-body { padding: 18px 22px; }
+.workflow-strip-top { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.current-item { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #48556a; }
+.card-stack { display: flex; flex-direction: column; gap: 18px; }
+.app-card { border-color: #e7ebf1; box-shadow: 0 2px 5px #25385803; }
+.app-card .ant-card-head { min-height: 54px; }
+.table-tools { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
+.table-title { color: #25354b; font-weight: 500; line-height: 1.7; }
+.item-row { cursor: pointer; }
+.data-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 17px; border-top: 1px solid #f0f2f5; margin-top: 14px; }
+.muted { color: #8a94a6; font-size: 12px; }
+.number-text { font-variant-numeric: tabular-nums; }
+.description-text, .plain-plan { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.9; color: #425066; }
+.source-block + .source-block { margin-top: 22px; padding-top: 20px; border-top: 1px solid #edf0f5; }
+.source-heading { margin-bottom: 12px; display: flex; align-items: center; gap: 7px; }
+.attachment-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-top: 16px; }
+.attachment { border: 1px solid #e9edf2; border-radius: 6px; padding: 10px; min-width: 0; }
+.attachment .ant-image { width: 100%; height: 144px; display: flex; align-items: center; justify-content: center; overflow: hidden; background: #f6f8fb; border-radius: 4px; }
+.attachment .ant-image img { width: 100%; height: 144px; object-fit: contain; }
+.attachment-name { margin-top: 9px; overflow-wrap: anywhere; font-size: 12px; }
+.repository-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.repository-card .ant-card-head-title { display: flex; align-items: center; gap: 8px; }
+.repo-path { display: block; color: #8a94a6; margin-bottom: 20px; overflow-wrap: anywhere; font-size: 12px; }
+.field-label { display: block; font-weight: 500; color: #48556a; margin: 15px 0 9px; font-size: 13px; }
+.full-width { width: 100%; }
+.action-bar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+.conversation-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, .8fr); gap: 18px; align-items: start; }
+.conversation-feed { max-height: 490px; min-height: 280px; overflow: auto; padding-right: 5px; }
+.chat-entry { margin-bottom: 20px; }
+.chat-meta { display: flex; gap: 9px; align-items: center; color: #8a94a6; font-size: 11px; margin-bottom: 7px; }
+.chat-body { background: #f6f8fb; border: 1px solid #eef1f5; border-radius: 0 8px 8px; padding: 12px 15px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.9; color: #3d4b61; }
+.chat-entry.user .chat-body { background: #eef7ff; border-color: #dfedfc; }
+.chat-entry.system .chat-body { background: white; color: #8791a1; border-style: dashed; }
+.stream-indicator { color: #1b8fff; font-size: 11px; margin-bottom: 8px; }
+.question { padding: 14px 16px; background: #f7fbff; border: 1px solid #dceeff; border-radius: 6px; margin-bottom: 13px; }
+.question-title { color: #31425b; font-weight: 500; margin-bottom: 12px; line-height: 1.7; }
+.question-options { display: flex; flex-direction: column; gap: 11px; margin-bottom: 12px; }
+.option-note { color: #8a94a6; font-size: 12px; margin-top: 4px; margin-left: 23px; font-weight: 400; }
+.plan-panel { max-height: 545px; overflow: auto; }
+.plan-version { font-size: 11px; color: #98a2b3; margin: 12px 0; overflow-wrap: anywhere; }
+.review-summary { display: flex; gap: 15px; align-items: flex-start; }
+.review-number { min-width: 58px; padding-right: 16px; border-right: 1px solid #e8edf3; color: #1b8fff; font-size: 34px; line-height: 1.1; font-weight: 600; }
+.review-number span { display: block; margin-top: 7px; font-weight: 400; font-size: 11px; color: #8a94a6; }
+.review-copy { color: #59667b; line-height: 1.9; }
+.finding-details { display: grid; gap: 12px; padding: 4px 10px; }
+.finding-details strong { display: block; font-size: 12px; color: #7e8a9d; margin-bottom: 4px; font-weight: 500; }
+.finding-details p { margin: 0; line-height: 1.8; white-space: pre-wrap; }
+.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 22px; }
+.diff-text { padding: 16px; border-radius: 6px; background: #f7f9fc; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.8 Consolas, "Microsoft YaHei", monospace; }
+.page-footer { color: #a1a9b7; text-align: center; font-size: 11px; padding: 20px 0 8px; }
+.offline-banner { margin-bottom: 16px; }
+.empty-area { padding: 24px 0; }
+@media (max-width: 1100px) { .conversation-grid, .repository-grid { grid-template-columns: 1fr; } .app-header { padding: 0 18px; } .page-content { padding: 20px 18px; } }
+@media (max-width: 750px) { .app-sider { width: 156px !important; min-width: 156px !important; max-width: 156px !important; } .main-layout { margin-left: 156px; } .brand { padding: 0 12px; gap: 7px; } .brand-title { font-size: 13px; } .brand-mark { width: 30px; height: 30px; } .brand-subtitle, .header-caption { display: none; } .sider-foot { left: 14px; right: 14px; } .page-heading h1 { font-size: 20px; } .settings-grid { grid-template-columns: 1fr; } .workflow-strip .ant-steps-item-description { display: none; } .data-foot { align-items: flex-start; flex-direction: column; } }
