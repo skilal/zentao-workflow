@@ -15,6 +15,14 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def session_title(state):
+    if state.get("custom_title"):
+        return state["custom_title"]
+    names = {"story": "需求", "task": "任务", "bug": "Bug"}
+    return "；".join(f"{names[item['kind']]} #{item['id']} · {item['title']}"
+                    for item in state.get("items", [state["item"]]))
+
+
 class SessionStore:
     def __init__(self):
         self.root = LOCAL / "sessions"
@@ -24,7 +32,7 @@ class SessionStore:
     def new(self, item):
         session_id = f"{item['kind']}-{item['id']}-{uuid4().hex[:10]}"
         state = {
-            "id": session_id, "item": item, "items": [item], "stage": "资料已读取", "phase": "plan",
+            "id": session_id, "item": item, "items": [item], "custom_title": "", "stage": "资料已读取", "phase": "plan",
             "created_at": timestamp(), "updated_at": timestamp(), "repos": [],
             "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
             "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],

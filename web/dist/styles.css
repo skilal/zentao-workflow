@@ -131,6 +131,7 @@ button, input, textarea { font: inherit; }
 .session-entry:hover, .session-entry:focus-visible { background: #f6f8fb; }
 .session-entry.selected { background: #eef7ff; box-shadow: inset 3px 0 rgb(27, 143, 255); }
 .session-entry-body { width: 100%; min-width: 0; }
+.session-entry-custom-title { margin-bottom: 4px; color: #25354b; font-weight: 600; font-size: 14px; line-height: 1.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-entry-title { color: #25354b; font-weight: 500; font-size: 13px; line-height: 1.7; }
 .session-entry-title > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-entry-status { margin: 9px 0 5px; display: flex; align-items: center; gap: 6px; }

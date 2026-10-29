@@ -17,7 +17,7 @@ from uuid import uuid4
 from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
-from workflow.store import timestamp
+from workflow.store import session_title, timestamp
 from workflow.engine import ACTIVE
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
@@ -53,7 +53,7 @@ def public_state(state):
 
 def history_summary(state):
     return {**{key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")},
-            "project": session_project(state)}
+            "project": session_project(state), "title": session_title(state)}
 
 
 class WebApplication:
@@ -98,6 +98,7 @@ class WebApplication:
 
     def session_payload(self, runtime):
         state = public_state(runtime.engine.state)
+        state["title"] = session_title(runtime.engine.state)
         state["project"] = session_project(state)
         state["project_move_reason"] = project_move_error(runtime)
         state["can_move_project"] = not state["project_move_reason"]
@@ -174,6 +175,33 @@ class WebApplication:
     def session(self, session_id):
         with self.lock:
             return self.session_payload(self.sessions.get(session_id))
+
+    def rename_session(self, request):
+        session_id, title, request_id = request.get("session_id"), request.get("title"), request.get("request_id")
+        if (not isinstance(session_id, str) or not isinstance(title, str) or not title.strip()
+                or not isinstance(request_id, str) or not 8 <= len(request_id) <= 100):
+            raise WorkflowError("请选择会话并填写非空的会话标题及请求标识。")
+        key = ("session_title", session_id, request_id)
+        with self.condition:
+            if self.closed:
+                raise WorkflowError("服务正在关闭。")
+            if key in self.requests:
+                return {**self.requests[key], "duplicate": True}
+            runtime = self.sessions.get(session_id)
+            if runtime.engine.closed or runtime.engine.state.get("cleanup"):
+                raise WorkflowError("会话已进入清理阶段，不能修改标题。")
+            # 与后台保存共用存储锁，保留执行器正在使用的状态对象，只更新标题元数据。
+            with runtime.engine.store.lock:
+                state = deepcopy(runtime.engine.state)
+                state["custom_title"] = title.strip()
+                runtime.engine.store.save(state)
+                runtime.engine.state.update(custom_title=state["custom_title"], updated_at=state["updated_at"])
+            self.emit(session_id, "state", runtime.engine.state)
+            result = self.session_payload(runtime)
+            self.requests[key] = result
+            while len(self.requests) > 512:
+                self.requests.popitem(last=False)
+            return result
 
     def projects(self):
         return self.project_partitions.list(self.settings["zentao"]["base_url"].rstrip("/"),
@@ -682,6 +710,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id")))
             elif self.path == "/api/projects":
                 self._json(200, application.add_project(data))
+            elif self.path == "/api/sessions/title":
+                self._json(200, application.rename_session(data))
             elif self.path == "/api/sessions/project":
                 self._json(200, application.move_project(data))
             elif self.path == "/api/shutdown":

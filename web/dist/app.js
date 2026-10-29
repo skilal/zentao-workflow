@@ -40,7 +40,7 @@ function CardBox(props) { return h(Card, { className: "app-card", ...props }, pr
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
-  const summary = Object.fromEntries(["id", "item", "items", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
+  const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
 function emptyDraft(state) { return { supplement: state?.supplement || "", reply: "", answers: {}, review_note: "", selected_findings: [] }; }
@@ -245,6 +245,22 @@ function WorkflowApp() {
           payload.reused_workspaces?.length > 0 && h(React.Fragment, null, h("p", null, "以下复用目录将保留："), payload.reused_workspaces.map(path => h("div", { key: path, className: "repo-path" }, path)))),
         onOk: async () => { if (!await act("delete_session", {}, id)) throw new Error("删除操作未提交"); } });
     } catch (error) { notice.error({ message: "无法删除会话", description: error.message }); }
+  }
+  function renameSession(entry) {
+    let title = entry.title;
+    modal.confirm({ title: "修改会话标题", okText: "保存", cancelText: "取消", icon: null,
+      content: h(Field, { label: "会话标题" }, h(Input, { defaultValue: title, "aria-label": "会话标题",
+        placeholder: "请输入会话标题", onChange: event => { title = event.target.value; } })),
+      onOk: async () => {
+        setRequestsPending(previous => ({ ...previous, [entry.id]: "rename_session" }));
+        try {
+          const payload = await fetch("/api/sessions/title", { method: "POST", credentials: "same-origin",
+            headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
+            body: JSON.stringify({ session_id: entry.id, title, request_id: crypto.randomUUID() }) }).then(readResponse);
+          receiveState(payload);
+        } catch (error) { notice.error({ message: "标题未保存", description: error.message }); throw error; }
+        finally { setRequestsPending(previous => { const next = { ...previous }; delete next[entry.id]; return next; }); }
+      } });
   }
   function changeProjectCollapse(keys) {
     setCollapsedProjects(keys);
@@ -726,7 +742,7 @@ function WorkflowApp() {
     const groups = [...projects, { id: 0, name: "无项目对话" }].map(project => {
       const entries = model.history.filter(entry => (entry.project?.id || 0) === project.id);
       const rows = entries.filter(entry => (sessionFilter === "all" || entry.stage === sessionFilter) &&
-        (!query || `${itemLabel(entry)} ${project.name} ${project.id > 0 ? `项目 #${project.id}` : ""}`.toLowerCase().includes(query)))
+        (!query || `${entry.title} ${itemLabel(entry)} ${project.name} ${project.id > 0 ? `项目 #${project.id}` : ""}`.toLowerCase().includes(query)))
         .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
       return { ...project, rows, updated_at: entries.reduce((latest, entry) => entry.updated_at > latest ? entry.updated_at : latest, "") };
     }).filter(project => !project.id || project.manual || (!query && sessionFilter === "all") || project.rows.length)
@@ -770,10 +786,13 @@ function WorkflowApp() {
                   onDragEnd: () => { setDragSessionId(null); setDropProjectId(null); },
                   tabIndex: 0, role: "button", "aria-pressed": selected, onKeyDown: event => { if (event.target === event.currentTarget && ["Enter", " "].includes(event.key)) { event.preventDefault(); open(); } } },
                   h("div", { className: "session-entry-body" },
+                    h("div", { className: "session-entry-custom-title", title: entry.title }, entry.title),
                     h("div", { className: "session-entry-title", title: itemLabel(entry) }, sessionItems(entry).map(item => h("div", { key: itemKey(item) }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
                     h("div", { className: "session-entry-status" }, stageTag(entry.stage), entry.busy && h(Spin, { size: "small" })),
                     h("div", { className: "session-entry-foot" }, h("span", { className: "muted" }, timeLabel(entry.updated_at)),
                       h("span", { className: "session-entry-actions", onClick: event => event.stopPropagation() },
+                      h(Button, { type: "text", size: "small", disabled: stopped || entry.deleting || Boolean(requestsPending[entry.id]),
+                        "aria-label": "修改会话标题", onClick: () => renameSession(entry) }, "改名"),
                       h(Tooltip, { title: entry.project_move_reason || "更换本次工作流的执行项目" }, h("span", null,
                         h(Dropdown, { disabled: !canMove, trigger: ["click"], menu: { selectedKeys: [String(entry.project?.id || 0)],
                           items: [...projects.map(value => ({ key: String(value.id), label: `${value.name || "项目"} #${value.id}`, disabled: value.id === entry.project?.id })),
