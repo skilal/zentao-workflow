@@ -1,6 +1,7 @@
 """显式暂停点、原生计划模式、修复轮次与本地提交控制。"""
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from hashlib import sha256
 from json import dumps, loads
 from re import search
@@ -100,9 +101,81 @@ class Workflow:
             self.store.save(self.state)
             self.emit("state", loads(dumps(self.state, ensure_ascii=False)))
 
-    def note(self, role, text):
-        self.store.append(self.state, role, text)
+    def note(self, role, text, **metadata):
+        self.store.append(self.state, role, text, **metadata)
         self.emit("message", {"role": role, "text": text})
+
+    def current_reviews(self):
+        return [entry for entry in self.state["reviews"]
+                if entry.get("delivery_round", 1) == self.state.get("delivery_round", 1)]
+
+    def validate_followup(self, text, image_ids):
+        state = self.require_state("已完成（静态审查）")
+        if state["phase"] != "complete" or not state.get("thread_id"):
+            raise WorkflowError("原 Codex 线程不存在，不能继续此会话。")
+        if (not isinstance(text, str) or not isinstance(image_ids, list)
+                or any(not isinstance(value, str) for value in image_ids)
+                or len(set(image_ids)) != len(image_ids)):
+            raise WorkflowError("请提供反馈文字及不重复的截图编号。")
+        available = {image["id"]: image for image in state.get("followup_images", []) if "history_index" not in image}
+        if any(value not in available for value in image_ids):
+            raise WorkflowError("截图不属于当前待发送反馈，不能使用其他会话或已发送图片。")
+        if not text.strip() and not image_ids:
+            raise WorkflowError("请填写测试问题或添加至少一张截图。")
+        if not state["repos"]:
+            raise WorkflowError("原会话没有已确定的工作区，不能继续修复。")
+        return [deepcopy(available[value]) for value in image_ids]
+
+    def followup(self, text, images, request_id):
+        state = self.state
+        number = state.get("delivery_round", 1)
+        archived = {key: deepcopy(state.get(key)) for key in
+                    ("repos", "selections", "plan", "plan_hash", "approved_plan", "approved_hash",
+                     "approval_source", "plan_round", "fix_round", "max_fix_rounds", "commits",
+                     "acceptance", "review_manifest", "review_prompt", "review_prompt_hash", "followup")}
+        archived.update(number=number, completed_at=state["updated_at"], reviews=deepcopy(self.current_reviews()),
+                        decisions=deepcopy([entry for entry in state["decisions"] if entry.get("delivery_round", 1) == number]))
+        state.setdefault("deliveries", []).append(archived)
+        targets = [{"name": repo["name"], "role": repo["role"], "path": repo["source"],
+                    "branch": repo["branch"], "base": "refs/heads/" + repo["branch"], "create": False}
+                   for repo in state["repos"]]
+        history_index = len(state["history"])
+        image_ids = {entry["id"] for entry in images}
+        for image in state.get("followup_images", []):
+            if image["id"] in image_ids:
+                image["history_index"] = history_index
+        state.update(delivery_round=number + 1, repos=[], selections=targets, phase="fix", stage="准备工作区中",
+                     prepare_complete=False, pause_requested=False, turn_id=None, pending=None, commits={},
+                     fix_round=0, max_fix_rounds=self.settings["review"]["max_fix_rounds"], error="",
+                     review_manifest={}, review_prompt="", review_prompt_hash="", acceptance=None,
+                     approval_source="followup", followup={"text": text.strip(), "images": images,
+                         "request_id": request_id, "history_index": history_index,
+                         "authorization_hash": sha256(dumps([text.strip(), [image["id"] for image in images]],
+                                                            ensure_ascii=False).encode("utf-8")).hexdigest()})
+        self.note("用户", text.strip(), images=images, request_id=request_id)
+        self._prepare_followup()
+
+    def _prepare_followup(self):
+        state = self.state
+        state.update(stage="准备工作区中", pause_requested=False)
+        self.save()
+        self._close_rpc()
+        workspace = self.store.directory(state["id"]) / "workspace"
+        workspace.mkdir(exist_ok=True)
+        prepared = {repo["name"] for repo in state["repos"]}
+        for index, selection in enumerate(state["selections"]):
+            if self.closed or state.get("pause_requested"):
+                state["stage"] = "已暂停"
+                self.save()
+                return
+            if selection["name"] not in prepared:
+                acquire_workspace(selection, workspace / f"repo-{index + 1}-delivery-{state['delivery_round']}", self.store, state)
+        state["prepare_complete"] = True
+        self.save()
+        self._start_turn("用户发送本轮测试反馈即明确授权修复。先读取 workflow.task_context 和当前代码，"
+                         "只修复 followup 中的反馈，原计划用于理解业务背景；本轮不必重新生成计划。"
+                         "需要澄清时等待明确回答，扩大范围时先重新计划。首次反馈修复不占用 Review 后修复次数。"
+                         "完成后由控制器审查并本地提交，模型不要自行提交。\n测试反馈：\n" + state["followup"]["text"])
 
     def connect(self):
         with self.zentao_lock:
@@ -360,6 +433,8 @@ class Workflow:
     def ensure_rpc(self):
         if not self.state.get("codex"):
             raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
+        if self.state.get("followup") and not self.state.get("thread_id"):
+            raise WorkflowError("原 Codex 线程不存在，不能新建线程替代续聊。")
         if self.closed:
             raise WorkflowError("客户端已经关闭，不能启动新会话。")
         if self.rpc is not None and self.rpc.process.poll() is not None:
@@ -377,7 +452,11 @@ class Workflow:
             if self.state["thread_id"]:
                 params = thread_parameters(self.state, self.rpc.model, self.rpc.disabled_mcp)
                 params.update(threadId=self.state["thread_id"], excludeTurns=True)
-                self.rpc.request("thread/resume", params)
+                try:
+                    self.rpc.request("thread/resume", params)
+                except Exception:
+                    self._close_rpc()
+                    raise
             else:
                 data = self.rpc.request("thread/start", thread_parameters(self.state, self.rpc.model, self.rpc.disabled_mcp))
                 self.state["thread_id"] = data["thread"]["id"]
@@ -418,11 +497,16 @@ class Workflow:
         context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                    "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
-                   "feishu_links": state["snapshot"]["feishu_links"], "decisions": state["decisions"]}
+                   "feishu_links": state["snapshot"]["feishu_links"],
+                   "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
+                   "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup")}
+        scope = ("原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的测试反馈。"
+                 if state.get("followup") and state["approval_source"] == "followup" else
+                 "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。")
         prompt = ("所有回答使用中文。系统命令、编译、构建、运行验证、依赖安装一律禁止。"
                   "当前阶段由控制器决定。只有 workflow MCP 的受控文件工具允许修改业务文件。"
                   "需要业务选择或扩大计划范围时必须提问，不得自行决定。"
-                  "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。\n" + text +
+                  + scope + "\n" + text +
                   "\n工作流上下文：\n" + dumps(context, ensure_ascii=False))
         if phase == "branch":
             context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
@@ -438,6 +522,8 @@ class Workflow:
                 if material.get("image"):
                     inputs.append({"type": "localImage", "path": material["path"]})
             for image in state.get("supplement_images", []):
+                inputs.append({"type": "localImage", "path": image["path"]})
+            for image in (state.get("followup") or {}).get("images", []):
                 inputs.append({"type": "localImage", "path": image["path"]})
         params = {"threadId": state["thread_id"], "input": inputs,
                   "cwd": str(turn_cwd), "approvalPolicy": "on-request",
@@ -520,7 +606,8 @@ class Workflow:
             raise WorkflowError("固定 Review 提示词不能为空。")
         state["review_prompt"] = prompt
         state["review_prompt_hash"] = sha256(prompt.encode("utf-8")).hexdigest()
-        previous = state["reviews"][-1]["result"] if state["reviews"] else None
+        reviews = self.current_reviews()
+        previous = reviews[-1]["result"] if reviews else None
         self._start_turn(prompt + "\n\n以上固定提示词必须原样遵循。当前只读审查，不得修改。"
                          "先用 workflow.changes 阅读每个仓库的累计差异，再结合 baseline_file 和当前文件确定问题来源。"
                          "审查新文件，不遗漏上轮修复。无法确认则标为证据不足，不声称业务运行已经通过。"
@@ -533,14 +620,15 @@ class Workflow:
         state = self.require_state("等待修复选择")
         if state["fix_round"] >= state["max_fix_rounds"]:
             raise WorkflowError("已达到修复轮次上限；请明确追加一轮后再修复。")
-        current = state["reviews"][-1]["result"]["findings"]
+        current = self.current_reviews()[-1]["result"]["findings"]
         lookup = {finding["id"]: finding for finding in current}
         if not selected_ids or any(item not in lookup for item in selected_ids):
             raise WorkflowError("请至少选择一个有效问题。")
         if manifest(state["repos"]) != state["review_manifest"]:
             raise WorkflowError("代码已经变化，须先重新 Review。")
         chosen = [lookup[item] for item in selected_ids]
-        state["decisions"].append({"round": state["fix_round"] + 1, "fix_ids": selected_ids, "note": note})
+        state["decisions"].append({"round": state["fix_round"] + 1, "fix_ids": selected_ids, "note": note,
+                                   "delivery_round": state.get("delivery_round", 1)})
         state["fix_round"] += 1
         state["phase"] = "fix"
         self._start_turn("用户选择修复以下问题，只处理选中项。不要顺手修改未选项或原有问题。"
@@ -555,6 +643,8 @@ class Workflow:
 
     def rereview(self):
         self.require_state("等待修复选择", "已停止", "已暂停")
+        if self.state.get("followup") and not self.state.get("prepare_complete"):
+            raise WorkflowError("请先从暂停点继续准备本轮工作区，再进行审查。")
         if self.state["commits"]:
             raise WorkflowError("已经发生部分提交，请先处理提交状态。")
         self.state["pause_requested"] = False
@@ -564,7 +654,7 @@ class Workflow:
         state = self.require_state("等待修复选择", "部分提交")
         if self.closed or (automatic and state.get("pause_requested")):
             return
-        findings = state["reviews"][-1]["result"]["findings"]
+        findings = self.current_reviews()[-1]["result"]["findings"]
         if set(accepted_ids) != {finding["id"] for finding in findings}:
             raise WorkflowError("结束前必须明确接受所有仍存在的问题；否则请选择修复。")
         if findings and not acceptance_note.strip():
@@ -593,7 +683,7 @@ class Workflow:
             ids = ",".join(str(item["id"]) for item in items)
             title = "；".join(str(item["title"]).replace("\n", " ").replace("\r", " ") for item in items)[:100]
             message = f"feat(zentao-tasks-{ids}): {title}"
-        if state["item"]["kind"] == "bug":
+        if state["item"]["kind"] == "bug" or state.get("delivery_round", 1) > 1:
             message = message.replace("feat(", "fix(", 1)
         for repository in pending:
             if self.closed or state.get("pause_requested"):
@@ -644,7 +734,10 @@ class Workflow:
         if state["commits"]:
             raise WorkflowError("存在部分提交，只能先完成或处理该提交过程。")
         state["pause_requested"] = False
-        if state.get("reviews") and state["phase"] == "review":
+        if state.get("followup") and not state.get("prepare_complete"):
+            self._prepare_followup()
+            return
+        if self.current_reviews() and state["phase"] == "review":
             # 恢复动作只重新审查；上次结果不能在重启后直接触发提交。
             self._begin_review()
             return
@@ -768,6 +861,7 @@ class Workflow:
         else:
             match = search(r"<proposed_plan>([\s\S]*?)</proposed_plan>", text)
             plan = match.group(1).strip() if match else ""
+        history_index = len(state["history"])
         self.note("Codex", text or self.plan_stream)
         if state["phase"] == "plan":
             state["plan"] = plan
@@ -792,7 +886,8 @@ class Workflow:
             if not isinstance(result.get("findings"), list) or not isinstance(result.get("summary"), str) or not isinstance(result.get("resolved_previous"), list):
                 raise WorkflowError("Review 结果不符合约定结构，已停止。")
             review_number = len(state["reviews"]) + 1
-            previous = {finding["id"]: finding for finding in state["reviews"][-1]["result"]["findings"]} if state["reviews"] else {}
+            reviews = self.current_reviews()
+            previous = {finding["id"]: finding for finding in reviews[-1]["result"]["findings"]} if reviews else {}
             resolved = {entry["id"] for entry in result["resolved_previous"] if entry.get("evidence", "").strip()}
             if not resolved.issubset(previous):
                 raise WorkflowError("Review 声称解决了不存在的旧问题，已停止。")
@@ -812,6 +907,7 @@ class Workflow:
                 if old_id not in seen and old_id not in resolved:
                     result["findings"].append(finding.copy())
             state["reviews"].append({"number": review_number, "fix_round": state["fix_round"],
+                                     "delivery_round": state.get("delivery_round", 1), "history_index": history_index,
                                      "prompt_hash": state["review_prompt_hash"], "result": result,
                                      "manifest": state["review_manifest"].copy()})
             state["stage"] = "等待修复选择"

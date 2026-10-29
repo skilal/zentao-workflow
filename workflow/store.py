@@ -1,6 +1,7 @@
 """每个工作项的持久状态，原子写入且不保存登录 Token。"""
 
 from datetime import datetime, timezone
+from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
 from os import walk
@@ -23,6 +24,18 @@ def session_title(state):
                     for item in state.get("items", [state["item"]]))
 
 
+def write_authorized(state):
+    if state.get("approval_source") == "followup":
+        feedback = state["followup"]
+        scope = dumps([feedback["text"], [image["id"] for image in feedback["images"]]], ensure_ascii=False)
+        return sha256(scope.encode("utf-8")).hexdigest() == feedback.get("authorization_hash")
+    plan = state.get("approved_plan", "")
+    return bool(plan and sha256(plan.encode("utf-8")).hexdigest() == state.get("approved_hash"))
+
+def session_repositories(state):
+    return [*state["repos"], *(repo for delivery in state.get("deliveries", []) for repo in delivery["repos"])]
+
+
 class SessionStore:
     def __init__(self):
         self.root = LOCAL / "sessions"
@@ -39,6 +52,7 @@ class SessionStore:
             "plan_round": None, "approval_source": "",
             "pending": None, "history": [], "reviews": [], "decisions": [],
             "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
+            "delivery_round": 1, "deliveries": [], "followup_images": [],
         }
         self.save(state)
         return state
@@ -83,7 +97,8 @@ class SessionStore:
                         raise WorkflowError(f"会话目录仍包含 Git 工作区或链接，已停止删除：{path}")
             rmtree(directory)
 
-    def append(self, state, role, text):
+    def append(self, state, role, text, **metadata):
         with self.lock:
-            state["history"].append({"time": timestamp(), "role": role, "text": text})
+            state["history"].append({"time": timestamp(), "role": role, "text": text, "phase": state["phase"],
+                                     "delivery_round": state.get("delivery_round", 1), **metadata})
             self.save(state)

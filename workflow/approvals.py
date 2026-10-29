@@ -1,11 +1,11 @@
 """只承接已确认阶段、已选仓库的本地 MCP 文件写入授权。"""
 
-from hashlib import sha256
 from pathlib import Path
 
 from workflow.gitops import safe_file
 from workflow.mcp_server import SKIP, TOOLS
 from workflow.settings import WorkflowError
+from workflow.store import write_authorized
 
 
 WRITE_TOOL_DESCRIPTIONS = {description: (name, definition) for name, description, definition in TOOLS
@@ -21,8 +21,7 @@ def is_controlled_write(state, params):
     tool = WRITE_TOOL_DESCRIPTIONS.get(metadata.get("tool_description"))
     if not tool or state["stage"] not in ("实施中", "修复中"):
         return False
-    approved_plan = state.get("approved_plan", "")
-    if not approved_plan or sha256(approved_plan.encode("utf-8")).hexdigest() != state.get("approved_hash"):
+    if not write_authorized(state):
         return False
     arguments = metadata.get("tool_params")
     if not isinstance(arguments, dict) or any(key not in arguments for key in tool[1]["required"]):

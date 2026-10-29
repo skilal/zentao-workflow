@@ -17,7 +17,7 @@ from uuid import uuid4
 from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
-from workflow.store import session_title, timestamp
+from workflow.store import session_repositories, session_title, timestamp
 from workflow.engine import ACTIVE
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
@@ -35,6 +35,9 @@ def public_state(state):
         return None
     result = deepcopy(state)
     result.setdefault("supplement_images", [])
+    result.setdefault("followup_images", [])
+    result.setdefault("delivery_round", 1)
+    result.setdefault("deliveries", [])
     for source in result.get("snapshot", {}).get("sources", []):
         raw = source.pop("raw", {})
         # 旧会话没有资料归属字段，从已保存的原始正文恢复图片和附件的关联。
@@ -102,17 +105,19 @@ class WebApplication:
     def session_payload(self, runtime):
         state = public_state(runtime.engine.state)
         state["title"] = session_title(runtime.engine.state)
+        repositories = session_repositories(state)
+        state["can_edit"] = runtime.engine.editable() and not runtime.engine.closed and not state.get("cleanup", {}).get("finalizing")
         state["project"] = session_project(state)
         state["project_move_reason"] = project_move_error(runtime)
         state["can_move_project"] = not state["project_move_reason"]
-        state["can_edit"] = runtime.engine.editable() and not runtime.engine.closed and not state.get("cleanup", {}).get("finalizing")
         return {"session_id": state["id"], "state": state, "revision": runtime.revision,
                 "event_cursor": runtime.event_cursor, "stream": runtime.stream,
                 "busy": runtime.busy, "working": runtime.engine.working(),
                 "directory": str(self.sessions.store.directory(state["id"])),
-                "reused_workspaces": sorted({entry["path"] for entry in state["repos"] if not entry.get("workspace_owned", True)}),
-                "workspaces": sorted({entry["path"] for entry in state["repos"] if entry.get("workspace_owned", True)} |
-                    {str(self.sessions.store.directory(state["id"]) / "workspace" / f"repo-{index + 1}")
+                "reused_workspaces": sorted({entry["path"] for entry in repositories if not entry.get("workspace_owned", True)}),
+                "workspaces": sorted({entry["path"] for entry in repositories if entry.get("workspace_owned", True)} |
+                    {str(self.sessions.store.directory(state["id"]) / "workspace" /
+                         (f"repo-{index + 1}" + (f"-delivery-{state['delivery_round']}" if state.get("followup") else "")))
                      for index, selection in enumerate(state.get("selections", []))
                      if selection["name"] not in {entry["name"] for entry in state["repos"]}})}
 
@@ -290,21 +295,24 @@ class WebApplication:
                 self.requests.popitem(last=False)
             return result
 
-    def _supplement_runtime(self, session_id, revision):
+    def _supplement_runtime(self, session_id, revision, purpose="supplement"):
+        if not isinstance(purpose, str) or purpose not in {"supplement", "followup"}:
+            raise WorkflowError("图片用途无效，测试反馈图片必须归属正式会话。")
         runtime = self.sessions.get(session_id)
         state = runtime.engine.state
         if self.closed or self.busy == "settings" or runtime.busy or runtime.engine.working():
             raise WorkflowError("该会话正在执行操作，请等待完成后修改图片。")
-        if (runtime.engine.closed or state["stage"] not in {"资料已读取", "准备工作区失败"}
+        allowed = (state["stage"] == "已完成（静态审查）" and state["phase"] == "complete") if purpose == "followup" else state["stage"] in {"资料已读取", "准备工作区失败"}
+        if (runtime.engine.closed or not allowed
                 or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
             raise WorkflowError("当前阶段不能修改补充图片。")
         if type(revision) is not int or revision != runtime.revision:
             raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再操作。")
         return runtime
 
-    def upload_supplement_image(self, session_id, revision, name, data):
+    def upload_supplement_image(self, session_id, revision, name, data, purpose="supplement"):
         with self.condition:
-            runtime = self._supplement_runtime(session_id, revision)
+            runtime = self._supplement_runtime(session_id, revision, purpose)
             maximum = self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
             if not isinstance(name, str) or not name.strip() or not 0 < len(data) <= maximum:
                 raise WorkflowError("图片名称不能为空，单张大小不能超过配置的附件上限。")
@@ -320,24 +328,24 @@ class WebApplication:
             if not signatures.get(extension):
                 raise WorkflowError("请选择格式与内容一致的 PNG、JPEG、GIF、WebP 或 BMP 图片。")
             image_id = uuid4().hex
-            path = self.sessions.store.directory(session_id) / "attachments" / "supplement" / f"{image_id}.{extension}"
+            path = runtime.engine.store.directory(runtime.engine.state["id"]) / "attachments" / purpose / f"{image_id}.{extension}"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
             image = {"id": image_id, "name": name, "extension": extension, "size": len(data),
                      "path": str(path), "content_type": guess_type(path.name)[0]}
-            runtime.engine.state.setdefault("supplement_images", []).append(image)
+            runtime.engine.state.setdefault(purpose + "_images", []).append(image)
             runtime.engine.save()
             return self.session_payload(runtime)
 
-    def remove_supplement_image(self, session_id, revision, image_id):
+    def remove_supplement_image(self, session_id, revision, image_id, purpose="supplement"):
         with self.condition:
-            runtime = self._supplement_runtime(session_id, revision)
-            images = runtime.engine.state.get("supplement_images", [])
-            image = next((entry for entry in images if entry["id"] == image_id), None)
+            runtime = self._supplement_runtime(session_id, revision, purpose)
+            images = runtime.engine.state.get(purpose + "_images", [])
+            image = next((entry for entry in images if entry["id"] == image_id and "history_index" not in entry), None)
             if image is None:
                 raise WorkflowError("图片不在当前会话的补充附件列表中。")
             path = Path(image["path"]).resolve()
-            allowed = (self.sessions.store.directory(session_id) / "attachments" / "supplement").resolve()
+            allowed = (runtime.engine.store.directory(runtime.engine.state["id"]) / "attachments" / purpose).resolve()
             if not path.is_relative_to(allowed):
                 raise WorkflowError("补充图片路径不合法。")
             path.unlink()
@@ -413,6 +421,9 @@ class WebApplication:
             runtime = None if global_action or (action == "collect" and not session_id) else self.sessions.get(session_id)
             engine = runtime.engine if runtime else self.sessions.connection
             state = engine.state
+            if action == "followup" and any((entry.get("followup") or {}).get("request_id") == request_id
+                    for entry in [state, *state.get("deliveries", [])]):
+                return {"accepted": True, "duplicate": True, "session_id": session_id, "request_id": request_id}
             if self.busy == "settings" or (global_action and self.busy):
                 raise WorkflowError("全局操作尚未完成，请等待。")
             if runtime:
@@ -422,7 +433,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 saved = state.get("codex")
                 if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
@@ -485,6 +496,10 @@ class WebApplication:
                 if not isinstance(choices, dict):
                     raise WorkflowError("请明确选择待确定仓库的分支。")
                 operation, arguments = engine.choose_branches, (choices,)
+            elif action == "followup":
+                text = data.get("text", "")
+                images = engine.validate_followup(text, data.get("image_ids", []))
+                operation, arguments = engine.followup, (text, images, request_id)
             elif action == "answer":
                 text, answers = str(data.get("text", "")).strip(), data.get("answers")
                 pending = state.get("pending")
@@ -739,7 +754,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 if len(data) != length:
                     raise WorkflowError("图片传输不完整，请重新上传。")
                 self._json(200, application.upload_supplement_image(query.get("session_id", [""])[0],
-                    int(query.get("revision", ["-1"])[0]), query.get("name", [""])[0], data))
+                    int(query.get("revision", ["-1"])[0]), query.get("name", [""])[0], data, purpose=query.get("purpose", ["supplement"])[0]))
                 return
             if self.headers.get_content_type() != "application/json":
                 raise WorkflowError("操作必须使用 JSON 请求。")
@@ -752,7 +767,7 @@ class WebHandler(BaseHTTPRequestHandler):
             if self.path == "/api/actions":
                 self._json(202, application.dispatch(data))
             elif self.path == "/api/supplement-images/remove":
-                self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id")))
+                self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id"), purpose=data.get("purpose", "supplement")))
             elif self.path == "/api/projects":
                 self._json(200, application.add_project(data))
             elif self.path == "/api/sessions/title":
@@ -794,12 +809,16 @@ class WebHandler(BaseHTTPRequestHandler):
     def _supplement_image(self, query):
         application = self.server.application
         session_id = query.get("session_id", [""])[0]
-        state = application.session(session_id)["state"]
-        image = next((entry for entry in state["supplement_images"] if entry["id"] == query.get("image_id", [""])[0]), None)
+        runtime = application.sessions.get(session_id)
+        state = runtime.engine.state
+        purpose = query.get("purpose", ["supplement"])[0]
+        if purpose not in {"supplement", "followup"}:
+            raise WorkflowError("图片用途无效。")
+        image = next((entry for entry in state.get(purpose + "_images", []) if entry["id"] == query.get("image_id", [""])[0]), None)
         if image is None:
             raise WorkflowError("图片不在当前会话的补充附件列表中。")
         path = Path(image["path"]).resolve()
-        allowed = (application.sessions.store.directory(session_id) / "attachments" / "supplement").resolve()
+        allowed = (runtime.engine.store.directory(state["id"]) / "attachments" / purpose).resolve()
         if not path.is_relative_to(allowed) or not path.is_file():
             raise WorkflowError("该补充图片当前不可读取。")
         data = path.read_bytes()

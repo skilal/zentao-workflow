@@ -7,7 +7,7 @@ from sys import stdin, stdout
 
 from workflow.gitops import differences, git, safe_file
 from workflow.settings import WorkflowError
-from workflow.store import SessionStore
+from workflow.store import SessionStore, write_authorized
 
 
 def schema(properties, required=()):
@@ -77,8 +77,10 @@ class Tools:
     def call(self, name, arguments):
         state = self.store.load(self.session_id)
         if name == "task_context":
-            return {**{key: state.get(key) for key in ("item", "items", "project", "snapshot", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "decisions", "phase", "stage")},
-                    "supplement_images": state.get("supplement_images", [])}
+            return {**{key: state.get(key) for key in ("item", "items", "project", "snapshot", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage")},
+                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
+                    "supplement_images": state.get("supplement_images", []),
+                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup")}
         repositories = {repository["name"]: repository for repository in state["repos"]}
         repository = repositories.get(arguments.get("repository"))
         if repository is None:
@@ -133,7 +135,8 @@ class Tools:
                     "text": "\n".join(f"{index + 1}: {lines[index]}" for index in range(start - 1, min(len(lines), start - 1 + count)))}
         if name not in ("write_file", "replace_text", "delete_file"):
             raise WorkflowError("未知 MCP 工具。")
-        if state["stage"] not in ("实施中", "修复中") or not state.get("approved_hash"):
+        authorized = write_authorized(state) if state.get("approval_source") == "followup" else state.get("approved_hash")
+        if state["stage"] not in ("实施中", "修复中") or not authorized:
             raise WorkflowError("当前阶段禁止修改文件，必须等待计划确认或修复选择。")
         if path.relative_to(Path(repository["path"]).resolve()).as_posix().casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
             raise WorkflowError("该文件包含任务开始前的本机保留改动，不会自动修改或提交；需要修改时请先取得用户明确指示。")

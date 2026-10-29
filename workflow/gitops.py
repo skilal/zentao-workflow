@@ -9,6 +9,7 @@ from subprocess import CREATE_NO_WINDOW, PIPE, run
 from threading import Lock, RLock
 
 from workflow.settings import WorkflowError
+from workflow.store import session_repositories
 
 
 HOOK_NAMES = ("post-checkout", "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "pre-auto-gc",
@@ -315,7 +316,8 @@ def cleanup_workspaces(store, state, repositories):
     if not state["repos"] and not state.get("selections") and not workspace.exists():
         return
     sources = {str(Path(entry["path"]).resolve()) for entry in repositories}
-    sources.update(str(Path(entry["source"]).resolve()) for entry in state["repos"])
+    all_repositories = session_repositories(state)
+    sources.update(str(Path(entry["source"]).resolve()) for entry in all_repositories)
     sources.update(str(Path(entry["path"]).resolve()) for entry in state.get("selections", []))
     removed = state.setdefault("cleanup", {}).setdefault("removed", [])
     with ExitStack() as stack:
@@ -333,11 +335,12 @@ def cleanup_workspaces(store, state, repositories):
                     if "locked" in entry or "prunable" in entry:
                         raise WorkflowError(f"工作区被锁定或注册失效，已停止删除：{path}")
                     registered[str(path)] = source
-        expected = {str(Path(entry["path"]).resolve()): entry["source"] for entry in state["repos"] if entry.get("workspace_owned", True)}
+        expected = {str(Path(entry["path"]).resolve()): entry["source"] for entry in all_repositories if entry.get("workspace_owned", True)}
         prepared = {entry["name"] for entry in state["repos"]}
         for index, selection in enumerate(state.get("selections", [])):
             if selection["name"] not in prepared:
-                expected.setdefault(str(workspace / f"repo-{index + 1}"), selection["path"])
+                suffix = f"-delivery-{state['delivery_round']}" if state.get("followup") else ""
+                expected.setdefault(str(workspace / f"repo-{index + 1}{suffix}"), selection["path"])
         for name, source in expected.items():
             path = Path(name)
             if path.parent != workspace:

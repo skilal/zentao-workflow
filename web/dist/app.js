@@ -155,6 +155,7 @@ function WorkflowApp() {
   const [draft, setDraft] = useState(emptyDraft());
   const draftRef = useRef(draft);
   const imageInput = useRef(null);
+  const followupImageInput = useRef(null);
   const imageQueues = useRef({});
   const [imageTransfers, setImageTransfers] = useState({});
   const [diffOpen, setDiffOpen] = useState(false);
@@ -200,7 +201,7 @@ function WorkflowApp() {
         try {
           const current = modelRef.current.sessions[id];
           if (!current) throw new Error("会话已删除，请重新选择工作项。");
-          const query = new URLSearchParams({ session_id: id, revision: current.revision, name: task.name });
+          const query = new URLSearchParams({ session_id: id, revision: current.revision, name: task.name, purpose: task.purpose });
           const payload = await fetch(`/api/supplement-images?${query}`, { method: "POST", credentials: "same-origin",
             headers: { "Content-Type": "application/octet-stream", "X-Workflow-Token": csrf.current }, body: task.file }).then(readResponse);
           if (modelRef.current.sessions[id]) receiveState(payload);
@@ -210,16 +211,16 @@ function WorkflowApp() {
       }
     } finally { queue.running = false; }
   }
-  function addImages(files) {
+  function addImages(files, purpose = "supplement") {
     const id = modelRef.current.state?.id;
-    if (!id || !supplementEditable) return;
+    if (!id || !(purpose === "followup" ? followupEditable : supplementEditable)) return;
     const queue = imageQueues.current[id] ||= { tasks: [], running: false };
     queue.tasks.push(...Array.from(files, file => ({ uid: crypto.randomUUID(), file, name: file.name,
-      status: "waiting", error: "" })));
+      status: "waiting", error: "", purpose })));
     publishImageTransfers();
     uploadImages(id);
   }
-  function pasteImages(event) {
+  function pasteImages(event, purpose = "supplement") {
     const files = Array.from(event.clipboardData.items).filter(item => item.kind === "file" && item.type.startsWith("image/"))
       .map(item => item.getAsFile()).filter(Boolean);
     if (!files.length) return;
@@ -228,18 +229,18 @@ function WorkflowApp() {
     const input = event.target;
     if (text && input.tagName === "TEXTAREA") {
       const start = input.selectionStart, end = input.selectionEnd;
-      changeDraft({ supplement: input.value.slice(0, start) + text + input.value.slice(end) });
+      changeDraft({ [purpose === "followup" ? "reply" : "supplement"]: input.value.slice(0, start) + text + input.value.slice(end) });
       requestAnimationFrame(() => input.setSelectionRange(start + text.length, start + text.length));
     }
-    addImages(files);
+    addImages(files, purpose);
   }
-  async function removeImage(image) {
+  async function removeImage(image, purpose = "supplement") {
     const id = state.id;
     setRequestsPending(previous => ({ ...previous, [id]: "remove_image" }));
     try {
       const payload = await fetch("/api/supplement-images/remove", { method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
-        body: JSON.stringify({ session_id: id, revision: modelRef.current.sessions[id].revision, image_id: image.id }) }).then(readResponse);
+        body: JSON.stringify({ session_id: id, revision: modelRef.current.sessions[id].revision, image_id: image.id, purpose }) }).then(readResponse);
       if (modelRef.current.sessions[id]) receiveState(payload);
     } catch (error) { notice.error({ message: "图片未移除", description: error.message }); }
     finally { setRequestsPending(previous => { const next = { ...previous }; delete next[id]; return next; }); }
@@ -412,11 +413,13 @@ function WorkflowApp() {
 
   const state = model?.state;
   const stage = state?.stage || "";
-  const review = state?.reviews?.at(-1);
+  const review = state?.reviews?.filter(entry => (entry.delivery_round || 1) === (state.delivery_round || 1)).at(-1);
   const findings = review?.result?.findings || [];
   const transfers = imageTransfers[state?.id] || [];
   const imagesUploading = transfers.some(entry => entry.status !== "error");
   const supplementEditable = Boolean(state && ["资料已读取", "准备工作区失败"].includes(stage) &&
+    !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
+  const followupEditable = Boolean(state?.phase === "complete" && stage === "已完成（静态审查）" &&
     !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
   const busy = Boolean(stopped || sending || model?.busy || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
   const selectedKey = selectedItems.join("|");
@@ -492,6 +495,15 @@ function WorkflowApp() {
     if (await act("plan", { ...(state.codex || sessionSelection), supplement: draft.supplement }) && modelRef.current.selectedSessionId === id) navigate("plan");
   }
   async function answer() {
+    if (state.phase === "complete") {
+      const images = state.followup_images.filter(image => image.history_index === undefined);
+      if (busy || transfers.length) return;
+      if (!draft.reply.trim() && !images.length) { notice.warning({ message: "请填写测试问题或添加截图" }); return; }
+      const id = state.id;
+      if (await act("followup", { text: draft.reply, image_ids: images.map(image => image.id) }) && modelRef.current.selectedSessionId === id)
+        changeDraft({ reply: "", answers: {} });
+      return;
+    }
     const questions = state?.pending?.params?.questions || [];
     const answers = {}, pieces = [];
     for (const question of questions) {
@@ -641,6 +653,7 @@ function WorkflowApp() {
   }
 
   function renderBranches() {
+    const transfers = (imageTransfers[state.id] || []).filter(task => task.purpose !== "followup");
     const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy;
     const repositories = state.branch_resolution?.repositories || [];
     const detailRepositories = state.branch_resolution?.manual && !state.repos.length ? [] : model.settings.repositories.filter(repository => {
@@ -699,33 +712,60 @@ function WorkflowApp() {
             h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0 || (!state.codex && !sessionSelection), onClick: startPlan }, "开始需求分析与计划"))));
   }
 
+  function renderFeedbackImages(images, editable = false) {
+    return h("div", { className: "attachment-grid" }, images.map(image => h("div", { className: "attachment", key: image.id },
+      h(Image, { src: `/api/supplement-images?${new URLSearchParams({ session_id: state.id, purpose: "followup", image_id: image.id })}`,
+        alt: image.name, preview: { mask: "查看图片" } }),
+      h("div", { className: "attachment-name" }, image.name),
+      editable && h("div", { className: "supplement-image-actions" }, h(Button, { size: "small", type: "text", danger: true,
+        onClick: () => removeImage(image, "followup") }, "移除")))));
+  }
+
+  function renderFeedbackTransfers() {
+    return h("div", { className: "attachment-grid" }, transfers.filter(task => task.purpose === "followup").map(task =>
+      h("div", { className: "attachment", key: task.uid }, h("div", { className: "attachment-name" }, task.name),
+        h("div", { className: "supplement-image-actions" }, task.status === "error" ? h(Tag, { color: "error" }, "上传失败") :
+          h(Space, null, h(Spin, { size: "small" }), task.status === "waiting" ? "等待上传" : "上传中")),
+        task.status === "error" && h(React.Fragment, null, h(Typography.Text, { type: "danger" }, task.error),
+          h(Space, null, h(Button, { size: "small", disabled: !followupEditable, onClick: () => {
+            task.status = "waiting"; task.error = ""; publishImageTransfers(); uploadImages(state.id);
+          } }, "重试"), h(Button, { size: "small", type: "text", danger: true, disabled: !followupEditable, onClick: () => {
+            const queue = imageQueues.current[state.id]; queue.tasks = queue.tasks.filter(entry => entry.uid !== task.uid); publishImageTransfers();
+          } }, "移除"))))));
+  }
+
   function renderPlan() {
-    if (!state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "先选择工作项并等待读取完成，再开始需求分析与计划" }));
+    if (!model.selectedSessionId || !state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "先选择工作项并等待读取完成，再开始需求分析与计划" }));
     if (!state.codex && !["资料已读取", "资料读取失败"].includes(stage)) return h(CardBox, { title: "确认历史会话的模型配置" },
       h(Typography.Paragraph, null, "该历史会话未保存模型与推理强度。请选择一次，保存后按原阶段继续。"),
       h(CodexSelection, { key: state.id, value: draft.codex, disabled: busy, onReady: setSessionSelection, onChange: codex => changeDraft({ codex }) }),
       h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy || !sessionSelection,
         onClick: () => act("configure_codex", sessionSelection) }, "保存会话模型配置"),
       h(Button, { disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段")));
-    if (state.phase === "branch" || !state.repos.length) return h("div", { className: "card-stack" }, renderBranches(),
+    if (state.phase === "branch" || (!state.repos.length && !state.followup)) return h("div", { className: "card-stack" }, renderBranches(),
       h(CardBox, { title: "流程操作" },
         state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
         h(Space, null,
         h(Button, { disabled: stopped || !ACTIVE.has(stage), onClick: () => act("pause") }, "暂停当前阶段"),
         h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"))));
     const questions = state.pending?.params?.questions || [];
-    const canAnswer = ["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) && !busy;
-    const entries = state.history.filter(entry => entry.role !== "控制器");
+    const continuing = state.phase === "complete";
+    const feedbackAuthorized = state.approval_source === "followup";
+    const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy;
+    const entries = state.history.map((entry, index) => ({ ...entry, index })).filter(entry => entry.role !== "控制器");
     return h("div", { className: "conversation-grid" },
       h("div", { className: "card-stack" },
         renderBranches(),
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
-        state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
+          state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           h("div", { className: "conversation-feed", ref: feedRef }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
-            entries.map((entry, index) => h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: index },
-              h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time))), h("div", { className: "chat-body" }, entry.text))),
+            entries.map(entry => h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: entry.index },
+              h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time)),
+                entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`)),
+              h("div", { className: "chat-body" }, entry.text,
+                entry.images?.length > 0 && renderFeedbackImages(entry.images)))),
             model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, model.stream)))),
-        h(CardBox, { title: questions.length ? "需要你的回答" : "补充说明与回复" },
+        h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续测试与 Bug 修复" : "补充说明与回复" },
           questions.map(question => {
             const key = `${state.pending.id}:${question.id}:${question.question}`;
             const value = draft.answers[key] || {};
@@ -735,16 +775,36 @@ function WorkflowApp() {
                 question.options.map(option => h("div", { key: option.label }, h(Radio, { value: option.label }, option.label), option.description && h("div", { className: "option-note" }, option.description)))),
               h(Input.TextArea, { value: value.custom || "", rows: 2, disabled: !canAnswer, placeholder: "也可以填写自定义答案或补充说明", onChange: event => update({ custom: event.target.value }) }));
           }),
-          h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer, placeholder: questions.length ? "其他补充说明（可选）" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
-          h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer, onClick: answer }, questions.length ? "提交回答并继续" : "提交补充说明")))),
-      h("div", { className: "card-stack" }, h(CardBox, { title: "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认") },
+          h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer,
+            onPaste: continuing && followupEditable ? event => pasteImages(event, "followup") : undefined,
+            placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入复现步骤、实际结果与预期结果，可粘贴测试截图…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
+          continuing && h(React.Fragment, null,
+            h("div", { className: "supplement-image-tools" },
+              h("input", { type: "file", ref: followupImageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", onChange: event => {
+                addImages(event.target.files, "followup"); event.target.value = "";
+              } }),
+              h(Button, { disabled: !followupEditable, onClick: () => followupImageInput.current.click() }, "上传测试截图"),
+              h(Typography.Text, { type: "secondary" }, `单张不超过 ${model.settings.max_attachment_mb} MB；发送即授权修复，完成后自动 Review`)),
+            renderFeedbackImages(state.followup_images.filter(image => image.history_index === undefined), followupEditable),
+            renderFeedbackTransfers(),
+            transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再发送。")),
+          h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送并修复" : "提交补充说明")))),
+      h("div", { className: "card-stack" }, h(CardBox, { title: feedbackAuthorized ? "原需求实施计划" : "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, feedbackAuthorized ? "原计划 · 业务背景" : state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认") },
         state.plan ? h(React.Fragment, null, h("div", { className: "plan-panel" }, h("pre", { className: "plain-plan" }, state.plan)), h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
         h(Button, { type: "primary", block: true, disabled: stage !== "等待计划确认" || busy, onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")),
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
           h(Button, { block: true, disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
-          h(Button, { block: true, disabled: !state.reviews.length, onClick: () => navigate("review") }, "查看 Review 问题")),
-          h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。"))));
+          h(Button, { block: true, disabled: !review, onClick: () => navigate("review") }, "定位最新 Review")),
+          h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
+            "发送测试反馈即授权本轮修复；需要澄清时等待回答，扩大范围时先重新计划。Review 无遗留问题后自动本地 commit，不 push。" :
+            "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
+        Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
+        state.deliveries.length > 0 && h(CardBox, { title: "历史交付记录" }, h(Collapse, { ghost: true, items: state.deliveries.map(delivery => ({
+          key: delivery.number, label: `第 ${delivery.number} 轮交付 · ${timeLabel(delivery.completed_at)}`,
+          children: h(Descriptions, { column: 1, items: Object.entries(delivery.commits).map(([name, sha]) => ({ key: name, label: name,
+            children: h(Typography.Text, { code: true, copyable: true }, sha) })) })
+        })) }))));
   }
 
   function renderReview() {
