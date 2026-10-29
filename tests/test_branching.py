@@ -73,7 +73,7 @@ class BranchWorkflowChecks(TestCase):
             ("workflow.store.LOCAL", self.root),
             ("workflow.engine.branch_catalog", lambda repository: deepcopy(self.catalogs[repository["role"]])),
             ("workflow.engine.refresh_branches", lambda repository: deepcopy(self.catalogs[repository["role"]])),
-            ("workflow.engine.prepare", self.prepare),
+            ("workflow.engine.acquire_workspace", self.prepare),
             ("workflow.engine.save_settings", self.save_settings),
         ):
             patched = patch(target, new=replacement)
@@ -90,9 +90,12 @@ class BranchWorkflowChecks(TestCase):
         self.flow._start_turn = self.turns
         self.prepared = []
 
-    def prepare(self, source, path, branch, base, create, track=False):
-        self.prepared.append({"branch": branch, "create": create, "track": track})
-        return {"source": source, "path": str(path), "branch": branch, "base": base, "baseline": "a" * 40, "create": create}
+    def prepare(self, selection, path, store, state):
+        self.prepared.append({"branch": selection["branch"], "create": selection["create"], "track": selection.get("track", False)})
+        record = {**selection, "source": selection["path"], "path": str(path), "baseline": "a" * 40}
+        state["repos"].append(record)
+        store.save(state)
+        return record
 
     def save_settings(self, settings):
         (self.root / "settings.json").write_text(dumps(settings, ensure_ascii=False), encoding="utf-8")

@@ -135,6 +135,8 @@ class Tools:
             raise WorkflowError("未知 MCP 工具。")
         if state["stage"] not in ("实施中", "修复中") or not state.get("approved_hash"):
             raise WorkflowError("当前阶段禁止修改文件，必须等待计划确认或修复选择。")
+        if path.relative_to(Path(repository["path"]).resolve()).as_posix().casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
+            raise WorkflowError("该文件包含任务开始前的本机保留改动，不会自动修改或提交；需要修改时请先取得用户明确指示。")
         if path.name.casefold() in ("agents.md", "claude.md", "qwen.md"):
             raise WorkflowError("工作流不允许通过修改项目指令文件扩大执行权限。")
         if name == "delete_file":

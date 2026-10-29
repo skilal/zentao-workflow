@@ -38,7 +38,9 @@ def is_controlled_write(state, params):
     if Path(relative).name.casefold() in ("agents.md", "claude.md", "qwen.md"):
         return False
     try:
-        safe_file(repository, relative)
+        path = safe_file(repository, relative)
     except WorkflowError:
+        return False
+    if path.relative_to(Path(repository["path"]).resolve()).as_posix().casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
         return False
     return True

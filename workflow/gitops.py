@@ -1,4 +1,4 @@
-"""分支元数据、独立工作区和本地提交；不执行项目脚本。"""
+"""分支元数据、工作目录分配和本地提交；不执行项目脚本。"""
 
 from hashlib import sha256
 from contextlib import ExitStack
@@ -149,6 +149,80 @@ def prepare(repository, destination, branch, base, create, track=False):
             "base": base, "baseline": baseline, "create": bool(create)}
 
 
+def workspace_claims(sessions, excluded_session):
+    return {str(Path(repository["path"]).resolve()).casefold(): session["id"]
+            for session in sessions if session["id"] != excluded_session and session["phase"] != "complete"
+            for repository in session["repos"]}
+
+
+@locked_repository
+def acquire_workspace(selection, destination, store, state):
+    """优先沿用目标分支目录，其次切换空闲目录，最后创建；登记与分配共用仓库锁。"""
+    source, destination = Path(selection["path"]).resolve(), Path(destination).resolve()
+    sessions = store.sessions()
+    claims = workspace_claims(sessions, state["id"])
+    session_states = {session["id"]: session for session in sessions}
+    entries = worktrees(source)
+    available = []
+    for entry in entries:
+        path = Path(entry["worktree"]).resolve()
+        owner = claims.get(str(path).casefold())
+        managed = None
+        if path.is_relative_to(store.root.resolve()):
+            managed = path.relative_to(store.root.resolve()).parts[0]
+        reusable = not owner and (path == source or managed == state["id"] or
+            (managed in session_states and session_states[managed]["phase"] == "complete"))
+        if entry.get("branch") == "refs/heads/" + selection["branch"]:
+            if not reusable or "locked" in entry or "prunable" in entry:
+                raise WorkflowError(f"分支 {selection['branch']} 已被占用：{path}（会话：{owner or managed or '外部工作区'}）。请先完成或删除占用会话，或明确选择其他分支。")
+            available = [entry]
+            break
+        if reusable and "locked" not in entry and "prunable" not in entry:
+            available.append(entry)
+    else:
+        available.sort(key=lambda entry: Path(entry["worktree"]).resolve() != source)
+    if not available:
+        record = prepare(source, destination, selection["branch"], selection["base"],
+                         selection["create"], selection.get("track", False))
+        record.update(workspace_owned=True, workspace_mode="created", preserved_paths=[])
+    else:
+        entry = available[0]
+        path = Path(entry["worktree"]).resolve()
+        branch, base = selection["branch"], selection["base"]
+        if not branch.strip() or not base.strip():
+            raise WorkflowError("目标分支和代码基准尚未确定。")
+        git(source, "check-ref-format", "--branch", branch)
+        baseline = git(source, "rev-parse", "--verify", base + "^{commit}")
+        if not selection["create"] and git(source, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}") != baseline:
+            raise WorkflowError("现有目标分支与所选代码基准不一致，请重新选择。")
+        reject_hooks(path)
+        configured_hooks = git(path, "config", "--path", "--get", "core.hooksPath", optional=True)
+        if configured_hooks and not Path(configured_hooks).is_absolute():
+            hook_paths = [(Path(configured_hooks) / name).as_posix() for name in HOOK_NAMES]
+            if git(path, "ls-tree", "--name-only", baseline, "--", *hook_paths):
+                raise WorkflowError("所选代码基准包含 Git 钩子，切换分支前已停止，不会自动绕过。")
+        preserved = working_paths({"path": str(path)})
+        switching = entry.get("branch") != "refs/heads/" + branch
+        if switching:
+            if selection["create"]:
+                if selection.get("track"):
+                    git(path, "switch", "--track", "-c", branch, base)
+                else:
+                    git(path, "switch", "-c", branch, baseline)
+            else:
+                git(path, "switch", branch)
+        reject_hooks(path)
+        record = {"source": str(source), "path": str(path), "branch": branch, "base": base,
+                  "baseline": baseline, "create": bool(selection["create"]),
+                  "workspace_owned": path.parent == store.directory(state["id"]) / "workspace",
+                  "workspace_mode": "switched" if switching else "reused",
+                  "preserved_paths": sorted(set(preserved + working_paths({"path": str(path)})))}
+    record.update(name=selection["name"], role=selection["role"])
+    state["repos"].append(record)
+    store.save(state)
+    return record
+
+
 def ensure_baseline(repository):
     if git(repository["path"], "rev-parse", "HEAD") != repository["baseline"]:
         raise WorkflowError("工作区 HEAD 已改变，不能继续使用原审查基线。")
@@ -157,11 +231,17 @@ def ensure_baseline(repository):
 
 
 def changed_paths(repository):
-    path = repository["path"]
     ensure_baseline(repository)
-    tracked = git(path, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "HEAD", "--", binary=True)
+    return working_paths(repository)
+
+
+def working_paths(repository):
+    path = repository["path"]
+    tracked = git(path, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", "HEAD", "--", binary=True)
     added = git(path, "ls-files", "--others", "--exclude-standard", "-z", binary=True)
-    return sorted(set(part.decode("utf-8", errors="strict") for part in (tracked + added).split(b"\0") if part))
+    preserved = {relative.casefold() for relative in repository.get("preserved_paths", [])}
+    paths = {part.decode("utf-8", errors="strict") for part in (tracked + added).split(b"\0") if part}
+    return sorted(relative for relative in paths if relative.casefold() not in preserved)
 
 
 def safe_file(repository, relative):
@@ -194,12 +274,12 @@ def manifest(repositories):
 
 
 def differences(repository):
-    ensure_baseline(repository)
-    text = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--stat", repository["baseline"], "--")
-    patch = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-color", repository["baseline"], "--")
+    paths = changed_paths(repository)
+    text = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--stat", repository["baseline"], "--", *paths) if paths else ""
+    patch = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-color", repository["baseline"], "--", *paths) if paths else ""
     new_files = git(repository["path"], "ls-files", "--others", "--exclude-standard", "-z", binary=True)
     return {"repository": repository["name"], "baseline": repository["baseline"], "stat": text,
-            "patch": patch, "untracked": [part.decode("utf-8") for part in new_files.split(b"\0") if part]}
+            "patch": patch, "untracked": [part.decode("utf-8") for part in new_files.split(b"\0") if part and part.decode("utf-8") in paths]}
 
 
 @locked_repository
@@ -211,15 +291,20 @@ def commit(repository, message, expected_manifest):
     paths = changed_paths(repository)
     if not paths:
         return None
-    if git(repository["path"], "diff", "--cached", "--name-only"):
+    staged_before = git(repository["path"], "diff", "--cached", "--no-renames", "--name-only", "-z", binary=True)
+    preserved = {relative.casefold() for relative in repository.get("preserved_paths", [])}
+    if any(part.decode("utf-8").casefold() not in preserved for part in staged_before.split(b"\0") if part):
         raise WorkflowError("暂存区存在外部改动，已停止，未重新暂存。")
     git(repository["path"], "add", "--", *paths)
-    staged = git(repository["path"], "diff", "--cached", "--name-only", "-z", binary=True)
-    if sorted(part.decode("utf-8") for part in staged.split(b"\0") if part) != paths:
+    staged = git(repository["path"], "diff", "--cached", "--no-renames", "--name-only", "-z", binary=True)
+    if sorted(part.decode("utf-8") for part in staged.split(b"\0") if part and part.decode("utf-8").casefold() not in preserved) != paths:
         raise WorkflowError("实际暂存文件与本次修改清单不同，已停止。")
     if manifest([repository]) != expected_manifest:
         raise WorkflowError("暂存期间文件发生变化，已停止提交。")
-    git(repository["path"], "commit", "-m", message)
+    if preserved:
+        git(repository["path"], "commit", "--only", "-m", message, "--", *paths)
+    else:
+        git(repository["path"], "commit", "-m", message)
     return git(repository["path"], "rev-parse", "HEAD")
 
 
@@ -248,9 +333,11 @@ def cleanup_workspaces(store, state, repositories):
                     if "locked" in entry or "prunable" in entry:
                         raise WorkflowError(f"工作区被锁定或注册失效，已停止删除：{path}")
                     registered[str(path)] = source
-        expected = {str(Path(entry["path"]).resolve()): entry["source"] for entry in state["repos"]}
+        expected = {str(Path(entry["path"]).resolve()): entry["source"] for entry in state["repos"] if entry.get("workspace_owned", True)}
+        prepared = {entry["name"] for entry in state["repos"]}
         for index, selection in enumerate(state.get("selections", [])):
-            expected.setdefault(str(workspace / f"repo-{index + 1}"), selection["path"])
+            if selection["name"] not in prepared:
+                expected.setdefault(str(workspace / f"repo-{index + 1}"), selection["path"])
         for name, source in expected.items():
             path = Path(name)
             if path.parent != workspace:
@@ -267,7 +354,10 @@ def cleanup_workspaces(store, state, repositories):
                     raise WorkflowError(f"工作区目录包含链接：{path}")
                 if path.is_dir() and str(path.resolve()) not in registered:
                     raise WorkflowError(f"发现未登记的工作区目录，已停止删除：{path}")
+        claims = workspace_claims(store.sessions(), state["id"])
         for name, source in registered.items():
+            if name.casefold() in claims:
+                raise WorkflowError(f"工作区正在被会话 {claims[name.casefold()]} 使用，不能删除：{name}")
             path = Path(name)
             common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
             expected_common = Path(git(source, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()

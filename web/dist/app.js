@@ -203,11 +203,12 @@ function WorkflowApp() {
       const payload = await fetch(`/api/session?id=${encodeURIComponent(id)}`, { cache: "no-store" }).then(readResponse);
       receiveState(payload);
       const removed = payload.state.cleanup?.removed || [];
-      modal.confirm({ title: "删除会话及独立工作区？", okText: "删除会话", cancelText: "取消", okButtonProps: { danger: true }, width: 620,
+      modal.confirm({ title: "删除会话及其新建工作区？", okText: "删除会话", cancelText: "取消", okButtonProps: { danger: true }, width: 620,
         content: h("div", { className: "delete-description" }, h("p", null, itemLabel(payload.state)),
-          h(Alert, { type: "warning", showIcon: true, message: "会话记录、附件和独立工作区将被删除，Git 分支及提交保留。存在未提交文件时会停止删除。" }),
+          h(Alert, { type: "warning", showIcon: true, message: "会话记录、附件和本会话新建工作区将被删除；复用目录、Git 分支及提交保留。新建工作区存在未提交文件或被其他会话使用时会停止删除。" }),
           h("p", null, "会话资料目录："), h("div", { className: "repo-path" }, payload.directory),
-          h("p", null, "独立工作区："), payload.workspaces.length ? payload.workspaces.map(path => h("div", { key: path, className: "repo-path" }, path, removed.includes(path) && "（已清理）")) : h("p", { className: "muted" }, "尚未创建工作区")),
+          h("p", null, "本会话新建工作区："), payload.workspaces.length ? payload.workspaces.map(path => h("div", { key: path, className: "repo-path" }, path, removed.includes(path) && "（已清理）")) : h("p", { className: "muted" }, "没有需要删除的工作区"),
+          payload.reused_workspaces?.length > 0 && h(React.Fragment, null, h("p", null, "以下复用目录将保留："), payload.reused_workspaces.map(path => h("div", { key: path, className: "repo-path" }, path)))),
         onOk: async () => { if (!await act("delete_session", {}, id)) throw new Error("删除操作未提交"); } });
     } catch (error) { notice.error({ message: "无法删除会话", description: error.message }); }
   }
@@ -525,7 +526,7 @@ function WorkflowApp() {
           entry?.question && h(Alert, { type: "warning", showIcon: true, message: entry.question }),
           entry?.candidates.length > 0 && h("p", { className: "muted" }, `AI 候选：${entry.candidates.join("、")}`),
           entry?.refresh_state && h("p", { className: "muted" }, { running: "正在刷新远程分支…", done: "已刷新远程分支", failed: "远程分支刷新失败，修复连接后可恢复当前阶段" }[entry.refresh_state]),
-          workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }] }));
+          workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : [])] }));
       })),
       (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&
         h(CardBox, { title: "补充需求与验收标准" },
@@ -555,7 +556,7 @@ function WorkflowApp() {
                     const queue = imageQueues.current[state.id]; queue.tasks = queue.tasks.filter(entry => entry.uid !== task.uid); publishImageTransfers();
                   } }, "移除")))))),
           transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再开始计划。"),
-          ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "将建立独立工作区，保留原目录中的未提交修改"),
+          ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "优先复用目标分支或切换空闲目录，已有改动保留且不提交"),
             h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0, onClick: startPlan }, "开始需求分析与计划"))));
   }
 

@@ -326,7 +326,7 @@ class AutoDeliveryChecks(TestCase):
         self.assertEqual(self.state["commits"], {"前端": "first-sha"})
         self.assertEqual(self.state["stage"], "部分提交")
         self.flow.pause()
-        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.git", side_effect=["first-sha", ""]), patch("workflow.engine.commit", return_value="second-sha") as operation:
+        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.git", return_value="first-sha"), patch("workflow.engine.working_paths", return_value=[]), patch("workflow.engine.commit", return_value="second-sha") as operation:
             self.flow.finalize([], "")
         self.assertEqual(operation.call_count, 1)
         self.assertEqual(operation.call_args.args[0]["name"], "后端")

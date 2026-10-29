@@ -8,7 +8,7 @@ from threading import Lock, RLock
 
 from workflow.approvals import is_controlled_write
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
-from workflow.gitops import branch_catalog, commit, ensure_baseline, git, manifest, prepare, refresh_branches
+from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.store import SessionStore
@@ -328,16 +328,11 @@ class Workflow:
                     raise WorkflowError("已创建的工作区选择发生变化，请新建工作流处理，不会自动删除旧工作区。")
                 continue
             try:
-                repository = prepare(selection["path"], workspace / f"repo-{index + 1}", selection["branch"],
-                                     selection["base"], selection["create"], selection.get("track", False))
+                acquire_workspace(selection, workspace / f"repo-{index + 1}", self.store, state)
             except Exception:
                 state["stage"] = "准备工作区失败"
                 self.save()
                 raise
-            repository["name"] = selection["name"]
-            if "role" in selection:
-                repository["role"] = selection["role"]
-            state["repos"].append(repository)
             self.save()
         if set(existing) - {selection["name"] for selection in selections}:
             raise WorkflowError("不能移除已创建的工作区，请保留原选择。")
@@ -575,7 +570,7 @@ class Workflow:
                 if manifest([repository]):
                     raise WorkflowError("已记录无修改的仓库再次发生变化，已停止，不把新修改混入剩余提交。")
             elif previous:
-                if git(repository["path"], "rev-parse", "HEAD") != previous or git(repository["path"], "status", "--porcelain"):
+                if git(repository["path"], "rev-parse", "HEAD") != previous or working_paths(repository):
                     raise WorkflowError("已提交仓库再次发生变化，已停止，不把新修改混入剩余提交。")
         pending = [repo for repo in state["repos"] if repo["name"] not in state["commits"]]
         expected = {key: value for key, value in state["review_manifest"].items()

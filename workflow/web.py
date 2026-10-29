@@ -98,9 +98,11 @@ class WebApplication:
                 "event_cursor": runtime.event_cursor, "stream": runtime.stream,
                 "busy": runtime.busy, "working": runtime.engine.working(),
                 "directory": str(self.sessions.store.directory(state["id"])),
-                "workspaces": sorted({entry["path"] for entry in state["repos"]} |
+                "reused_workspaces": sorted({entry["path"] for entry in state["repos"] if not entry.get("workspace_owned", True)}),
+                "workspaces": sorted({entry["path"] for entry in state["repos"] if entry.get("workspace_owned", True)} |
                     {str(self.sessions.store.directory(state["id"]) / "workspace" / f"repo-{index + 1}")
-                     for index, _ in enumerate(state.get("selections", []))})}
+                     for index, selection in enumerate(state.get("selections", []))
+                     if selection["name"] not in {entry["name"] for entry in state["repos"]}})}
 
     def summary(self, runtime):
         return {**history_summary(runtime.engine.state), "busy": runtime.busy,
