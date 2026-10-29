@@ -507,7 +507,7 @@ function WorkflowApp() {
   function renderBranches() {
     const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy;
     const repositories = state.branch_resolution?.repositories || [];
-    const detailRepositories = model.settings.repositories.filter(repository => {
+    const detailRepositories = state.branch_resolution?.manual && !state.repos.length ? [] : model.settings.repositories.filter(repository => {
       const entry = repositories.find(entry => entry.role === repository.role);
       return state.repos.some(entry => entry.name === repository.name) || entry?.status === "needs_user" ||
         entry?.reason || entry?.question || entry?.candidates.length > 0 || entry?.refresh_state;
