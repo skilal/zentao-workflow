@@ -90,16 +90,17 @@ class Workflow:
             items.extend(self.zentao.list_items(kind))
         self.emit("items", items)
 
-    def collect(self, item):
+    def collect(self, items):
         if self.state and self.state["stage"] in ACTIVE | {"等待人工回答"}:
             raise WorkflowError("当前会话尚未暂停，不能切换工作项。")
         self._close_rpc()
-        self.state = self.store.new(item)
+        self.state = self.store.new(items[0])
+        self.state["items"] = items
         try:
-            self.state["snapshot"] = self.zentao.collect(item, self.store.directory(self.state["id"]))
+            self.state["snapshot"] = self.zentao.collect_many(items, self.store.directory(self.state["id"]))
             self.state["project"] = self.state["snapshot"]["project"]
             self.save()
-            self.note("系统", "资料已读取。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
+            self.note("系统", f"已读取 {len(items)} 个工作项的资料，将在同一会话中处理。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
         except Exception:
             self.state["stage"] = "资料读取失败"
             self.save()
@@ -375,15 +376,16 @@ class Workflow:
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
         turn_cwd = session_path if phase == "branch" else session_path / "workspace"
-        context = {"item": state["item"], "supplement": state["supplement"], "plan": state.get("approved_plan"),
+        context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"], "plan": state.get("approved_plan"),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
                    "feishu_links": state["snapshot"]["feishu_links"], "decisions": state["decisions"]}
         prompt = ("所有回答使用中文。系统命令、编译、构建、运行验证、依赖安装一律禁止。"
                   "当前阶段由控制器决定。只有 workflow MCP 的受控文件工具允许修改业务文件。"
-                  "需要业务选择或扩大计划范围时必须提问，不得自行决定。\n" + text +
+                  "需要业务选择或扩大计划范围时必须提问，不得自行决定。"
+                  "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。\n" + text +
                   "\n工作流上下文：\n" + dumps(context, ensure_ascii=False))
         if phase == "branch":
-            context = {"project": state["project"], "item": state["item"], "supplement": state["supplement"],
+            context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                        "sources": [{"title": source["title"], "content": source["content"]}
                                    for source in state["snapshot"]["sources"]],
                        "repositories": [{"role": entry["role"], "refreshed": entry["refreshed"], "branches": entry["catalog"]}
@@ -539,6 +541,11 @@ class Workflow:
         self.save()
         title = str(state["item"]["title"]).replace("\n", " ").replace("\r", " ")[:100]
         message = f"feat(zentao-{state['item']['kind']}-{state['item']['id']}): {title}"
+        items = state.get("items", [state["item"]])
+        if len(items) > 1:
+            ids = ",".join(str(item["id"]) for item in items)
+            title = "；".join(str(item["title"]).replace("\n", " ").replace("\r", " ") for item in items)[:100]
+            message = f"feat(zentao-tasks-{ids}): {title}"
         if state["item"]["kind"] == "bug":
             message = message.replace("feat(", "fix(", 1)
         for repository in pending:

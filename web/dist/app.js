@@ -17,6 +17,8 @@ const PAGES = {
 };
 
 function itemKey(item) { return item ? `${item.kind}:${item.id}` : ""; }
+function sessionItems(state) { return state.items || [state.item]; }
+function itemLabel(state) { return sessionItems(state).map(item => `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`).join("；"); }
 function timeLabel(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : ""; }
 function plainDescription(value) {
   return String(value || "").replaceAll("【spec】", "【需求描述】").replaceAll("【verify】", "【验收标准】")
@@ -39,7 +41,7 @@ function CardBox(props) { return h(Card, { className: "app-card", ...props }, pr
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
-  const summary = Object.fromEntries(["id", "item", "stage", "updated_at", "fix_round", "commits"].map(key => [key, state[key]]));
+  const summary = Object.fromEntries(["id", "item", "items", "stage", "updated_at", "fix_round", "commits"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)];
 }
 async function readResponse(response) {
@@ -61,7 +63,8 @@ function WorkflowApp() {
   const eventSource = useRef(null);
   const [fatal, setFatal] = useState("");
   const [sending, setSending] = useState("");
-  const [selectedItem, setSelectedItem] = useState("");
+  const [selectedItems, setSelectedItems] = useState([]);
+  const selectionRequest = useRef("");
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState({ supplement: "", reply: "", answers: {}, review_note: "", selected_findings: [] });
@@ -128,15 +131,29 @@ function WorkflowApp() {
   const review = state?.reviews?.at(-1);
   const findings = review?.result?.findings || [];
   const busy = Boolean(stopped || sending || model?.busy);
+  const selectedKey = selectedItems.join("|");
+  const loadedKey = state ? sessionItems(state).map(itemKey).join("|") : "";
+  const selectionMatches = Boolean(state?.snapshot) && selectedItems.length > 0 && selectedKey === loadedKey;
   useEffect(() => {
     if (!state || state.id === lastSession.current) return;
     lastSession.current = state.id;
-    setSelectedItem(itemKey(state.item));
+    setSelectedItems(sessionItems(state).map(itemKey));
     const saved = sessionStorage.getItem(`workflow-draft:${state.id}`);
     const value = saved ? JSON.parse(saved) : { supplement: state.supplement || "", reply: "", answers: {}, review_note: "", selected_findings: [] };
     draftRef.current = value;
     setDraft(value);
   }, [state?.id]);
+  useEffect(() => {
+    if (!selectedItems.length || selectionMatches || busy || !model?.connected || selectionRequest.current === selectedKey) return;
+    const timer = setTimeout(() => {
+      selectionRequest.current = selectedKey;
+      act("collect", { items: selectedItems.map(key => {
+        const [kind, id] = key.split(":");
+        return { kind, id: Number(id) };
+      }) });
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [selectedKey, loadedKey, busy, model?.connected]);
   useEffect(() => {
     if (!state || !review) return;
     const key = `${state.id}:${review.number}`;
@@ -167,6 +184,7 @@ function WorkflowApp() {
     finally { setSending(""); }
   }
   async function startPlan() {
+    if (!selectionMatches || busy) return;
     if (await act("plan", { supplement: draft.supplement })) navigate("plan");
   }
   async function answer() {
@@ -204,8 +222,15 @@ function WorkflowApp() {
   function renderItems() {
     const rows = model.items.filter(item => (filter === "all" || item.kind === filter) &&
       (!query.trim() || `${item.id} ${item.title}`.toLowerCase().includes(query.trim().toLowerCase())));
-    const chosen = model.items.find(item => itemKey(item) === selectedItem);
     const canCollect = !ACTIVE.has(stage) && stage !== "等待人工回答";
+    const selectionDisabled = busy || !canCollect || !model.connected;
+    function chooseItems(keys) {
+      if (selectionDisabled) return;
+      const added = keys.find(key => !selectedItems.includes(key));
+      const next = added && !added.startsWith("task:") ? [added] : keys.filter(key => key.startsWith("task:"));
+      selectionRequest.current = "";
+      setSelectedItems(next);
+    }
     const columns = [
       { title: "类型", dataIndex: "kind", width: 85, render: typeTag },
       { title: "编号", dataIndex: "id", width: 90, render: value => h(Typography.Text, { code: true }, `#${value}`) },
@@ -214,32 +239,38 @@ function WorkflowApp() {
       { title: "所属项目", dataIndex: "project", width: 120, render: value => /^\d+$/.test(String(value)) ? `项目 #${value}` : String(value || "—") },
       { title: "优先级", dataIndex: "priority", width: 80, render: value => value ? `P${value}` : "—" }
     ];
-    const snapshot = state?.snapshot;
+    const snapshot = selectionMatches ? state?.snapshot : null;
     return h("div", { className: "card-stack" },
       h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, { onClick: () => act("refresh"), disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表")) },
         h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => setFilter(event.target.value), optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => ({ value, label: `${label} ${model.items.filter(item => item.kind === value).length}` }))] }),
           h(Input.Search, { placeholder: "搜索编号或标题", allowClear: true, value: query, onChange: event => setQuery(event.target.value), style: { width: 260 } })),
         h(Table, { columns, dataSource: rows, rowKey: itemKey, size: "middle", pagination: rows.length > 10 ? { pageSize: 10, showSizeChanger: false } : false,
           scroll: { x: 700 }, locale: { emptyText: model.connected ? "暂无符合条件的待处理工作项" : "连接禅道后显示待处理工作项" }, rowClassName: "item-row",
-          rowSelection: { type: "radio", selectedRowKeys: selectedItem ? [selectedItem] : [], onChange: keys => setSelectedItem(keys[0]) },
-          onRow: record => ({ onClick: () => setSelectedItem(itemKey(record)) }) }),
+          rowSelection: { type: "checkbox", selectedRowKeys: selectedItems, preserveSelectedRowKeys: true, hideSelectAll: filter !== "task", onChange: chooseItems,
+            getCheckboxProps: () => ({ disabled: selectionDisabled }) },
+          onRow: record => ({ onClick: event => {
+            if (event.target.closest(".ant-table-selection-column")) return;
+            const key = itemKey(record);
+            chooseItems(selectedItems.includes(key) ? selectedItems.filter(value => value !== key) : [...selectedItems, key]);
+          } }) }),
         h("div", { className: "data-foot" }, h("span", { className: "muted" }, "仅显示直接指派给当前登录账号的待处理工作项"),
-          h(Button, { type: "primary", disabled: busy || !chosen || !canCollect || !model.connected, loading: model.busy === "collect", onClick: () => act("collect", { kind: chosen.kind, id: chosen.id }) }, "读取选中工作项"))),
-      h(CardBox, { title: state ? h(Space, null, "工作项资料", typeTag(state.item.kind), h("span", null, `#${state.item.id}`)) : "工作项资料" },
-        !snapshot ? h("div", { className: "empty-area" }, h(Empty, { description: "选择工作项后，读取完整描述、图片和附件" })) :
+          h(Space, null, (sending === "collect" || model.busy === "collect") && h(Spin, { size: "small" }),
+            h("span", { className: "muted" }, selectedItems.length ? `已选 ${selectedItems.length} 项 · 选中后自动读取资料` : "可多选同一项目的任务联合开发；需求和 Bug 单选")))),
+      h(CardBox, { title: snapshot ? h(Space, { wrap: true }, "工作项资料", ...sessionItems(state).map(item => h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id}`))) : "工作项资料" },
+        !snapshot ? h("div", { className: "empty-area" }, h(Empty, { description: model.busy === "collect" || sending === "collect" ? "正在读取所选工作项的完整资料…" : "勾选工作项后自动读取描述、图片、附件及关联需求" })) :
           h(React.Fragment, null,
             snapshot.blockers?.length > 0 && h(Alert, { type: "warning", showIcon: true, message: "有待补充的需求资料", description: h("div", null, snapshot.blockers.map((text, index) => h("div", { key: index }, text))), style: { marginBottom: 20 } }),
-            snapshot.sources.map((source, index) => h("div", { className: "source-block", key: `${source.kind}:${source.id}` },
-              h("div", { className: "source-heading" }, index > 0 && h(Tag, null, "关联资料"), h("strong", null, source.title), h(Typography.Text, { type: "secondary" }, `${TYPE_NAMES[source.kind]} #${source.id}`),
+            snapshot.sources.map((source, index) => h("div", { className: "source-block", key: `${source.kind}:${source.id}:${index}` },
+              h("div", { className: "source-heading" }, h(Tag, { color: source.selected ? "blue" : "default" }, source.selected || (source.selected == null && index === 0) ? "选中工作项" : "关联资料"), h("strong", null, source.title), h(Typography.Text, { type: "secondary" }, `${TYPE_NAMES[source.kind]} #${source.id}`),
                 source.version != null && h(Tag, null, `关联版本 ${source.version}`)),
               source.note && h(Typography.Text, { type: "secondary" }, source.note),
-              h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")))),
-            h("div", { className: "attachment-grid" }, snapshot.materials.map(material => {
+              h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")),
+              h("div", { className: "attachment-grid" }, snapshot.materials.filter(material => source.material_ids.includes(material.file_id)).map(material => {
               const url = `/api/material?session=${encodeURIComponent(state.id)}&file_id=${material.file_id}`;
               return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),
                 h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, `${material.title}.${material.extension}`)),
                 material.issue && h(Typography.Text, { type: "warning" }, material.issue));
-            })),
+            })))),
             snapshot.feishu_links?.length > 0 && h(Alert, { type: "info", showIcon: true, message: "飞书文档暂未接入", style: { marginTop: 18 },
               description: h("div", null, h("p", null, "如果文档中有必要业务规则，请在计划前补充相关内容。"), snapshot.feishu_links.map(url => h("div", { key: url }, h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, url)))) }))),
       snapshot && renderBranches());
@@ -293,7 +324,7 @@ function WorkflowApp() {
   }
 
   function renderPlan() {
-    if (!state) return h(CardBox, null, h(Empty, { description: "先读取工作项，再开始需求分析与计划" }));
+    if (!state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "先选择工作项并等待读取完成，再开始需求分析与计划" }));
     if (state.phase === "branch" || !state.repos.length) return h("div", { className: "card-stack" }, renderBranches(),
       h(CardBox, { title: "流程操作" }, h(Space, null,
         h(Button, { disabled: stopped || !ACTIVE.has(stage), onClick: () => act("pause") }, "暂停当前阶段"),
@@ -384,7 +415,7 @@ function WorkflowApp() {
   function renderHistory() {
     return h(CardBox, { title: "已保存的会话", extra: h("span", { className: "muted" }, "恢复查看不会自动继续执行") }, h(Table, {
       dataSource: model.history, rowKey: "id", pagination: { pageSize: 10, showSizeChanger: false, hideOnSinglePage: true }, scroll: { x: 750 }, locale: { emptyText: "还没有历史会话" },
-      columns: [{ title: "工作项", render: (_, entry) => h(Space, null, typeTag(entry.item.kind), h(Typography.Text, { code: true }, `#${entry.item.id}`), entry.item.title) },
+      columns: [{ title: "工作项", render: (_, entry) => h(Space, { direction: "vertical", size: 4 }, ...sessionItems(entry).map(item => h(Space, { key: itemKey(item) }, typeTag(item.kind), h(Typography.Text, { code: true }, `#${item.id}`), item.title))) },
         { title: "阶段", dataIndex: "stage", width: 160, render: stageTag }, { title: "更新时间", dataIndex: "updated_at", width: 175, render: timeLabel },
         { title: "操作", width: 100, render: (_, entry) => h(Button, { type: "link", disabled: busy || ACTIVE.has(stage) || stage === "等待人工回答", onClick: async () => { if (await act("restore", { id: entry.id })) navigate(entry.stage === "资料已读取" ? "items" : "plan"); } }, "恢复查看") }]
     }));
@@ -411,7 +442,7 @@ function WorkflowApp() {
           !online && h(Alert, { className: "offline-banner", type: stopped ? "info" : "warning", showIcon: true, message: stopped ? "本地服务已停止" : "与本地服务的实时连接暂时中断", description: stopped ? "会话记录已保留。需要继续时，重新运行启动脚本后刷新页面。" : "页面会尝试恢复事件连接；如果服务已重启，请刷新页面。", action: h(Button, { onClick: () => location.reload() }, "刷新页面") }),
           state?.error && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
-          h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item" }, state ? `${TYPE_NAMES[state.item.kind]} #${state.item.id} · ${state.item.title}` : "选择工作项，开始一次完整的需求交付"), stageTag(stage)),
+          h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"), stageTag(stage)),
             h(Steps, { current: stepOf(state), size: "small", responsive: false, items: ["选择工作项", "制定计划", "实施修改", "Review", "本地提交"].map(title => ({ title })) })),
           renderers[page](), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
     h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },

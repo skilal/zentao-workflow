@@ -22,7 +22,7 @@ class SessionStore:
     def new(self, item):
         session_id = f"{item['kind']}-{item['id']}-{uuid4().hex[:10]}"
         state = {
-            "id": session_id, "item": item, "stage": "资料已读取", "phase": "plan",
+            "id": session_id, "item": item, "items": [item], "stage": "资料已读取", "phase": "plan",
             "created_at": timestamp(), "updated_at": timestamp(), "repos": [],
             "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
             "approved_plan": "", "approved_hash": "", "supplement": "",

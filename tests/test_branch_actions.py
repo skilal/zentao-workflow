@@ -8,6 +8,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
+from workflow.mcp_server import Tools
 from workflow.settings import ROOT, WorkflowError
 from workflow.web import WebApplication, public_state
 
@@ -86,3 +87,47 @@ class BranchActionChecks(TestCase):
         self.assertEqual(state["project"]["id"], 41)
         self.assertEqual(state["branch_resolution"]["repositories"][0]["candidates"], ["示例分支"])
         self.assertNotIn("raw", state["snapshot"]["sources"][0])
+
+    def test_collect_passes_all_selected_tasks_using_server_side_metadata(self):
+        items = [{"kind": "task", "id": 7, "title": "前端任务"},
+                 {"kind": "task", "id": 8, "title": "后端任务"}]
+        self.application.items = items
+        operation = self.application.engine.collect = Mock()
+        self.application.dispatch(self.request("collect", {"items": [
+            {"kind": "task", "id": 7, "title": "客户端伪造标题"}, {"kind": "task", "id": 8}]}))
+        operation.assert_called_once_with(items)
+
+    def test_collect_rejects_empty_duplicate_unknown_and_mixed_selections(self):
+        task = {"kind": "task", "id": 7}
+        story = {"kind": "story", "id": 8}
+        self.application.items = [task, story]
+        operation = self.application.engine.collect = Mock()
+        for choices in ([], [task, task], [task, story], [{"kind": "task", "id": 9}],
+                        [{"kind": "task", "id": True}], [{"kind": [], "id": 7}], [None]):
+            with self.subTest(choices=choices), self.assertRaises(WorkflowError):
+                self.application.dispatch(self.request("collect", {"items": choices}))
+        operation.assert_not_called()
+
+    def test_joint_collection_survives_restore_history_and_mcp_context(self):
+        items = [{"kind": "task", "id": 7, "title": "前端任务"},
+                 {"kind": "task", "id": 8, "title": "后端任务"}]
+        self.application.items = items
+        snapshot = {"items": items, "project": {"id": 41, "name": "示例项目"}, "sources": [], "materials": []}
+        with patch.object(self.application.engine.zentao, "collect_many", return_value=snapshot):
+            self.application.dispatch(self.request("collect", {"items": items}))
+        session_id = self.application.engine.state["id"]
+        self.application.engine.restore(session_id)
+        self.assertEqual(self.application.state["items"], items)
+        self.assertEqual(self.application.snapshot()["history"][0]["items"], items)
+        self.assertEqual(Tools(session_id).call("task_context", {})["items"], items)
+
+    def test_joint_delivery_commit_description_identifies_both_tasks(self):
+        self.state.update(stage="等待修复选择", items=[self.state["item"], {"kind": "task", "id": 8, "title": "前端任务"}],
+                          repos=[{"name": "前端", "path": "模拟前端工作区"}, {"name": "后端", "path": "模拟后端工作区"}],
+                          reviews=[{"result": {"findings": []}}], review_manifest={})
+        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit", return_value="模拟提交") as commit:
+            self.application.engine.finalize([], "")
+        self.assertEqual(commit.call_count, 2)
+        for call in commit.call_args_list:
+            self.assertIn("zentao-tasks-7,8", call.args[1])
+            self.assertIn("脱敏工作项；前端任务", call.args[1])

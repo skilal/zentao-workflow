@@ -18,7 +18,7 @@ from webbrowser import open as open_browser
 from workflow.engine import ACTIVE, Workflow
 from workflow.gitops import branches, differences, safe_file
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
-from workflow.zentao import KINDS, ZentaoClient
+from workflow.zentao import KINDS, ZentaoClient, identifier, parse_description
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -30,12 +30,24 @@ def public_state(state):
         return None
     result = deepcopy(state)
     for source in result.get("snapshot", {}).get("sources", []):
-        source.pop("raw", None)
+        raw = source.pop("raw", {})
+        # 旧会话没有资料归属字段，从已保存的原始正文恢复图片和附件的关联。
+        if "material_ids" not in source:
+            files = raw.get("files", [])
+            if isinstance(files, dict):
+                files = files.values()
+            material_ids = [identifier(file.get("id")) for file in files]
+            for field in ("spec", "verify", "desc", "steps", "bugSteps"):
+                for url in parse_description(raw.get(field)).images:
+                    query = parse_qs(urlparse(url).query)
+                    if "fileID" in query:
+                        material_ids.append(identifier(query["fileID"][0]))
+            source["material_ids"] = list(dict.fromkeys(material_ids))
     return result
 
 
 def history_summary(state):
-    return {key: state.get(key) for key in ("id", "item", "stage", "updated_at", "fix_round", "commits")}
+    return {key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")}
 
 
 class WebApplication:
@@ -179,11 +191,23 @@ class WebApplication:
             elif action == "refresh":
                 operation, arguments, affects = self.engine.refresh, (), False
             elif action == "collect":
-                kind, item_id = data.get("kind"), data.get("id")
-                item = next((item for item in self.items if item["kind"] == kind and item["id"] == item_id), None)
-                if not item:
-                    raise WorkflowError("请从当前登录账号的待处理列表中选择工作项。")
-                operation, arguments = self.engine.collect, (deepcopy(item),)
+                choices = data.get("items")
+                if not isinstance(choices, list) or not choices:
+                    raise WorkflowError("请选择至少一个工作项。")
+                available = {(item["kind"], item["id"]): item for item in self.items}
+                selected, seen = [], set()
+                for choice in choices:
+                    if (not isinstance(choice, dict) or not isinstance(choice.get("kind"), str) or choice["kind"] not in KINDS
+                            or type(choice.get("id")) is not int):
+                        raise WorkflowError("工作项类型或编号无效。")
+                    key = (choice["kind"], choice["id"])
+                    if key not in available or key in seen:
+                        raise WorkflowError("请从当前登录账号的待处理列表中选择不重复的工作项。")
+                    selected.append(deepcopy(available[key]))
+                    seen.add(key)
+                if len(selected) > 1 and any(item["kind"] != "task" for item in selected):
+                    raise WorkflowError("仅任务支持多选联合开发，需求和 Bug 请单独选择。")
+                operation, arguments = self.engine.collect, (selected,)
             elif action in {"plan", "edit_branches"}:
                 supplement = data.get("supplement", "")
                 if not isinstance(supplement, str) or "selections" in data:
