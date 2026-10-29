@@ -21,6 +21,10 @@ def load_settings():
         raise WorkflowError("修复轮次上限必须为非负整数。")
     if not settings["codex"]["command"] or not isinstance(settings["codex"]["command"], list):
         raise WorkflowError("codex.command 必须是明确的命令参数数组。")
+    compile_check = settings.get("compile_check", {"enabled": False})
+    if not isinstance(compile_check, dict) or type(compile_check.get("enabled")) is not bool:
+        raise WorkflowError("compile_check.enabled 必须是布尔值。")
+    settings["compile_check"] = compile_check
     return settings
 
 

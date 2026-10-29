@@ -13,12 +13,12 @@ DOMPurify.addHook("afterSanitizeAttributes", node => {
 });
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
-const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中"]);
+const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"]);
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
   items: ["工作项与资料", "从指派给你的需求、任务和 Bug 中，选择本次处理对象。"],
   plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
-  settings: ["工作流设置", "管理禅道账号、固定 Review 提示词和默认修复轮次。"]
+  settings: ["工作流设置", "管理禅道账号、后端编译检查、固定 Review 提示词和默认修复轮次。"]
 };
 
 function itemKey(item) { return item ? `${item.kind}:${item.id}` : ""; }
@@ -37,7 +37,7 @@ function stageTag(stage) {
 function stepOf(state) {
   if (!state) return 0;
   if (state.phase === "complete") return state.stage === "已完成（未审查）" ? 2 : 4;
-  if (state.phase === "followup") return 2;
+  if (["followup", "compile", "compile_fix"].includes(state.phase)) return 2;
   if (state.reviews?.length || state.phase === "review" || state.phase === "fix") return 3;
   if (state.phase === "implement") return 2;
   if (state.repos?.length) return 1;
@@ -60,6 +60,7 @@ function mergeHistory(history, state) {
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
 function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
+  compile_check_enabled: state?.plan_started_at ? Boolean(state.compile_check?.enabled) : Boolean(settings?.compile_check_enabled),
   codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
 const EFFORT_NAMES = { none: "无", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最大", ultra: "超高" };
 function CodexSelection({ value, onChange, onReady, disabled }) {
@@ -504,7 +505,7 @@ function WorkflowApp() {
   async function startPlan() {
     if (!selectionMatches || busy || imageQueues.current[state.id]?.tasks.length || (!state.codex && !sessionSelection)) return;
     const id = state.id;
-    if (await act("plan", { ...(state.codex || sessionSelection), supplement: draft.supplement }) && modelRef.current.selectedSessionId === id) navigate("plan");
+    if (await act("plan", { ...(state.codex || sessionSelection), compile_check_enabled: state.plan_started_at ? Boolean(state.compile_check?.enabled) : draft.compile_check_enabled, supplement: draft.supplement }) && modelRef.current.selectedSessionId === id) navigate("plan");
   }
   async function answer() {
     if (state.phase === "complete") {
@@ -726,6 +727,10 @@ function WorkflowApp() {
             key: state.id, value: draft.codex, disabled: !editable, onReady: setSessionSelection,
             onChange: codex => changeDraft({ codex }) }),
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `会话模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
+          !state.plan_started_at && h("div", { className: "action-bar" },
+            h(Checkbox, { checked: draft.compile_check_enabled, disabled: !editable,
+              onChange: event => changeDraft({ compile_check_enabled: event.target.checked }) }, "Review 前自动检查后端编译"),
+            h(Typography.Text, { type: "secondary" }, "仅检查有改动的后端模块；前端继续 Review。需要下载依赖时等待人工选择。")),
           ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "开始后固定模型与推理强度；已有改动保留且不提交"),
             h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0 || (!state.codex && !sessionSelection), onClick: startPlan }, "开始需求分析与计划"))));
   }
@@ -775,6 +780,7 @@ function WorkflowApp() {
     return h("div", { className: "conversation-grid" },
       h("div", { className: "card-stack" },
         renderBranches(),
+        renderCompileChecks(),
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           h("div", { className: "conversation-feed", ref: feedRef }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
@@ -836,6 +842,40 @@ function WorkflowApp() {
         })) }))));
   }
 
+  function renderCompileChecks() {
+    const checks = state.compile_checks || [];
+    const latest = checks.at(-1);
+    const statusNames = { pending: "等待检查", running: "正在检查", passed: "通过", skipped: "人工跳过",
+      dependencies: "缺少依赖", blocked: "需要人工处理", code_error: "代码错误", excluded: "不再检查" };
+    return h(CardBox, { title: "后端编译检查", extra: h(Tag, null, state.compile_check?.enabled ? "已开启" : "已关闭") },
+      checks.length === 0 ? h(Typography.Text, { type: "secondary" }, state.compile_check?.enabled ? "实施或修复完成后，按模块检查有任务改动的后端；前端继续参与 Review。" : "本会话不自动执行后端编译检查。") :
+        h(Collapse, { defaultActiveKey: [latest.id], key: latest.id, ghost: true, items: checks.map((batch, index) => ({
+          key: batch.id, label: `第 ${index + 1} 次检查 · 第 ${batch.delivery_round} 轮交付 · 自动修复 ${batch.fix_round}/${batch.limit}`,
+          children: h(Space, { direction: "vertical", style: { width: "100%" } }, batch.repositories.length === 0 && "没有需要编译的后端任务改动，前端仍按原流程参与 Review。",
+            batch.repositories.map(entry => {
+              const current = state.repos.some(repo => repo.name === entry.name && repo.role === "backend") &&
+                batch.id === latest.id && batch.delivery_round === state.delivery_round && state.phase === "compile" &&
+                ["等待编译选择", "已暂停", "已停止"].includes(stage) && !["passed", "skipped", "pending", "excluded"].includes(entry.status);
+              const retired = state.repos.some(repo => repo.name === entry.name && repo.role === "frontend") &&
+                batch.id === latest.id && batch.delivery_round === state.delivery_round && state.phase === "compile" &&
+                ["等待编译选择", "已暂停", "已停止"].includes(stage) && !["passed", "skipped", "excluded"].includes(entry.status);
+              const choose = decision => act("compile_decision", { batch_id: batch.id, repository: entry.name, decision });
+              return h("div", { className: "question", key: entry.name },
+                h(Space, null, h("strong", null, entry.name), h(Tag, { color: entry.status === "passed" ? "success" : entry.status === "skipped" ? "default" : "gold" }, statusNames[entry.status] || entry.status)),
+                h("p", null, entry.summary),
+                entry.modules.length > 0 && h(Typography.Paragraph, { type: "secondary" }, `模块：${entry.modules.join("、")}（含所需模块）`),
+                entry.diagnostics?.map((diagnostic, number) => h("p", { key: number }, `${diagnostic.path}:${diagnostic.line} · ${diagnostic.message}`)),
+                retired && h(Button, { disabled: busy, onClick: () => choose("retry") }, "前端检查已取消，继续后端流程"),
+                current && h(Space, { wrap: true },
+                  entry.status === "dependencies" && h(Button, { disabled: busy, onClick: () => choose("download") }, "允许下载并继续"),
+                  h(Button, { disabled: busy, onClick: () => choose("retry") }, "重新检查"),
+                  h(Button, { disabled: busy, onClick: () => choose("skip") }, "跳过该仓库本轮检查"),
+                  entry.status === "code_error" && batch.fix_round >= batch.limit && h(Button, { disabled: busy, onClick: () => choose("add_round") }, "追加一轮编译修复"),
+                  h(Button, { disabled: busy, onClick: () => choose("pause") }, "暂停")));
+            })),
+        })) }));
+  }
+
   function renderReview(entry, originalText) {
     const latest = entry.number === review?.number && (entry.delivery_round || 1) === state.delivery_round && state.phase !== "complete";
     const findings = entry.result.findings;
@@ -883,6 +923,8 @@ function WorkflowApp() {
           h(Form.Item, { name: "account", label: "登录账号", rules: [{ required: true, message: "请填写账号" }] }, h(Input, { autoComplete: "off" })),
           h(Form.Item, { name: "password", label: "登录密码", extra: "留空保持已保存值；填写后使用本机加密保存" }, h(Input.Password, { autoComplete: "new-password", placeholder: "不回显已保存的密码" })),
           h(Form.Item, { name: "max_fix_rounds", label: "默认修复轮次上限", rules: [{ required: true, message: "请填写轮次" }] }, h(InputNumber, { min: 0, precision: 0, className: "full-width" }))),
+        h(Form.Item, { name: "compile_check_enabled", valuePropName: "checked", extra: "仅检查后端改动模块及所需模块；前端继续 Review。新会话可单独调整。" },
+          h(Checkbox, null, "Review 前自动检查后端编译")),
         h(Form.Item, { name: "model", hidden: true }, h(Input)),
         h(Form.Item, { name: "reasoning_effort", hidden: true }, h(Input)),
         h(Form.Item, { label: "新会话默认模型", extra: "开始会话前可单独调整，已开始的会话保持原配置。" },

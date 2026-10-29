@@ -38,6 +38,8 @@ def public_state(state):
     result.setdefault("followup_images", [])
     result.setdefault("delivery_round", 1)
     result.setdefault("deliveries", [])
+    result.setdefault("compile_checks", [])
+    result.setdefault("compile_check", {"enabled": False})
     # 旧记录只在响应副本中关联原文，不修改磁盘上的会话数据。
     cursor = 0
     for review in result.get("reviews", []):
@@ -190,6 +192,7 @@ class WebApplication:
         return {"base_url": self.settings["zentao"]["base_url"], "account": self.settings["zentao"]["account"],
                 "model": self.settings["codex"]["model"], "reasoning_effort": self.settings["codex"]["reasoning_effort"],
                 "max_fix_rounds": self.settings["review"]["max_fix_rounds"],
+                "compile_check_enabled": self.settings.get("compile_check", {}).get("enabled", False),
                 "max_attachment_mb": self.settings["zentao"]["max_attachment_mb"],
                 "review_prompt": (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(),
                 "repositories": deepcopy(self.settings["repositories"]), "feishu_enabled": False}
@@ -386,6 +389,9 @@ class WebApplication:
         maximum = data.get("max_fix_rounds")
         prompt = str(data.get("review_prompt", "")).strip()
         password = data.get("password", "")
+        compile_enabled = data.get("compile_check_enabled", self.settings.get("compile_check", {}).get("enabled", False))
+        if type(compile_enabled) is not bool:
+            raise WorkflowError("编译检查开关必须是布尔值。")
         if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
             raise WorkflowError("请填写不包含凭据的完整禅道 HTTP 地址。")
         if not account or not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0 or not prompt:
@@ -402,6 +408,7 @@ class WebApplication:
             self.settings["zentao"].update(base_url=url, account=account)
             self.settings["codex"].update(model=model, reasoning_effort=effort)
             self.settings["review"]["max_fix_rounds"] = maximum
+            self.settings["compile_check"] = {"enabled": compile_enabled}
             (ROOT / self.settings["review"]["prompt_file"]).write_text(prompt + "\n", encoding="utf-8")
             save_settings(self.settings)
         with self.sessions.zentao_lock:
@@ -456,8 +463,11 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
+                if ("plan_started_at" in state and "compile_check_enabled" in data
+                        and data["compile_check_enabled"] != state.get("compile_check", {}).get("enabled", False)):
+                    raise WorkflowError("会话编译检查配置已经固定，不能再次修改。")
                 saved = state.get("codex")
                 if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
                     raise WorkflowError("会话模型配置已经固定，请新建会话使用其他配置。")
@@ -501,6 +511,10 @@ class WebApplication:
                     state["codex"] = validate_selection(self.codex_models(), data.get("model"), data.get("reasoning_effort"))
                     engine.save()
                 if "plan_started_at" not in engine.state:
+                    enabled = data.get("compile_check_enabled", self.settings.get("compile_check", {}).get("enabled", False))
+                    if type(enabled) is not bool:
+                        raise WorkflowError("编译检查开关必须是布尔值。")
+                    engine.state["compile_check"] = {"enabled": enabled}
                     engine.state["plan_started_at"] = timestamp()
                     engine.store.save(engine.state)
                 operation, arguments = engine.start_plan, (supplement, action == "edit_branches")
@@ -549,6 +563,10 @@ class WebApplication:
                 operation, arguments = engine.add_round, ()
             elif action == "rereview":
                 operation, arguments = engine.rereview, ()
+            elif action == "compile_decision":
+                if any(not isinstance(data.get(key), str) or not data[key] for key in ("batch_id", "repository", "decision")):
+                    raise WorkflowError("请选择当前编译检查及有效操作。")
+                operation, arguments = engine.compile_decision, (data["batch_id"], data["repository"], data["decision"])
             elif action == "finalize":
                 ids = self._ids(data)
                 operation, arguments = engine.finalize, (ids, str(data.get("note", "")))

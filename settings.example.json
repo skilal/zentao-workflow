@@ -22,6 +22,9 @@
     "prompt_file": "prompts/review.md",
     "max_fix_rounds": 3
   },
+  "compile_check": {
+    "enabled": false
+  },
   "feishu_enabled": false,
   "web": {
     "host": "127.0.0.1",

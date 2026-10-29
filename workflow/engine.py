@@ -9,6 +9,8 @@ from threading import Lock, RLock
 
 from workflow.approvals import is_controlled_write
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
+from workflow.compile_flow import CompileFlow
+from workflow.compile_checks import compile_context
 from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.rpc import AppServer, thread_parameters
@@ -32,9 +34,9 @@ FINDING_SCHEMA = {"type": "object", "properties": {
     }, "required": ["id", "evidence"], "additionalProperties": False}}
 }, "required": ["summary", "findings", "resolved_previous"], "additionalProperties": False}
 
-ACTIVE = {"识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中"}
+ACTIVE = {"识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"}
 COMPLETE = {"已完成（静态审查）", "已完成（未审查）"}
-PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中"}
+PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中", "compile_fix": "编译修复中"}
 
 
 def parse_review(text):
@@ -65,7 +67,7 @@ def parse_review(text):
     return result
 
 
-class Workflow:
+class Workflow(CompileFlow):
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
         self.emit = emit
@@ -88,6 +90,7 @@ class Workflow:
         self.job_lock = Lock()
         self.jobs = 0
         self.turn_running = False
+        self.compile_runner = None
 
     def working(self):
         with self.job_lock:
@@ -530,12 +533,15 @@ class Workflow:
                    "feishu_links": state["snapshot"]["feishu_links"],
                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
-                   "review_enabled": state.get("review_enabled", True)}
+                   "review_enabled": state.get("review_enabled", True),
+                   "compile_check": state.get("compile_check", {"enabled": False}),
+                   "compile_checks": compile_context(state)}
         scope = ("原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
                  "获取信息时只读取并回答；明确要求修改时才处理对应修改。是否自动 Review 由控制器决定。"
                  if state.get("followup") else
                  "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。")
-        prompt = ("所有回答使用中文。系统命令、编译、构建、运行验证、依赖安装一律禁止。"
+        prompt = ("所有回答使用中文。模型禁止执行系统命令、编译、构建、运行验证和依赖安装。"
+                  "开启编译检查时仅由控制器执行，模型只处理控制器明确授权的编译代码修复。"
                   "当前阶段由控制器决定。只有 workflow MCP 的受控文件工具允许修改业务文件。"
                   "需要业务选择或扩大计划范围时必须提问，不得自行决定。"
                   + scope + "\n" + text +
@@ -629,6 +635,7 @@ class Workflow:
 
     def _begin_review(self):
         state = self.state
+        self._guard_compile()
         state["review_manifest"] = manifest(state["repos"])
         state["phase"] = "review"
         prompt = (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip()
@@ -646,6 +653,7 @@ class Workflow:
                          "仅输出符合给定 Schema 的 JSON。每个问题必须给出具体需求、代码证据、处理建议和影响。"
                          "已有问题仍存在时填写 previous_id，新问题填空字符串；上轮问题确已解决时在 resolved_previous 中给出原编号及具体代码证据。"
                          "未提及也未明确说明解决依据的旧问题会继续保留，不能以遗漏方式将其视为通过。"
+                         "编译检查仅覆盖后端，结果见上下文 compile_checks；前端仍须审查，跳过编译不能视为编译通过。"
                          "\n上轮审查：" + dumps(previous, ensure_ascii=False), FINDING_SCHEMA)
 
     def fix(self, selected_ids, note):
@@ -680,12 +688,14 @@ class Workflow:
         if self.state["commits"]:
             raise WorkflowError("已经发生部分提交，请先处理提交状态。")
         self.state["pause_requested"] = False
-        self._begin_review()
+        self._before_review()
 
     def finalize(self, accepted_ids, acceptance_note, automatic=False):
         state = self.require_state("等待修复选择", "部分提交")
         if self.closed or (automatic and state.get("pause_requested")):
             return
+        if not state["commits"]:
+            self._guard_compile()
         findings = self.current_reviews()[-1]["result"]["findings"]
         if set(accepted_ids) != {finding["id"] for finding in findings}:
             raise WorkflowError("结束前必须明确接受所有仍存在的问题；否则请选择修复。")
@@ -742,10 +752,12 @@ class Workflow:
             return
         was_active = state["stage"] in ACTIVE | {"等待人工回答"}
         state["pause_requested"] = True
+        if self.compile_runner:
+            self.compile_runner.stop()
         state["stage"] = "部分提交" if state["commits"] else "已暂停"
         state["last_output"] = self.last_message or "\n\n".join(self.output.values())
         self.save()
-        if self.rpc and state.get("turn_id") and was_active:
+        if self.rpc and state.get("turn_id") and was_active and state["phase"] != "compile":
             self.rpc.request("turn/interrupt", {"threadId": state["thread_id"], "turnId": state["turn_id"]})
         state["pending"] = None
         self.save()
@@ -766,6 +778,15 @@ class Workflow:
         if state["commits"]:
             raise WorkflowError("存在部分提交，只能先完成或处理该提交过程。")
         state["pause_requested"] = False
+        if state["phase"] == "compile":
+            self._resume_compile()
+            return
+        if state["phase"] == "compile_fix":
+            batch = self._compile_batch()
+            repository = next(repo for repo in state["repos"] if repo["name"] == batch["repair_repository"])
+            if repository["role"] != "backend":
+                self._compile_repaired()
+                return
         if state.get("followup") and not state.get("prepare_complete"):
             self._prepare_followup()
             return
@@ -903,23 +924,17 @@ class Workflow:
             round_state = state.get("plan_round")
             if plan and round_state is not None and round_state["turns"] == 1 and not round_state["asked"]:
                 self._implement_plan("auto")
-        elif state["phase"] in ("implement", "fix", "followup"):
+        elif state["phase"] in ("implement", "fix", "followup", "compile_fix"):
             if "[需要澄清]" in text or "[需要重做计划]" in text:
                 if "[需要重做计划]" in text:
                     self._new_plan_round()
                 state["stage"] = "等待计划补充"
                 self.save()
             else:
-                if state.get("followup") and "review_enabled" in state:
-                    changes = manifest(state["repos"])
-                    if not state["review_enabled"] or not changes:
-                        state.update(phase="complete", stage="已完成（未审查）")
-                        self.save()
-                        self.note("系统", ("本轮有代码修改，已保留在工作区。" if changes else "本轮无代码修改。") +
-                                  ("Review 开关已关闭。" if not state["review_enabled"] else "无代码修改，跳过 Review。") +
-                                  "未执行自动 Review 和本地提交，未 push，未修改禅道状态。")
-                        return
-                self._begin_review()
+                if state["phase"] == "compile_fix":
+                    self._compile_repaired()
+                else:
+                    self._before_review()
         elif state["phase"] == "review":
             if manifest(state["repos"]) != state["review_manifest"]:
                 raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
@@ -963,6 +978,8 @@ class Workflow:
 
     def close(self):
         self.closed = True
+        if self.compile_runner:
+            self.compile_runner.stop()
         try:
             self._close_rpc()
         finally:

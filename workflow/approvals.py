@@ -19,7 +19,7 @@ def is_controlled_write(state, params):
     if metadata.get("codex_approval_kind") != "mcp_tool_call":
         return False
     tool = WRITE_TOOL_DESCRIPTIONS.get(metadata.get("tool_description"))
-    if not tool or state["stage"] not in ("实施中", "修复中", "续聊处理中"):
+    if not tool or state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中"):
         return False
     if not write_authorized(state):
         return False
@@ -32,6 +32,13 @@ def is_controlled_write(state, params):
     if repository is None:
         return False
     relative = arguments.get("path", "")
+    if state["stage"] == "编译修复中":
+        checks = state.get("compile_checks", [])
+        if (repository["role"] != "backend" or not state.get("compile_check", {}).get("enabled")
+                or not checks or checks[-1]["status"] != "repairing"
+                or arguments.get("repository") != checks[-1].get("repair_repository")
+                or Path(relative).as_posix() not in checks[-1].get("repair_paths", [])):
+            return False
     if not relative or any(part.casefold() in SKIP for part in Path(relative).parts):
         return False
     if Path(relative).name.casefold() in ("agents.md", "claude.md", "qwen.md"):

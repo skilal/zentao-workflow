@@ -6,6 +6,7 @@ from pathlib import Path
 from sys import stdin, stdout
 
 from workflow.gitops import differences, git, safe_file
+from workflow.compile_checks import compile_context
 from workflow.settings import WorkflowError
 from workflow.store import SessionStore, write_authorized
 
@@ -23,9 +24,9 @@ TOOLS = [
     ("search_text", "在指定仓库文本中搜索字面量；最多返回 100 项并明确标记截断。", schema({"repository": STRING, "text": STRING, "pattern": STRING}, ("repository", "text"))),
     ("baseline_file", "读取实施前基线中的指定文件，用于区分原有与新增问题。", schema(FILE_ARGS, ("repository", "path"))),
     ("changes", "读取相对初始基线的累计差异；超长时用文件工具逐项查看。", schema({"repository": STRING}, ("repository",))),
-    ("write_file", "仅实施或修复阶段可用：写入一个工作区内 UTF-8 文件。", schema({**FILE_ARGS, "content": STRING}, ("repository", "path", "content"))),
-    ("replace_text", "仅实施或修复阶段可用：精确替换唯一一处文本，匹配不唯一则停止。", schema({**FILE_ARGS, "old": STRING, "new": STRING}, ("repository", "path", "old", "new"))),
-    ("delete_file", "仅实施或修复阶段可用：删除计划范围内的一个普通文件。", schema(FILE_ARGS, ("repository", "path"))),
+    ("write_file", "仅控制器授权的实施或修复阶段可用：写入一个工作区内 UTF-8 文件；编译修复限诊断文件。", schema({**FILE_ARGS, "content": STRING}, ("repository", "path", "content"))),
+    ("replace_text", "仅控制器授权的实施或修复阶段可用：精确替换唯一一处文本；编译修复限诊断文件。", schema({**FILE_ARGS, "old": STRING, "new": STRING}, ("repository", "path", "old", "new"))),
+    ("delete_file", "仅控制器授权的实施或修复阶段可用：删除范围内普通文件；编译修复限诊断文件。", schema(FILE_ARGS, ("repository", "path"))),
 ]
 SKIP = {".git", ".local", ".codex", ".idea", ".husky", "node_modules", "target", "dist", "build", "logs", "__pycache__", ".venv", "outputs", "output"}
 
@@ -81,7 +82,9 @@ class Tools:
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
-                    "review_enabled": state.get("review_enabled", True)}
+                    "review_enabled": state.get("review_enabled", True),
+                    "compile_check": state.get("compile_check", {"enabled": False}),
+                    "compile_checks": compile_context(state)}
         repositories = {repository["name"]: repository for repository in state["repos"]}
         repository = repositories.get(arguments.get("repository"))
         if repository is None:
@@ -137,8 +140,15 @@ class Tools:
         if name not in ("write_file", "replace_text", "delete_file"):
             raise WorkflowError("未知 MCP 工具。")
         authorized = write_authorized(state) if state.get("approval_source") == "followup" else state.get("approved_hash")
-        if state["stage"] not in ("实施中", "修复中", "续聊处理中") or not authorized:
+        if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not authorized:
             raise WorkflowError("当前阶段禁止修改文件，必须等待计划确认或修复选择。")
+        if state["stage"] == "编译修复中":
+            checks = state.get("compile_checks", [])
+            if (repository["role"] != "backend" or not write_authorized(state)
+                    or not state.get("compile_check", {}).get("enabled") or not checks
+                    or checks[-1]["status"] != "repairing" or repository["name"] != checks[-1].get("repair_repository")
+                    or Path(relative).as_posix() not in checks[-1].get("repair_paths", [])):
+                raise WorkflowError("编译修复只能修改控制器授权的本次错误文件。")
         if path.relative_to(Path(repository["path"]).resolve()).as_posix().casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
             raise WorkflowError("该文件包含任务开始前的本机保留改动，不会自动修改或提交；需要修改时请先取得用户明确指示。")
         if path.name.casefold() in ("agents.md", "claude.md", "qwen.md"):
