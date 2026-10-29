@@ -3,7 +3,7 @@
 const { useState, useEffect, useRef } = React;
 const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Checkbox,
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
-  Drawer, Collapse, Spin, notification, Divider, Descriptions } = antd;
+  Drawer, Collapse, Spin, notification, Divider, Descriptions, Tooltip } = antd;
 const h = React.createElement;
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
@@ -50,6 +50,7 @@ async function readResponse(response) {
 
 function WorkflowApp() {
   const [model, setModel] = useState(null);
+  const [navCollapsed, setNavCollapsed] = useState(true);
   const modelRef = useRef(null);
   const csrf = useRef("");
   const [page, setPage] = useState(() => {
@@ -398,11 +399,16 @@ function WorkflowApp() {
   return h(ConfigProvider, { locale: antd.locales.zh_CN, theme: { token: { colorPrimary: "rgb(27, 143, 255)", borderRadius: 6, fontSize: 14,
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif' }, components: { Button: { colorLink: "rgb(27, 143, 255)", defaultColor: "rgb(27, 143, 255)", defaultHoverColor: "rgb(27, 143, 255)" } } } },
     noticeHolder,
-    h(Layout, { className: "app-layout" },
-      h(Layout.Sider, { width: 214, theme: "light", className: "app-sider" },
-        h("div", { className: "brand" }, h("div", { className: "brand-mark" }, "工"), h("div", null, h("div", { className: "brand-title" }, "研发工作流"), h("div", { className: "brand-subtitle" }, "禅道 · CODEX"))),
-        h(Menu, { className: "navigation", mode: "inline", selectedKeys: [page], onClick: value => navigate(value.key), items: Object.entries(PAGES).map(([key, values], index) => ({ key, icon: h("span", { className: "nav-icon", "aria-hidden": true }, menuIcons[index]), label: values[0] })) }),
-        h("div", { className: "sider-foot" }, h("strong", null, model.settings.account), h(Badge, { status: online ? "success" : "default", text: h("span", { className: "muted" }, online ? "本地服务已连接" : "连接恢复中") }))),
+    h(Layout, { className: `app-layout${navCollapsed ? " nav-collapsed" : ""}` },
+      h(Layout.Sider, { width: 214, collapsedWidth: 64, collapsible: true, collapsed: navCollapsed, trigger: null, theme: "light", className: "app-sider" },
+        h("div", { className: "brand", title: navCollapsed ? "研发工作流" : undefined }, h("div", { className: "brand-mark" }, "工"), !navCollapsed && h("div", null, h("div", { className: "brand-title" }, "研发工作流"), h("div", { className: "brand-subtitle" }, "禅道 · CODEX"))),
+        h("div", { className: "navigation-toggle" }, h(Button, { type: "text", block: true, title: navCollapsed ? "展开导航" : "收起导航",
+          "aria-label": navCollapsed ? "展开导航" : "收起导航", "aria-expanded": !navCollapsed, "aria-controls": "main-navigation", onClick: () => setNavCollapsed(value => !value),
+          icon: h("span", { className: "nav-icon", "aria-hidden": true }, navCollapsed ? "›" : "‹") }, !navCollapsed && "收起导航")),
+        h(Menu, { id: "main-navigation", className: "navigation", mode: "inline", selectedKeys: [page], onClick: value => navigate(value.key), items: Object.entries(PAGES).map(([key, values], index) => ({ key, icon: h("span", { className: "nav-icon", "aria-hidden": true }, menuIcons[index]), label: values[0] })) }),
+        h("div", { className: "sider-foot" }, !navCollapsed && h("strong", null, model.settings.account),
+          h(Tooltip, { title: navCollapsed ? `${model.settings.account} · ${online ? "本地服务已连接" : "连接恢复中"}` : undefined, placement: "right" },
+            h("span", { "aria-label": online ? "本地服务已连接" : "连接恢复中" }, h(Badge, { status: online ? "success" : "default", text: !navCollapsed && h("span", { className: "muted" }, online ? "本地服务已连接" : "连接恢复中") }))))),
       h(Layout, { className: "main-layout" },
         h(Layout.Header, { className: "app-header" }, h("div", { className: "header-section" }, h("span", { className: "header-caption" }, "工作台"), h("span", null, heading[0])),
           h(Space, { size: 16 }, h(Badge, { status: model.connected ? "success" : "default", text: model.connected ? `禅道已连接 · ${model.settings.account}` : "禅道未连接" }),

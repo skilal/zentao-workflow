@@ -5,15 +5,22 @@ button, input, textarea { font: inherit; }
 .app-layout { min-height: 100vh; }
 .app-sider { position: fixed !important; inset: 0 auto 0 0; z-index: 20; border-right: 1px solid #edf0f4; background: #fff !important; }
 .brand { display: flex; align-items: center; gap: 10px; height: 80px; padding: 0 22px; border-bottom: 1px solid #f0f0f0; }
-.brand-mark { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 8px; background: #1b8fff; color: white; font-size: 22px; font-weight: 600; }
+.brand-mark { display: grid; place-items: center; flex-shrink: 0; width: 36px; height: 36px; border-radius: 8px; background: #1b8fff; color: white; font-size: 22px; font-weight: 600; }
 .brand-title { font-size: 16px; font-weight: 600; letter-spacing: .3px; }
 .brand-subtitle { margin-top: 3px; font-size: 11px; color: #8a94a6; letter-spacing: 1px; }
-.navigation { padding: 18px 10px; border: 0 !important; }
+.navigation-toggle { padding: 12px 10px 0; }
+.navigation-toggle .ant-btn { color: #728098; }
+.navigation { padding: 10px 10px 18px; border: 0 !important; }
 .navigation .ant-menu-item { height: 44px; line-height: 44px; margin-bottom: 7px; }
 .nav-icon { display: inline-flex; align-items: center; width: 18px; font-size: 17px; color: #728098; }
 .sider-foot { position: absolute; bottom: 22px; left: 22px; right: 20px; border-top: 1px solid #edf0f4; padding-top: 17px; color: #687386; font-size: 12px; }
 .sider-foot strong { display: block; margin-bottom: 7px; color: #3f4b5d; font-size: 13px; font-weight: 500; }
 .main-layout { margin-left: 214px; min-width: 0; }
+.app-layout.nav-collapsed .main-layout { margin-left: 64px; }
+.nav-collapsed .brand { justify-content: center; padding: 0; }
+.nav-collapsed .navigation { width: 64px; padding-left: 0; padding-right: 0; }
+.nav-collapsed .navigation.ant-menu-inline-collapsed > .ant-menu-item { padding-inline: 23px; }
+.nav-collapsed .sider-foot { left: 14px; right: 14px; text-align: center; }
 .app-header { display: flex; align-items: center; justify-content: space-between; height: 64px; padding: 0 28px; background: #fff; border-bottom: 1px solid #edf0f4; }
 .header-section { display: flex; align-items: center; gap: 16px; }
 .header-caption { color: #98a2b3; font-size: 13px; }
@@ -75,4 +82,4 @@ button, input, textarea { font: inherit; }
 .offline-banner { margin-bottom: 16px; }
 .empty-area { padding: 24px 0; }
 @media (max-width: 1100px) { .conversation-grid, .repository-grid { grid-template-columns: 1fr; } .app-header { padding: 0 18px; } .page-content { padding: 20px 18px; } }
-@media (max-width: 750px) { .app-sider { width: 156px !important; min-width: 156px !important; max-width: 156px !important; } .main-layout { margin-left: 156px; } .brand { padding: 0 12px; gap: 7px; } .brand-title { font-size: 13px; } .brand-mark { width: 30px; height: 30px; } .brand-subtitle, .header-caption { display: none; } .sider-foot { left: 14px; right: 14px; } .page-heading h1 { font-size: 20px; } .settings-grid { grid-template-columns: 1fr; } .workflow-strip .ant-steps-item-description { display: none; } .data-foot { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 750px) { .app-sider:not(.ant-layout-sider-collapsed) { width: 156px !important; min-width: 156px !important; max-width: 156px !important; } .main-layout { margin-left: 156px; } .brand { padding: 0 12px; gap: 7px; } .brand-title { font-size: 13px; } .brand-mark { width: 30px; height: 30px; } .brand-subtitle, .header-caption { display: none; } .sider-foot { left: 14px; right: 14px; } .page-heading h1 { font-size: 20px; } .settings-grid { grid-template-columns: 1fr; } .workflow-strip .ant-steps-item-description { display: none; } .data-foot { align-items: flex-start; flex-direction: column; } }
