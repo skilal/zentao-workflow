@@ -114,6 +114,19 @@ button, input, textarea { font: inherit; }
 .session-panel .ant-card-body { padding: 16px; }
 .session-panel .ant-input-search, .session-panel .ant-select { margin-top: 12px; }
 .session-list { margin-top: 12px; max-height: calc(100vh - 360px); min-height: 180px; overflow-y: auto; }
+.add-project-button { margin-top: 8px; }
+.session-project { border: 1px solid #edf0f4; border-radius: 6px; margin-bottom: 8px; }
+.session-project.drop-target { border-color: #1b8fff; background: #eef7ff; }
+.session-project .ant-collapse > .ant-collapse-item > .ant-collapse-header { padding: 10px 8px; align-items: center; }
+.session-project .ant-collapse .ant-collapse-content > .ant-collapse-content-box { padding: 0 4px 4px; }
+.session-project-heading { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
+.session-project-name { min-width: 0; color: #25354b; font-size: 12px; overflow-wrap: anywhere; }
+.session-project-number { color: #8a94a6; white-space: nowrap; }
+.session-project-count.ant-tag { margin: 0; font-size: 11px; flex-shrink: 0; }
+.session-project .ant-empty { margin-block: 12px; font-size: 12px; }
+.session-entry[draggable="true"] { cursor: grab; }
+.session-entry-actions { display: inline-flex; align-items: center; flex-shrink: 0; }
+.session-entry-actions .ant-btn { padding-inline: 3px; font-size: 11px; }
 .session-entry.ant-list-item { padding: 12px 10px; border-radius: 6px; cursor: pointer; border-bottom: 1px solid #edf0f4; }
 .session-entry:hover, .session-entry:focus-visible { background: #f6f8fb; }
 .session-entry.selected { background: #eef7ff; box-shadow: inset 3px 0 rgb(27, 143, 255); }

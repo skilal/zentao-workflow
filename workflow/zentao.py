@@ -217,6 +217,27 @@ class ZentaoClient:
             page += 1
         return records
 
+    def list_projects(self):
+        self.require_login()
+        page, projects = 1, {}
+        while True:
+            query = urlencode({"status": "all", "limit": self.settings["page_size"], "page": page})
+            data = self._fetch("api.php/v1/projects?" + query)
+            entries, total = data.get("projects"), data.get("total")
+            if not isinstance(entries, list) or type(total) is not int or total < 0:
+                raise WorkflowError("禅道项目列表格式不符合预期。")
+            previous = len(projects)
+            for entry in entries:
+                project_id, name = identifier(entry.get("id")), entry.get("name")
+                if project_id <= 0 or not isinstance(name, str) or not name.strip():
+                    raise WorkflowError("禅道项目编号或名称不符合预期。")
+                projects[project_id] = {"id": project_id, "name": name.strip()}
+            if len(projects) >= total:
+                return list(projects.values())
+            if len(projects) == previous:
+                raise WorkflowError("禅道项目分页提前结束，列表不完整，已停止。")
+            page += 1
+
     def detail(self, kind, item_id, require_assignee=True):
         self.require_login()
         if kind not in KINDS or int(item_id) <= 0:

@@ -3,7 +3,7 @@
 const { useState, useEffect, useRef } = React;
 const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Checkbox,
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
-  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip } = antd;
+  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown } = antd;
 const h = React.createElement;
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
@@ -40,14 +40,45 @@ function CardBox(props) { return h(Card, { className: "app-card", ...props }, pr
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
-  const summary = Object.fromEntries(["id", "item", "items", "stage", "updated_at", "fix_round", "commits"].map(key => [key, state[key]]));
+  const summary = Object.fromEntries(["id", "item", "items", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
 function emptyDraft(state) { return { supplement: state?.supplement || "", reply: "", answers: {}, review_note: "", selected_findings: [] }; }
+function projectCatalog(model) {
+  const projects = new Map((model.project_partitions || []).map(project => [project.id, { ...project }]));
+  for (const entry of model.history) {
+    if (entry.project?.id > 0 && !projects.has(entry.project.id)) projects.set(entry.project.id, { ...entry.project, manual: false });
+  }
+  for (const item of model.items) {
+    if (item.project_id > 0 && !projects.has(item.project_id)) projects.set(item.project_id, { id: item.project_id, name: item.project_name, manual: false });
+  }
+  return [...projects.values()];
+}
 async function readResponse(response) {
   const value = await response.json();
   if (!response.ok) throw new Error(value.error || "本地服务未完成该操作。");
   return value;
+}
+
+function ZentaoProjectSelect({ candidates, ...props }) {
+  const [projects, setProjects] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let disposed = false;
+    fetch("/api/zentao-projects", { credentials: "same-origin", cache: "no-store" }).then(readResponse).then(value => {
+      if (!disposed) setProjects(value.projects);
+    }).catch(error => { if (!disposed) setError(error.message); })
+      .finally(() => { if (!disposed) setLoading(false); });
+    return () => { disposed = true; };
+  }, []);
+  const options = projects.filter(project => !candidates?.length || candidates.some(entry => entry.id === project.id))
+    .map(project => ({ value: project.id, label: `${project.name} #${project.id}`, name: project.name }));
+  return h(React.Fragment, null,
+    h(Select, { className: "full-width", placeholder: "搜索项目名称或编号后选择", showSearch: true,
+      optionFilterProp: "label", loading, notFoundContent: loading ? "正在读取禅道项目…" : error || "暂无匹配项目",
+      ...props, options, disabled: props.disabled || loading || Boolean(error) }),
+    error && h(Typography.Text, { type: "danger" }, error));
 }
 
 function WorkflowApp() {
@@ -68,6 +99,9 @@ function WorkflowApp() {
   const sending = requestsPending[model?.selectedSessionId || "new"] || requestsPending.global || "";
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionFilter, setSessionFilter] = useState("all");
+  const [collapsedProjects, setCollapsedProjects] = useState(() => JSON.parse(sessionStorage.getItem("workflow-collapsed-projects") || "[]"));
+  const [dragSessionId, setDragSessionId] = useState(null);
+  const [dropProjectId, setDropProjectId] = useState(null);
   const viewEpoch = useRef(0);
   const deletedSessions = useRef(new Set());
   const [selectedItems, setSelectedItems] = useState([]);
@@ -212,6 +246,43 @@ function WorkflowApp() {
         onOk: async () => { if (!await act("delete_session", {}, id)) throw new Error("删除操作未提交"); } });
     } catch (error) { notice.error({ message: "无法删除会话", description: error.message }); }
   }
+  function changeProjectCollapse(keys) {
+    setCollapsedProjects(keys);
+    sessionStorage.setItem("workflow-collapsed-projects", JSON.stringify(keys));
+  }
+  function addProjectPartition() {
+    let projectId;
+    const dialog = modal.confirm({ title: "添加项目分区", okText: "添加", cancelText: "取消", icon: null,
+      okButtonProps: { disabled: true },
+      content: h("div", null, h("p", { className: "muted" }, "选择当前账号可见的禅道项目，添加到本地列表。支持搜索项目名称或编号。"),
+        h(Field, { label: "禅道项目" }, h(ZentaoProjectSelect, { "aria-label": "新增分区的禅道项目", onChange: value => {
+          projectId = value; dialog.update({ okButtonProps: { disabled: false } });
+        } }))),
+      onOk: async () => {
+        try {
+          if (!Number.isInteger(projectId) || projectId <= 0) throw new Error("请选择禅道项目。");
+          const result = await fetch("/api/projects", { method: "POST", credentials: "same-origin",
+            headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
+            body: JSON.stringify({ project_id: projectId, request_id: crypto.randomUUID() }) }).then(readResponse);
+          applyModel({ ...modelRef.current, project_partitions: result.project_partitions });
+          changeProjectCollapse(collapsedProjects.filter(key => key !== String(result.project.id)));
+        } catch (error) { notice.error({ message: "项目分区未添加", description: error.message }); throw error; }
+      } });
+  }
+  async function moveProject(id, projectId) {
+    const current = modelRef.current;
+    const payload = current.sessions[id];
+    setRequestsPending(previous => ({ ...previous, [id]: "move_project" }));
+    try {
+      const result = await fetch("/api/sessions/project", { method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
+        body: JSON.stringify({ session_id: id, revision: payload.revision, project_id: projectId,
+          request_id: crypto.randomUUID() }) }).then(readResponse);
+      receiveState(result);
+      changeProjectCollapse(collapsedProjects.filter(key => key !== String(projectId || 0)));
+    } catch (error) { notice.error({ message: "项目未更换", description: error.message }); }
+    finally { setRequestsPending(previous => { const next = { ...previous }; delete next[id]; return next; }); }
+  }
   useEffect(() => {
     let events, disposed = false;
     fetch("/api/bootstrap", { credentials: "same-origin", cache: "no-store" }).then(readResponse).then(data => {
@@ -224,7 +295,7 @@ function WorkflowApp() {
       eventSource.current = events;
       events.onopen = () => setOnline(true);
       events.onerror = () => setOnline(false);
-      for (const kind of ["state", "items", "connected", "connection", "conversation", "delta", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted"]) {
+      for (const kind of ["state", "items", "connected", "connection", "conversation", "delta", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
         events.addEventListener(kind, event => {
           if (disposed) return;
           const value = JSON.parse(event.data);
@@ -239,6 +310,7 @@ function WorkflowApp() {
             applyModel({ ...current, ...value, selectedSessionId: missing ? null : current.selectedSessionId, global_busy: value.busy, csrf_token: csrf.current });
             if (missing) newSession();
           }
+          else if (kind === "projects") applyModel({ ...current, project_partitions: value.project_partitions });
           else if (kind === "items") applyModel({ ...current, items: value });
           else if (kind === "connected") applyModel({ ...current, connected: true, profile: value });
           else if (kind === "connection") applyModel({ ...current, ...value });
@@ -471,12 +543,10 @@ function WorkflowApp() {
             h("div", { className: "project-info-name" }, project.name || state.item.project || "所属项目尚未明确"),
             project.id > 0 && h(Tag, { color: "blue" }, `项目 #${project.id}`),
             stage === "等待确认项目" && h("div", { className: "project-info-form" },
-              h("p", { className: "project-info-note" }, project.candidates?.length > 1 ? "请选择本次所属项目。" : "请填写禅道项目编号与名称。"),
-              project.candidates?.length > 1 ? h(Select, { className: "full-width", "aria-label": "所属项目", placeholder: "请选择所属项目", value: projectId || undefined, disabled: busy,
-                options: project.candidates.map(entry => ({ value: entry.id, label: `${entry.name || "项目"} #${entry.id}` })),
-                onChange: id => changeDraft({ project_id: id, project_name: project.candidates.find(entry => entry.id === id).name }) }) :
-                h(Field, { label: "禅道项目编号" }, h(InputNumber, { className: "full-width", "aria-label": "禅道项目编号", min: 1, precision: 0, value: projectId || undefined, disabled: busy || project.id > 0, onChange: id => changeDraft({ project_id: id }) })),
-              h(Field, { label: "所属项目名称" }, h(Input, { "aria-label": "所属项目名称", value: projectName, disabled: busy, onChange: event => changeDraft({ project_name: event.target.value }) })),
+              h("p", { className: "project-info-note" }, "搜索并选择本次所属的禅道项目。"),
+              h(ZentaoProjectSelect, { "aria-label": "所属项目", value: projectId || undefined, disabled: busy,
+                candidates: project.candidates,
+                onChange: (id, option) => changeDraft({ project_id: id, project_name: option.name }) }),
               h(Button, { className: "project-info-confirm", type: "primary", block: true, disabled: busy || !projectId || !projectName.trim(),
                 onClick: () => act("confirm_project", { project_id: projectId, name: projectName }) }, "确认项目并继续"))),
           model.settings.repositories.map(repository => {
@@ -490,7 +560,7 @@ function WorkflowApp() {
               h(Typography.Paragraph, { className: "project-info-path", title: repository.path, copyable: { text: repository.path, tooltips: ["复制仓库路径", "已复制"] } }, repository.path),
               h("div", { className: "project-info-label" }, "目标分支"),
               waiting && entry?.status === "needs_user" ?
-                h(Select, { className: "full-width project-info-select", "aria-label": `${repository.name}目标分支`, value: choices[entry.role], placeholder: "请选择项目分支", showSearch: true, disabled: busy,
+                h(Select, { className: "full-width project-info-select", "aria-label": `${repository.name}目标分支`, value: choices[entry.role], placeholder: "搜索并选择项目分支", showSearch: true, optionFilterProp: "label", disabled: busy,
                   notFoundContent: "没有可用分支，请准备后重新识别", options: entry.catalog.map(branch => ({ value: branch.name, label: `${branch.name}${branch.local ? "" : "（远程）"}` })),
                   onChange: branch => changeDraft({ branch_choices: { ...choices, [entry.role]: branch } }) }) :
               branch ? h("div", { className: "project-info-branch" }, branch) :
@@ -651,27 +721,69 @@ function WorkflowApp() {
 
   function renderSessions() {
     const stages = [...new Set(model.history.map(entry => entry.stage))];
-    const rows = model.history.filter(entry => (sessionFilter === "all" || entry.stage === sessionFilter) &&
-      (!sessionQuery.trim() || itemLabel(entry).toLowerCase().includes(sessionQuery.trim().toLowerCase())));
+    const projects = projectCatalog(model);
+    const query = sessionQuery.trim().toLowerCase();
+    const groups = [...projects, { id: 0, name: "无项目对话" }].map(project => {
+      const entries = model.history.filter(entry => (entry.project?.id || 0) === project.id);
+      const rows = entries.filter(entry => (sessionFilter === "all" || entry.stage === sessionFilter) &&
+        (!query || `${itemLabel(entry)} ${project.name} ${project.id > 0 ? `项目 #${project.id}` : ""}`.toLowerCase().includes(query)))
+        .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
+      return { ...project, rows, updated_at: entries.reduce((latest, entry) => entry.updated_at > latest ? entry.updated_at : latest, "") };
+    }).filter(project => !project.id || project.manual || (!query && sessionFilter === "all") || project.rows.length)
+      .sort((left, right) => !left.id ? 1 : !right.id ? -1 : right.updated_at.localeCompare(left.updated_at) || left.id - right.id);
     const running = model.history.filter(entry => ACTIVE.has(entry.stage) || entry.busy).length;
     return h(CardBox, { title: "会话", className: "app-card session-panel", extra: h(Typography.Text, { type: "secondary" }, `${running} 个执行中`) },
       h(Button, { type: "primary", block: true, onClick: newSession, disabled: stopped }, "新建会话"),
-      h(Input.Search, { value: sessionQuery, allowClear: true, placeholder: "搜索标题或编号", onChange: event => setSessionQuery(event.target.value) }),
+      h(Button, { block: true, className: "add-project-button", onClick: addProjectPartition, disabled: stopped || !model.connected }, "添加项目分区"),
+      h(Input.Search, { value: sessionQuery, allowClear: true, placeholder: "搜索会话或项目名称、编号", onChange: event => setSessionQuery(event.target.value) }),
       h(Select, { value: sessionFilter, className: "full-width", onChange: setSessionFilter,
         options: [{ value: "all", label: "全部状态" }, ...stages.map(value => ({ value, label: value }))] }),
-      h(List, { dataSource: rows, className: "session-list", locale: { emptyText: "暂无符合条件的会话" }, renderItem: entry => {
-        const selected = model.selectedSessionId === entry.id;
-        const cannotDelete = stopped || entry.working || entry.busy || ACTIVE.has(entry.stage) || entry.stage === "等待人工回答" || entry.stage === "资料读取中";
-        const open = () => selectSession(entry.id, ["资料已读取", "资料读取失败"].includes(entry.stage) ? "items" : model.sessions[entry.id]?.state.reviews?.length ? "review" : "plan");
-        return h(List.Item, { key: entry.id, className: `session-entry${selected ? " selected" : ""}`, onClick: open,
-          tabIndex: 0, role: "button", "aria-pressed": selected, onKeyDown: event => { if (event.target === event.currentTarget && ["Enter", " "].includes(event.key)) { event.preventDefault(); open(); } } },
-          h("div", { className: "session-entry-body" },
-            h("div", { className: "session-entry-title", title: itemLabel(entry) }, sessionItems(entry).map(item => h("div", { key: itemKey(item) }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
-            h("div", { className: "session-entry-status" }, stageTag(entry.stage), entry.busy && h(Spin, { size: "small" })),
-            h("div", { className: "session-entry-foot" }, h("span", { className: "muted" }, timeLabel(entry.updated_at)),
-              h(Button, { type: "link", danger: true, size: "small", disabled: Boolean(cannotDelete), title: cannotDelete ? "先暂停并等待操作结束后再删除" : "删除会话及工作区",
-                onClick: event => { event.stopPropagation(); deleteSession(entry.id); } }, "删除"))));
-      } }), h("div", { className: "muted session-panel-note" }, "切换只改变查看对象，后台会话继续运行。"));
+      h("div", { className: "session-list" }, groups.map(project => {
+        const key = String(project.id);
+        return h("section", { key, "data-project-id": key, className: `session-project${dropProjectId === key ? " drop-target" : ""}`,
+          onDragOver: event => {
+            if (!dragSessionId || !model.history.find(entry => entry.id === dragSessionId)?.can_move_project) return;
+            event.preventDefault(); event.dataTransfer.dropEffect = "move"; setDropProjectId(key);
+          },
+          onDragLeave: event => { if (!event.currentTarget.contains(event.relatedTarget)) setDropProjectId(null); },
+          onDrop: event => {
+            if (!dragSessionId) return;
+            event.preventDefault();
+            const entry = model.history.find(value => value.id === dragSessionId);
+            if (entry?.can_move_project && (entry.project?.id || 0) !== project.id) moveProject(entry.id, project.id || null);
+            setDropProjectId(null); setDragSessionId(null);
+          } },
+          h(Collapse, { ghost: true, activeKey: query || !collapsedProjects.includes(key) ? [key] : [],
+            onChange: keys => { if (!query) changeProjectCollapse(keys.length ? collapsedProjects.filter(value => value !== key) : [...collapsedProjects, key]); },
+            items: [{ key, label: h("div", { className: "session-project-heading" },
+              h("span", { className: "session-project-name", title: project.id ? `${project.name || "项目"} #${project.id}` : project.name }, project.name || `项目 #${project.id}`,
+                project.id > 0 && h("span", { className: "session-project-number" }, ` #${project.id}`)),
+              h(Tag, { className: "session-project-count" }, project.rows.length)),
+              children: h(List, { dataSource: project.rows, locale: { emptyText: "暂无会话，可移入未启动的会话" }, renderItem: entry => {
+                const selected = model.selectedSessionId === entry.id;
+                const canMove = entry.can_move_project && !stopped && !requestsPending[entry.id];
+                const cannotDelete = stopped || entry.working || entry.busy || ACTIVE.has(entry.stage) || entry.stage === "等待人工回答" || entry.stage === "资料读取中";
+                const open = () => selectSession(entry.id, ["资料已读取", "资料读取失败"].includes(entry.stage) ? "items" : model.sessions[entry.id]?.state.reviews?.length ? "review" : "plan");
+                return h(List.Item, { key: entry.id, className: `session-entry${selected ? " selected" : ""}`, onClick: open, draggable: Boolean(canMove),
+                  title: entry.project_move_reason || "可拖动到其他项目分区",
+                  onDragStart: event => { event.dataTransfer.setData("application/x-workflow-session", entry.id); event.dataTransfer.effectAllowed = "move"; setDragSessionId(entry.id); },
+                  onDragEnd: () => { setDragSessionId(null); setDropProjectId(null); },
+                  tabIndex: 0, role: "button", "aria-pressed": selected, onKeyDown: event => { if (event.target === event.currentTarget && ["Enter", " "].includes(event.key)) { event.preventDefault(); open(); } } },
+                  h("div", { className: "session-entry-body" },
+                    h("div", { className: "session-entry-title", title: itemLabel(entry) }, sessionItems(entry).map(item => h("div", { key: itemKey(item) }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
+                    h("div", { className: "session-entry-status" }, stageTag(entry.stage), entry.busy && h(Spin, { size: "small" })),
+                    h("div", { className: "session-entry-foot" }, h("span", { className: "muted" }, timeLabel(entry.updated_at)),
+                      h("span", { className: "session-entry-actions", onClick: event => event.stopPropagation() },
+                      h(Tooltip, { title: entry.project_move_reason || "更换本次工作流的执行项目" }, h("span", null,
+                        h(Dropdown, { disabled: !canMove, trigger: ["click"], menu: { selectedKeys: [String(entry.project?.id || 0)],
+                          items: [...projects.map(value => ({ key: String(value.id), label: `${value.name || "项目"} #${value.id}`, disabled: value.id === entry.project?.id })),
+                            { key: "0", label: "无项目对话", disabled: !entry.project?.id }],
+                          onClick: ({ key }) => moveProject(entry.id, key === "0" ? null : Number(key)) } },
+                          h(Button, { type: "text", size: "small", disabled: !canMove, "aria-label": "移动到项目" }, "移动")))),
+                      h(Button, { type: "link", danger: true, size: "small", disabled: Boolean(cannotDelete), title: cannotDelete ? "先暂停并等待操作结束后再删除" : "删除会话及工作区",
+                        onClick: event => { event.stopPropagation(); deleteSession(entry.id); } }, "删除")))));
+              } }) }] }));
+      })), h("div", { className: "muted session-panel-note" }, "未启动的会话可拖动或通过“移动”更换项目。切换查看不会停止后台会话。"));
   }
 
   if (fatal) return h("div", { style: { maxWidth: 650, margin: "100px auto" } }, h(Alert, { type: "error", showIcon: true, message: "无法连接本地网页服务", description: fatal, action: h(Button, { onClick: () => location.reload() }, "重新打开") }));

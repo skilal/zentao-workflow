@@ -16,6 +16,8 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from uuid import uuid4
 from webbrowser import open as open_browser
 
+from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
+from workflow.store import timestamp
 from workflow.engine import ACTIVE
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
@@ -50,7 +52,8 @@ def public_state(state):
 
 
 def history_summary(state):
-    return {key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")}
+    return {**{key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")},
+            "project": session_project(state)}
 
 
 class WebApplication:
@@ -71,6 +74,8 @@ class WebApplication:
         self.server = None
         self.closed = False
         self.sessions = SessionManager(self.settings, self.emit)
+        self.project_partitions = ProjectPartitions(self.sessions.store.root.parent / "project-partitions.json")
+        self.project_lock = RLock()
         self.management_executor = ThreadPoolExecutor(max_workers=1)
         self.pointer = LOCAL / "current-session.json"
         self.default_session_id = None
@@ -93,6 +98,9 @@ class WebApplication:
 
     def session_payload(self, runtime):
         state = public_state(runtime.engine.state)
+        state["project"] = session_project(state)
+        state["project_move_reason"] = project_move_error(runtime)
+        state["can_move_project"] = not state["project_move_reason"]
         state["can_edit"] = runtime.engine.editable() and not runtime.engine.closed and not state.get("cleanup", {}).get("finalizing")
         return {"session_id": state["id"], "state": state, "revision": runtime.revision,
                 "event_cursor": runtime.event_cursor, "stream": runtime.stream,
@@ -105,8 +113,10 @@ class WebApplication:
                      if selection["name"] not in {entry["name"] for entry in state["repos"]}})}
 
     def summary(self, runtime):
+        reason = project_move_error(runtime)
         return {**history_summary(runtime.engine.state), "busy": runtime.busy,
-                "working": runtime.engine.working(), "deleting": runtime.deleting}
+                "working": runtime.engine.working(), "deleting": runtime.deleting,
+                "can_move_project": not reason, "project_move_reason": reason}
 
     def emit(self, session_id, kind, value):
         with self.condition:
@@ -124,6 +134,7 @@ class WebApplication:
             elif kind == "items":
                 self.items = deepcopy(value)
                 self._publish("items", self.items)
+                self._publish("projects", {"project_partitions": self.projects()})
             elif kind == "connected":
                 self.connected, self.profile = True, value
                 self._publish("connected", value)
@@ -155,6 +166,7 @@ class WebApplication:
             return {"items": deepcopy(self.items), "default_session_id": self.default_session_id,
                     "connected": self.connected, "profile": self.profile, "busy": self.busy,
                     "cursor": self.sequence, "settings": self.public_settings(),
+                    "project_partitions": self.projects(),
                     "sessions": {session_id: self.session_payload(runtime) for session_id, runtime in self.sessions.runtimes.items()},
                     "history": sorted((self.summary(runtime) for runtime in self.sessions.runtimes.values()),
                                       key=lambda entry: (entry["updated_at"], entry["id"]), reverse=True)}
@@ -162,6 +174,75 @@ class WebApplication:
     def session(self, session_id):
         with self.lock:
             return self.session_payload(self.sessions.get(session_id))
+
+    def projects(self):
+        return self.project_partitions.list(self.settings["zentao"]["base_url"].rstrip("/"),
+            [runtime.engine.state for runtime in self.sessions.runtimes.values()], self.items)
+
+    def add_project(self, request):
+        project_id, request_id = request.get("project_id"), request.get("request_id")
+        if (type(project_id) is not int or project_id <= 0 or not isinstance(request_id, str)
+                or not 8 <= len(request_id) <= 100):
+            raise WorkflowError("请选择有效的禅道项目及请求标识。")
+        key = ("project_partition", request_id)
+        # 网络读取不持有事件锁，避免阻塞其他会话的状态通知。
+        with self.project_lock:
+            with self.condition:
+                if self.closed or self.busy == "settings":
+                    raise WorkflowError("服务正在关闭或修改设置，不能添加项目分区。")
+                if key in self.requests:
+                    return {**self.requests[key], "duplicate": True}
+                site = self.settings["zentao"]["base_url"].rstrip("/")
+            with self.sessions.zentao_lock:
+                project = self.sessions.zentao._fetch(f"api.php/v1/projects/{project_id}")
+            if identifier(project.get("id")) != project_id or not isinstance(project.get("name"), str) or not project["name"].strip():
+                raise WorkflowError("所属项目信息不符合预期。")
+            project = {"id": project_id, "name": project["name"].strip()}
+            with self.condition:
+                if self.closed or site != self.settings["zentao"]["base_url"].rstrip("/"):
+                    raise WorkflowError("禅道站点已变化或服务正在关闭，未添加项目分区。")
+                self.project_partitions.add(site, project)
+                result = {"project": project, "project_partitions": self.projects()}
+                self.requests[key] = result
+                while len(self.requests) > 512:
+                    self.requests.popitem(last=False)
+                self._publish("projects", {"project_partitions": result["project_partitions"]})
+                return result
+
+    def move_project(self, request):
+        session_id = request.get("session_id")
+        project_id, request_id = request.get("project_id"), request.get("request_id")
+        if (not session_id or "project_id" not in request
+                or (project_id is not None and (type(project_id) is not int or project_id <= 0))
+                or not isinstance(request_id, str) or not 8 <= len(request_id) <= 100):
+            raise WorkflowError("请明确指定会话、目标项目及请求标识。")
+        key = (session_id, request_id)
+        with self.condition:
+            if self.closed or self.busy == "settings":
+                raise WorkflowError("服务正在关闭或修改设置，不能更换项目。")
+            if key in self.requests:
+                return {**self.requests[key], "duplicate": True}
+            runtime = self.sessions.get(session_id)
+            if request.get("revision") != runtime.revision:
+                raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
+            reason = project_move_error(runtime)
+            if reason:
+                raise WorkflowError(reason)
+            project = {"id": 0, "name": ""} if project_id is None else next(
+                (value for value in self.projects() if value["id"] == project_id), None)
+            if project is None:
+                raise WorkflowError("目标项目分区不存在，请先添加项目分区。")
+            state = deepcopy(runtime.engine.state)
+            assign_project(state, project)
+            runtime.engine.store.save(state)
+            runtime.engine.state = state
+            self.emit(state["id"], "state", state)
+            self._publish("projects", {"project_partitions": self.projects()})
+            result = self.session_payload(runtime)
+            self.requests[key] = result
+            while len(self.requests) > 512:
+                self.requests.popitem(last=False)
+            return result
 
     def _supplement_runtime(self, session_id, revision):
         runtime = self.sessions.get(session_id)
@@ -256,6 +337,7 @@ class WebApplication:
             self._publish("settings", self.public_settings())
             self._publish("items", [])
             self._publish("connection", {"connected": False})
+            self._publish("projects", {"project_partitions": self.projects()})
 
     def dispatch(self, request):
         action = request.get("action")
@@ -323,6 +405,9 @@ class WebApplication:
                 supplement = data.get("supplement", "")
                 if not isinstance(supplement, str) or "selections" in data:
                     raise WorkflowError("开始计划只接受补充说明，仓库与分支由服务端确定。")
+                if "plan_started_at" not in engine.state:
+                    engine.state["plan_started_at"] = timestamp()
+                    engine.store.save(engine.state)
                 operation, arguments = engine.start_plan, (supplement, action == "edit_branches")
             elif action == "confirm_project":
                 project_id, name = data.get("project_id"), data.get("name")
@@ -419,6 +504,7 @@ class WebApplication:
                 if self.default_session_id == session_id:
                     self.default_session_id = None
                 del self.sessions.runtimes[session_id]
+                self._publish("projects", {"project_partitions": self.projects()})
                 self._publish("session_deleted", {"session_id": session_id})
         except Exception as error:
             with self.condition:
@@ -531,6 +617,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._events(query)
             elif path == "/api/session":
                 self._json(200, application.session(query.get("id", [""])[0]))
+            elif path == "/api/zentao-projects":
+                with application.sessions.zentao_lock:
+                    projects = application.sessions.zentao.list_projects()
+                self._json(200, {"projects": projects})
             elif path == "/api/branches":
                 name = query.get("repository", [""])[0]
                 repository = next((entry for entry in application.settings["repositories"] if entry["name"] == name), None)
@@ -590,6 +680,10 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._json(202, application.dispatch(data))
             elif self.path == "/api/supplement-images/remove":
                 self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id")))
+            elif self.path == "/api/projects":
+                self._json(200, application.add_project(data))
+            elif self.path == "/api/sessions/project":
+                self._json(200, application.move_project(data))
             elif self.path == "/api/shutdown":
                 self._json(200, {"stopping": True})
                 Thread(target=self.server.shutdown, daemon=True).start()

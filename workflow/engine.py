@@ -9,9 +9,10 @@ from threading import Lock, RLock
 from workflow.approvals import is_controlled_write
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
 from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
+from workflow.projects import assign_project, project_locked
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
-from workflow.store import SessionStore
+from workflow.store import SessionStore, timestamp
 from workflow.zentao import ZentaoClient, project_context
 
 
@@ -128,6 +129,8 @@ class Workflow:
             with self.zentao_lock:
                 self.state["snapshot"] = self.zentao.collect_many(items, self.store.directory(self.state["id"]))
             self.state["project"] = self.state["snapshot"]["project"]
+            if "project_override" in self.state:
+                assign_project(self.state, self.state["project_override"])
             self.state["stage"] = "资料已读取"
             self.save()
             self.note("系统", f"已读取 {len(items)} 个工作项的资料，将在同一会话中处理。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
@@ -138,13 +141,15 @@ class Workflow:
 
     def editable(self):
         state = self.state
-        return bool(state and state["stage"] in {"资料已读取", "资料读取失败"}
-                    and not state["repos"] and not state.get("branch_resolution") and not state.get("thread_id"))
+        return bool(state and not project_locked(state))
 
     def start_plan(self, supplement, manual=False):
         state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支")
         if not state.get("snapshot"):
             raise WorkflowError("需求资料尚未完整读取。")
+        if "plan_started_at" not in state:
+            state["plan_started_at"] = timestamp()
+            self.save()
         if state["repos"]:
             if manual:
                 raise WorkflowError("工作区已经创建，不能改变当前会话分支。")
