@@ -158,7 +158,7 @@ function WorkflowApp() {
   const eventSource = useRef(null);
   const [fatal, setFatal] = useState("");
   const [requestsPending, setRequestsPending] = useState({});
-  const sending = requestsPending[model?.selectedSessionId || "new"] || requestsPending.global || "";
+  const sending = requestsPending[model?.selectedSessionId || model?.preview?.preview_id || "new"] || requestsPending.new || requestsPending.global || "";
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionFilter, setSessionFilter] = useState("all");
   const [collapsedProjects, setCollapsedProjects] = useState(() => JSON.parse(sessionStorage.getItem("workflow-collapsed-projects") || "[]"));
@@ -190,7 +190,7 @@ function WorkflowApp() {
   const [modal, modalHolder] = Modal.useModal();
 
   function applyModel(value) {
-    const selected = value.sessions?.[value.selectedSessionId];
+    const selected = value.selectedSessionId ? value.sessions?.[value.selectedSessionId] : value.preview;
     const projected = { ...value, state: selected?.state || null, revision: selected?.revision,
       stream: selected?.stream || "", busy: selected?.busy || value.global_busy };
     modelRef.current = projected;
@@ -201,7 +201,33 @@ function WorkflowApp() {
     const value = { ...draftRef.current, ...change };
     draftRef.current = value;
     setDraft(value);
-    if (modelRef.current?.state?.id) sessionStorage.setItem(`workflow-draft:${modelRef.current.state.id}`, JSON.stringify(value));
+    if (modelRef.current?.selectedSessionId) sessionStorage.setItem(`workflow-draft:${modelRef.current.selectedSessionId}`, JSON.stringify(value));
+  }
+  function viewPayload(id) {
+    const current = modelRef.current;
+    return current.preview?.preview_id === id ? current.preview : current.sessions[id];
+  }
+  function viewAddress(id) {
+    return modelRef.current.preview?.preview_id === id ? { preview_id: id } : { session_id: id };
+  }
+  function receivePreview(payload) {
+    const current = modelRef.current;
+    if (current.preview?.preview_id !== payload.preview_id || current.preview.event_cursor > payload.event_cursor) return;
+    applyModel({ ...current, preview: payload });
+  }
+  function releasePreview(id) {
+    fetch("/api/previews/discard", { method: "POST", credentials: "same-origin", keepalive: true,
+      headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
+      body: JSON.stringify({ preview_id: id }) }).then(readResponse)
+      .catch(error => notice.error({ message: "临时资料未释放", description: error.message }));
+  }
+  function discardPreview() {
+    const id = modelRef.current?.preview?.preview_id;
+    if (!id) return;
+    delete imageQueues.current[id];
+    publishImageTransfers();
+    applyModel({ ...modelRef.current, preview: null });
+    releasePreview(id);
   }
   function publishImageTransfers() {
     setImageTransfers(Object.fromEntries(Object.entries(imageQueues.current).map(([id, queue]) => [id, [...queue.tasks]])));
@@ -216,12 +242,13 @@ function WorkflowApp() {
         task.status = "uploading";
         publishImageTransfers();
         try {
-          const current = modelRef.current.sessions[id];
-          if (!current) throw new Error("会话已删除，请重新选择工作项。");
-          const query = new URLSearchParams({ session_id: id, revision: current.revision, name: task.name, purpose: task.purpose });
+          const current = viewPayload(id);
+          if (!current) throw new Error("查看资料已释放或会话已删除，请重新选择工作项。");
+          const query = new URLSearchParams({ ...viewAddress(id), revision: current.revision, name: task.name, purpose: task.purpose });
           const payload = await fetch(`/api/supplement-images?${query}`, { method: "POST", credentials: "same-origin",
             headers: { "Content-Type": "application/octet-stream", "X-Workflow-Token": csrf.current }, body: task.file }).then(readResponse);
-          if (modelRef.current.sessions[id]) receiveState(payload);
+          if (payload.preview_id) receivePreview(payload);
+          else if (modelRef.current.sessions[id]) receiveState(payload);
           queue.tasks = queue.tasks.filter(entry => entry.uid !== task.uid);
         } catch (error) { task.status = "error"; task.error = error.message; }
         publishImageTransfers();
@@ -257,8 +284,9 @@ function WorkflowApp() {
     try {
       const payload = await fetch("/api/supplement-images/remove", { method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
-        body: JSON.stringify({ session_id: id, revision: modelRef.current.sessions[id].revision, image_id: image.id, purpose }) }).then(readResponse);
-      if (modelRef.current.sessions[id]) receiveState(payload);
+        body: JSON.stringify({ ...viewAddress(id), revision: viewPayload(id).revision, image_id: image.id, purpose }) }).then(readResponse);
+      if (payload.preview_id) receivePreview(payload);
+      else if (modelRef.current.sessions[id]) receiveState(payload);
     } catch (error) { notice.error({ message: "图片未移除", description: error.message }); }
     finally { setRequestsPending(previous => { const next = { ...previous }; delete next[id]; return next; }); }
   }
@@ -274,6 +302,7 @@ function WorkflowApp() {
   }
   function newSession() {
     viewEpoch.current += 1;
+    discardPreview();
     lastSession.current = null;
     selectionRequest.current = "";
     setSelectedItems([]);
@@ -286,6 +315,7 @@ function WorkflowApp() {
   }
   async function selectSession(id, targetPage) {
     const epoch = ++viewEpoch.current;
+    discardPreview();
     selectionRequest.current = "";
     sessionStorage.setItem("workflow-session", id);
     applyModel({ ...modelRef.current, selectedSessionId: id });
@@ -368,6 +398,7 @@ function WorkflowApp() {
     let events, disposed = false;
     fetch("/api/bootstrap", { credentials: "same-origin", cache: "no-store" }).then(readResponse).then(data => {
       if (disposed) return;
+      if (data.preview_supported !== true) throw new Error("本地服务版本过旧，请停止并重新启动本地服务，再刷新页面。当前服务不支持临时查看资料。");
       csrf.current = data.csrf_token;
       const saved = sessionStorage.getItem("workflow-session");
       const selectedSessionId = saved === null ? data.default_session_id : saved;
@@ -376,12 +407,13 @@ function WorkflowApp() {
       eventSource.current = events;
       events.onopen = () => setOnline(true);
       events.onerror = () => setOnline(false);
-      for (const kind of ["state", "items", "connected", "connection", "conversation", "delta", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
+      for (const kind of ["state", "preview", "items", "connected", "connection", "conversation", "delta", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
         events.addEventListener(kind, event => {
           if (disposed) return;
           const value = JSON.parse(event.data);
           const current = modelRef.current;
           if (kind === "state") receiveState(value);
+          else if (kind === "preview") receivePreview(value);
           else if (kind === "snapshot") {
             const missing = current.selectedSessionId && !value.sessions[current.selectedSessionId];
             for (const id of Object.keys(current.sessions)) if (!value.sessions[id]) {
@@ -389,6 +421,11 @@ function WorkflowApp() {
               deletedSessions.current.add(id);
             }
             applyModel({ ...current, ...value, selectedSessionId: missing ? null : current.selectedSessionId, global_busy: value.busy, csrf_token: csrf.current });
+            if (current.preview) {
+              const id = current.preview.preview_id;
+              fetch(`/api/preview?id=${encodeURIComponent(id)}`, { cache: "no-store" }).then(readResponse).then(receivePreview)
+                .catch(error => notice.error({ message: "临时资料同步失败", description: error.message }));
+            }
             if (missing) newSession();
           }
           else if (kind === "projects") applyModel({ ...current, project_partitions: value.project_partitions });
@@ -426,6 +463,10 @@ function WorkflowApp() {
     }).catch(error => { if (!disposed) setFatal(error.message); });
     return () => { disposed = true; if (events) events.close(); };
   }, []);
+  useEffect(() => {
+    window.addEventListener("pagehide", discardPreview);
+    return () => window.removeEventListener("pagehide", discardPreview);
+  }, []);
 
   const state = model?.state;
   const stage = state?.stage || "";
@@ -445,7 +486,7 @@ function WorkflowApp() {
     lastSession.current = state.id;
     selectionRequest.current = "";
     const itemKeys = sessionItems(state).map(itemKey);
-    const saved = sessionStorage.getItem(`workflow-draft:${state.id}`);
+    const saved = model.selectedSessionId ? sessionStorage.getItem(`workflow-draft:${state.id}`) : null;
     const value = { ...emptyDraft(state, model.settings), ...(saved ? JSON.parse(saved) : {}) };
     setSelectedItems(state.can_edit && value.selected_items ? value.selected_items : itemKeys);
     draftRef.current = value;
@@ -482,21 +523,32 @@ function WorkflowApp() {
   async function act(action, data = {}, targetId = modelRef.current.selectedSessionId) {
     const current = modelRef.current;
     const id = ["connect", "refresh", "settings"].includes(action) ? null : targetId;
-    const pendingKey = id || (action === "collect" ? "new" : "global");
+    const previewId = !id && ["collect", "plan"].includes(action) ? current.preview?.preview_id : null;
+    const pendingKey = id || previewId || (action === "collect" ? "new" : "global");
     const epoch = viewEpoch.current;
     setRequestsPending(previous => ({ ...previous, [pendingKey]: action }));
     try {
       const result = await fetch("/api/actions", { method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
-        body: JSON.stringify({ action, data, request_id: crypto.randomUUID(), session_id: id, revision: current.sessions[id]?.revision }) }).then(readResponse);
+        body: JSON.stringify({ action, data, request_id: crypto.randomUUID(), session_id: id,
+          preview_id: previewId, revision: previewId ? current.preview.revision : current.sessions[id]?.revision }) }).then(readResponse);
       if (action === "collect" && !id && epoch === viewEpoch.current) {
-        changeDraft({ codex: { model: current.settings.model, reasoning_effort: current.settings.reasoning_effort } });
+        if (!previewId) changeDraft({ codex: { model: current.settings.model, reasoning_effort: current.settings.reasoning_effort } });
+        lastSession.current = result.preview_id;
+        applyModel({ ...modelRef.current, preview: { preview_id: result.preview_id, event_cursor: -1 } });
+        const payload = await fetch(`/api/preview?id=${encodeURIComponent(result.preview_id)}`, { cache: "no-store" }).then(readResponse);
+        if (epoch === viewEpoch.current) receivePreview(payload);
+      } else if (action === "collect" && !id && !previewId) {
+        releasePreview(result.preview_id);
+      } else if (action === "plan" && previewId && epoch === viewEpoch.current) {
         lastSession.current = result.session_id;
+        delete imageQueues.current[previewId];
+        publishImageTransfers();
         sessionStorage.setItem("workflow-session", result.session_id);
         sessionStorage.setItem(`workflow-draft:${result.session_id}`, JSON.stringify(draftRef.current));
-        applyModel({ ...modelRef.current, selectedSessionId: result.session_id });
+        applyModel({ ...modelRef.current, preview: null, selectedSessionId: result.session_id });
         const payload = await fetch(`/api/session?id=${encodeURIComponent(result.session_id)}`, { cache: "no-store" }).then(readResponse);
-        if (epoch === viewEpoch.current && modelRef.current.selectedSessionId === result.session_id) receiveState(payload);
+        if (epoch === viewEpoch.current) receiveState(payload);
       }
       return result;
     } catch (error) { notice.error({ message: "操作未提交", description: error.message }); return null; }
@@ -504,8 +556,12 @@ function WorkflowApp() {
   }
   async function startPlan() {
     if (!selectionMatches || busy || imageQueues.current[state.id]?.tasks.length || (!state.codex && !sessionSelection)) return;
-    const id = state.id;
-    if (await act("plan", { ...(state.codex || sessionSelection), compile_check_enabled: state.plan_started_at ? Boolean(state.compile_check?.enabled) : draft.compile_check_enabled, supplement: draft.supplement }) && modelRef.current.selectedSessionId === id) navigate("plan");
+    const epoch = viewEpoch.current;
+    const result = await act("plan", { ...(state.codex || sessionSelection), compile_check_enabled: state.plan_started_at ? Boolean(state.compile_check?.enabled) : draft.compile_check_enabled,
+      supplement: draft.supplement, items: selectedItems.map(key => {
+      const [kind, number] = key.split(":"); return { kind, id: Number(number) };
+    }) });
+    if (result && epoch === viewEpoch.current && modelRef.current.selectedSessionId === result.session_id) navigate("plan");
   }
   async function answer() {
     if (state.phase === "complete") {
@@ -601,6 +657,10 @@ function WorkflowApp() {
           h(Space, null, (sending === "collect" || model.busy === "collect") && h(Spin, { size: "small" }),
             h("span", { className: "muted" }, selectedItems.length ? `已选 ${selectedItems.length} 项 · 选中后自动读取资料` : "可多选同一项目的任务联合开发；需求和 Bug 单选")))),
       h(CardBox, { title: snapshot ? h(Space, { wrap: true }, "工作项资料", ...sessionItems(state).map(item => h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id}`))) : "工作项资料" },
+        stage === "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "资料读取失败", description: state.error,
+          action: h(Button, { disabled: busy || !model.connected, onClick: () => act("collect", { items: selectedItems.map(key => {
+            const [kind, id] = key.split(":"); return { kind, id: Number(id) };
+          }) }) }, "重新读取资料"), style: { marginBottom: 16 } }),
         !snapshot ? h("div", { className: "empty-area" }, h(Empty, { description: model.busy === "collect" || sending === "collect" ? "正在读取所选工作项的完整资料…" : "勾选工作项后自动读取描述、图片、附件及关联需求" })) :
           h(React.Fragment, null,
             snapshot.blockers?.length > 0 && h(Alert, { type: "warning", showIcon: true, message: "有待补充的需求资料", description: h("div", null, snapshot.blockers.map((text, index) => h("div", { key: index }, text))), style: { marginBottom: 20 } }),
@@ -610,7 +670,7 @@ function WorkflowApp() {
               source.note && h(Typography.Text, { type: "secondary" }, source.note),
               h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")),
               h("div", { className: "attachment-grid" }, snapshot.materials.filter(material => source.material_ids.includes(material.file_id)).map(material => {
-              const url = `/api/material?session=${encodeURIComponent(state.id)}&file_id=${material.file_id}`;
+              const url = `/api/material?${new URLSearchParams({ ...(model.preview ? { preview_id: state.id } : { session: state.id }), file_id: material.file_id })}`;
               return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),
                 h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, `${material.title}.${material.extension}`)),
                 material.issue && h(Typography.Text, { type: "warning" }, material.issue));
@@ -707,7 +767,7 @@ function WorkflowApp() {
               h(Typography.Text, { type: "secondary" }, `支持多选、分批上传及粘贴图片，单张不超过 ${model.settings.max_attachment_mb} MB`))),
           h("div", { className: "attachment-grid" },
             (state.supplement_images || []).map(image => h("div", { className: "attachment", key: image.id },
-              h(Image, { src: `/api/supplement-images?${new URLSearchParams({ session_id: state.id, image_id: image.id })}`, alt: image.name, preview: { mask: "查看图片" } }),
+              h(Image, { src: `/api/supplement-images?${new URLSearchParams({ ...viewAddress(state.id), image_id: image.id })}`, alt: image.name, preview: { mask: "查看图片" } }),
               h("div", { className: "attachment-name" }, image.name),
               h("div", { className: "supplement-image-actions" }, h(Tag, { color: "success" }, "已上传"),
                 editable && h(Button, { size: "small", type: "text", danger: true, onClick: () => removeImage(image) }, "移除")))),
@@ -1033,7 +1093,7 @@ function WorkflowApp() {
             h(Button, { onClick: () => act("connect"), disabled: busy, loading: model.busy === "connect" }, model.connected ? "重新连接" : "连接禅道"))),
         h(Layout.Content, { className: "page-content" },
           !online && h(Alert, { className: "offline-banner", type: stopped ? "info" : "warning", showIcon: true, message: stopped ? "本地服务已停止" : "与本地服务的实时连接暂时中断", description: stopped ? "会话记录已保留。需要继续时，重新运行启动脚本后刷新页面。" : "页面会尝试恢复事件连接；如果服务已重启，请刷新页面。", action: h(Button, { onClick: () => location.reload() }, "刷新页面") }),
-          state?.error && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
+          state?.error && stage !== "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h("div", { className: page === "settings" ? "" : "session-workspace" }, page !== "settings" && renderSessions(), h("div", { className: "session-content" },
           page !== "settings" && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),

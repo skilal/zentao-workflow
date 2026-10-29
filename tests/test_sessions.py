@@ -141,17 +141,18 @@ class SessionChecks(SessionFixture):
             self.application.dispatch(self.request(self.first, "collect", {"items": items}))
 
     def test_new_collection_returns_stable_id_for_repeated_request(self):
-        item = {"kind": "task", "id": 9, "title": "新会话"}
+        item = {"kind": "task", "id": 9, "title": "查看资料"}
         self.application.items = [item]
         request = self.request(self.first, "collect", {"items": [item]}, session_id=None)
         snapshot = {"sources": [], "materials": [], "project": {"id": 41, "name": "示例项目"}}
         with patch.object(self.application.sessions.zentao, "collect_many", return_value=snapshot):
             result = self.application.dispatch(request)
-            self.drain(self.application.sessions.get(result["session_id"]))
+            self.drain(self.application.sessions.get_preview(result["preview_id"]))
         duplicate = self.application.dispatch(request)
         self.assertTrue(duplicate["duplicate"])
-        self.assertEqual(result["session_id"], duplicate["session_id"])
-        self.assertEqual(len(self.application.sessions.runtimes), 3)
+        self.assertEqual(result["preview_id"], duplicate["preview_id"])
+        self.assertNotIn("session_id", result)
+        self.assertEqual(len(self.application.sessions.runtimes), 2)
 
     def test_restarting_pauses_all_interrupted_sessions_and_clears_pending_requests(self):
         for runtime in (self.first, self.second):

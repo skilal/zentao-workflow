@@ -4,7 +4,7 @@ from threading import RLock
 
 from workflow.engine import ACTIVE, Workflow
 from workflow.settings import WorkflowError
-from workflow.store import SessionStore
+from workflow.store import PreviewStore, SessionStore
 from workflow.zentao import ZentaoClient
 
 
@@ -27,6 +27,8 @@ class SessionManager:
         self.zentao_lock = RLock()
         self.zentao = ZentaoClient(settings)
         self.runtimes = {}
+        self.previews = {}
+        self.promoted_previews = {}
         self.connection = Workflow(settings, lambda kind, value: emit(None, kind, value),
                                    self.store, self.zentao, self.zentao_lock, self.settings_lock)
         for state in self.store.sessions():
@@ -56,8 +58,36 @@ class SessionManager:
             raise WorkflowError("该会话正在删除，请等待操作结束。")
         return runtime
 
+    def new_preview(self, item):
+        store = PreviewStore()
+        state = store.new(item)
+        preview_id = state["id"]
+        engine = Workflow(self.settings, lambda kind, value: self.emit(preview_id, kind, value),
+                          store, self.zentao, self.zentao_lock, self.settings_lock)
+        engine.state = state
+        runtime = SessionRuntime(engine)
+        runtime.uploads = 0
+        self.previews[preview_id] = runtime
+        return runtime
+
+    def get_preview(self, preview_id):
+        if not isinstance(preview_id, str) or preview_id not in self.previews or self.previews[preview_id].deleting:
+            raise WorkflowError("当前查看资料已失效，请重新选择工作项。")
+        return self.previews[preview_id]
+
+    def close_preview(self, preview_id):
+        runtime = self.previews[preview_id]
+        runtime.engine.close()
+        runtime.engine.store.close()
+
     def close(self):
         errors = []
+        for preview_id in list(self.previews):
+            try:
+                self.close_preview(preview_id)
+                del self.previews[preview_id]
+            except Exception as error:
+                errors.append(f"临时资料 {preview_id}：{error}")
         engines = [self.connection, *(runtime.engine for runtime in list(self.runtimes.values()))]
         for engine in engines:
             try:

@@ -11,6 +11,7 @@ from mimetypes import guess_type
 from os import getpid
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
+from shutil import copytree, rmtree
 from threading import Condition, RLock, Thread, Timer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from uuid import uuid4
@@ -120,6 +121,9 @@ class WebApplication:
         if isinstance(value, dict) and value.get("session_id") in self.sessions.runtimes:
             self.sessions.runtimes[value["session_id"]].event_cursor = self.sequence
             value = {**value, "event_cursor": self.sequence}
+        if isinstance(value, dict) and value.get("preview_id") in self.sessions.previews:
+            self.sessions.previews[value["preview_id"]].event_cursor = self.sequence
+            value = {**value, "event_cursor": self.sequence}
         packet = f"id: {self.sequence}\nevent: {kind}\ndata: {dumps(value, ensure_ascii=False)}\n\n".encode("utf-8")
         self.events.append((self.sequence, packet))
         self.event_bytes += len(packet)
@@ -152,9 +156,38 @@ class WebApplication:
                 "working": runtime.engine.working(), "deleting": runtime.deleting,
                 "can_move_project": not reason, "project_move_reason": reason}
 
+    def preview_payload(self, runtime):
+        state = public_state(runtime.engine.state)
+        state["project"] = session_project(state)
+        state["can_edit"] = not runtime.deleting and runtime.engine.editable()
+        return {"preview_id": state["id"], "state": state, "revision": runtime.revision,
+                "event_cursor": runtime.event_cursor, "busy": runtime.busy, "working": runtime.engine.working()}
+
+    def preview(self, preview_id):
+        with self.lock:
+            return self.preview_payload(self.sessions.get_preview(preview_id))
+
+    def discard_preview(self, preview_id):
+        with self.condition:
+            runtime = self.sessions.get_preview(preview_id)
+            runtime.deleting = True
+            def release():
+                self.sessions.close_preview(preview_id)
+                with self.condition:
+                    del self.sessions.previews[preview_id]
+            return self.management_executor.submit(release)
+
     def emit(self, session_id, kind, value):
         with self.condition:
             if self.closed:
+                return
+            if session_id in self.sessions.previews:
+                runtime = self.sessions.previews[session_id]
+                if runtime.deleting:
+                    return
+                if kind in {"state", "message", "activity"}:
+                    runtime.revision += 1
+                    self._publish("preview", self.preview_payload(runtime))
                 return
             runtime = self.sessions.runtimes.get(session_id) if session_id else None
             if session_id and (not runtime or runtime.deleting):
@@ -213,7 +246,7 @@ class WebApplication:
 
     def snapshot(self):
         with self.lock:
-            return {"items": deepcopy(self.items), "default_session_id": self.default_session_id,
+            return {"preview_supported": True, "items": deepcopy(self.items), "default_session_id": self.default_session_id,
                     "connected": self.connected, "profile": self.profile, "busy": self.busy,
                     "cursor": self.sequence, "settings": self.public_settings(),
                     "project_partitions": self.projects(),
@@ -321,10 +354,12 @@ class WebApplication:
                 self.requests.popitem(last=False)
             return result
 
-    def _supplement_runtime(self, session_id, revision, purpose="supplement"):
-        if not isinstance(purpose, str) or purpose not in {"supplement", "followup"}:
+    def _supplement_runtime(self, session_id, revision, preview_id=None, purpose="supplement"):
+        if not isinstance(purpose, str) or purpose not in {"supplement", "followup"} or (purpose == "followup" and preview_id):
             raise WorkflowError("图片用途无效，后续对话图片必须归属正式会话。")
-        runtime = self.sessions.get(session_id)
+        if bool(session_id) == bool(preview_id):
+            raise WorkflowError("请明确指定一个会话或当前查看资料。")
+        runtime = self.sessions.get_preview(preview_id) if preview_id else self.sessions.get(session_id)
         state = runtime.engine.state
         if self.closed or self.busy == "settings" or runtime.busy or runtime.engine.working():
             raise WorkflowError("该会话正在执行操作，请等待完成后修改图片。")
@@ -336,9 +371,9 @@ class WebApplication:
             raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再操作。")
         return runtime
 
-    def upload_supplement_image(self, session_id, revision, name, data, purpose="supplement"):
+    def upload_supplement_image(self, session_id, revision, name, data, preview_id=None, purpose="supplement"):
         with self.condition:
-            runtime = self._supplement_runtime(session_id, revision, purpose)
+            runtime = self._supplement_runtime(session_id, revision, preview_id, purpose)
             maximum = self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
             if not isinstance(name, str) or not name.strip() or not 0 < len(data) <= maximum:
                 raise WorkflowError("图片名称不能为空，单张大小不能超过配置的附件上限。")
@@ -361,11 +396,11 @@ class WebApplication:
                      "path": str(path), "content_type": guess_type(path.name)[0]}
             runtime.engine.state.setdefault(purpose + "_images", []).append(image)
             runtime.engine.save()
-            return self.session_payload(runtime)
+            return self.preview_payload(runtime) if preview_id else self.session_payload(runtime)
 
-    def remove_supplement_image(self, session_id, revision, image_id, purpose="supplement"):
+    def remove_supplement_image(self, session_id, revision, image_id, preview_id=None, purpose="supplement"):
         with self.condition:
-            runtime = self._supplement_runtime(session_id, revision, purpose)
+            runtime = self._supplement_runtime(session_id, revision, preview_id, purpose)
             images = runtime.engine.state.get(purpose + "_images", [])
             image = next((entry for entry in images if entry["id"] == image_id and "history_index" not in entry), None)
             if image is None:
@@ -377,9 +412,11 @@ class WebApplication:
             path.unlink()
             images.remove(image)
             runtime.engine.save()
-            return self.session_payload(runtime)
+            return self.preview_payload(runtime) if preview_id else self.session_payload(runtime)
 
     def update_settings(self, data):
+        if any(runtime.engine.working() or runtime.uploads for runtime in self.sessions.previews.values()):
+            raise WorkflowError("工作项资料正在读取或上传，请等待完成后修改设置。")
         if any(runtime.engine.working() or runtime.deleting or runtime.engine.state["stage"] not in
                COMPLETE | {"资料已读取", "资料读取失败"} for runtime in self.sessions.runtimes.values()):
             raise WorkflowError("有会话的流程配置已固定，请结束这些流程后修改默认设置。")
@@ -417,6 +454,8 @@ class WebApplication:
             self.sessions.connection.zentao = client
             for runtime in self.sessions.runtimes.values():
                 runtime.engine.zentao = client
+            for runtime in self.sessions.previews.values():
+                runtime.engine.zentao = client
         with self.condition:
             self.connected, self.profile = False, None
             self.items = []
@@ -424,6 +463,41 @@ class WebApplication:
             self._publish("items", [])
             self._publish("connection", {"connected": False})
             self._publish("projects", {"project_partitions": self.projects()})
+
+    def promote_preview(self, preview_id, runtime, supplement, items, codex):
+        source = runtime.engine.state
+        if (source["stage"] != "资料已读取" or not source.get("snapshot")
+                or items != [{"kind": item["kind"], "id": item["id"]} for item in source["items"]]):
+            raise WorkflowError("当前选择与已读取资料不一致，请完成资料读取后再开始计划。")
+        if runtime.uploads:
+            raise WorkflowError("补充图片尚未上传完成，请等待后再开始计划。")
+        selection = validate_selection(self.codex_models(), codex.get("model"), codex.get("reasoning_effort"))
+        compile_enabled = codex.get("compile_check_enabled", self.settings.get("compile_check", {}).get("enabled", False))
+        if type(compile_enabled) is not bool:
+            raise WorkflowError("编译检查开关必须是布尔值。")
+        state = self.sessions.store.new(source["item"], save=False)
+        state.update({key: deepcopy(value) for key, value in source.items() if key not in {"id", "created_at", "updated_at"}})
+        state["supplement"] = supplement.strip()
+        state["codex"] = selection
+        state["compile_check"] = {"enabled": compile_enabled}
+        state["plan_started_at"] = timestamp()
+        directory = self.sessions.store.directory(state["id"])
+        previous = runtime.engine.store.directory(preview_id)
+        try:
+            if (previous / "attachments").exists():
+                copytree(previous / "attachments", directory / "attachments")
+            for entry in [*state["snapshot"]["materials"], *state["supplement_images"]]:
+                entry["path"] = str(directory / Path(entry["path"]).relative_to(previous))
+            self.sessions.store.save(state)
+        except (OSError, ValueError):
+            if directory.exists():
+                rmtree(directory)
+            raise
+        created = self.sessions.add(state)
+        self.sessions.promoted_previews[preview_id] = state["id"]
+        self.discard_preview(preview_id)
+        self.emit(state["id"], "state", state)
+        return created
 
     def dispatch(self, request):
         action = request.get("action")
@@ -437,7 +511,10 @@ class WebApplication:
             session_id = request.get("session_id")
             if session_id is not None and not isinstance(session_id, str):
                 raise WorkflowError("会话标识无效。")
-            request_key = (session_id, request_id)
+            preview_id = request.get("preview_id")
+            if preview_id is not None and (not isinstance(preview_id, str) or session_id):
+                raise WorkflowError("查看资料标识无效，不能与会话同时指定。")
+            request_key = (session_id or preview_id, request_id)
             if request_key in self.requests:
                 previous = self.requests[request_key]
                 if previous.get("session_id") in self.sessions.runtimes:
@@ -447,8 +524,17 @@ class WebApplication:
                 return {**self.requests[request_key], "duplicate": True}
             if action == "restore":
                 return {"accepted": True, **self.session(data.get("id"))}
+            if preview_id and action == "plan" and preview_id in self.sessions.promoted_previews:
+                created_id = self.sessions.promoted_previews[preview_id]
+                saved = self.sessions.get(created_id).engine.state["codex"]
+                if any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
+                    raise WorkflowError("会话模型配置已经固定，不能通过重复请求修改。")
+                return {"accepted": True, "duplicate": True, "session_id": created_id, "request_id": request_id}
+            if preview_id and action not in {"collect", "plan"}:
+                raise WorkflowError("当前查看资料尚未创建会话。")
             global_action = action in {"connect", "refresh", "settings"}
-            runtime = None if global_action or (action == "collect" and not session_id) else self.sessions.get(session_id)
+            runtime = (self.sessions.get_preview(preview_id) if preview_id else
+                       None if global_action or (action == "collect" and not session_id) else self.sessions.get(session_id))
             engine = runtime.engine if runtime else self.sessions.connection
             state = engine.state
             if action == "followup" and any((entry.get("followup") or {}).get("request_id") == request_id
@@ -465,14 +551,15 @@ class WebApplication:
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
                 if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
-                if ("plan_started_at" in state and "compile_check_enabled" in data
-                        and data["compile_check_enabled"] != state.get("compile_check", {}).get("enabled", False)):
-                    raise WorkflowError("会话编译检查配置已经固定，不能再次修改。")
-                saved = state.get("codex")
-                if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
-                    raise WorkflowError("会话模型配置已经固定，请新建会话使用其他配置。")
-                if not saved and action not in {"collect", "pause", "delete_session", "configure_codex", "plan"}:
-                    raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
+                if not preview_id:
+                    if ("plan_started_at" in state and "compile_check_enabled" in data
+                            and data["compile_check_enabled"] != state.get("compile_check", {}).get("enabled", False)):
+                        raise WorkflowError("会话编译检查配置已经固定，不能再次修改。")
+                    saved = state.get("codex")
+                    if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
+                        raise WorkflowError("会话模型配置已经固定，请新建会话使用其他配置。")
+                    if not saved and action not in {"collect", "pause", "delete_session", "configure_codex", "plan"}:
+                        raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
             affects, control = True, action == "pause"
             if action == "connect":
                 operation, arguments, affects = engine.connect, (), False
@@ -498,16 +585,20 @@ class WebApplication:
                 if runtime and not engine.editable():
                     raise WorkflowError("开始计划后不能改变工作项，请新建会话。")
                 if not runtime:
-                    runtime = self.sessions.add(self.sessions.store.new(selected[0]))
+                    runtime = self.sessions.new_preview(selected[0])
                     engine = runtime.engine
-                    session_id = engine.state["id"]
-                    self.emit(session_id, "state", engine.state)
+                    preview_id = engine.state["id"]
+                    self.emit(preview_id, "state", engine.state)
                 operation, arguments = engine.collect, (selected,)
             elif action in {"plan", "edit_branches"}:
                 supplement = data.get("supplement", "")
                 if not isinstance(supplement, str) or "selections" in data:
                     raise WorkflowError("开始计划只接受补充说明，仓库与分支由服务端确定。")
-                if not state.get("codex"):
+                if preview_id:
+                    runtime = self.promote_preview(preview_id, runtime, supplement, data.get("items"), data)
+                    engine = runtime.engine
+                    session_id = engine.state["id"]
+                elif not state.get("codex"):
                     state["codex"] = validate_selection(self.codex_models(), data.get("model"), data.get("reasoning_effort"))
                     engine.save()
                 if "plan_started_at" not in engine.state:
@@ -583,7 +674,12 @@ class WebApplication:
                 operation, arguments, affects = self.update_settings, (data,), False
             else:
                 raise WorkflowError("不支持该操作。")
-            result = {"accepted": True, "request_id": request_id, "session_id": session_id if runtime else None}
+            viewing = bool(preview_id) and not session_id
+            result = {"accepted": True, "request_id": request_id}
+            if viewing:
+                result["preview_id"] = preview_id
+            else:
+                result["session_id"] = session_id if runtime else None
             self.requests[request_key] = result
             while len(self.requests) > 512:
                 self.requests.popitem(last=False)
@@ -592,7 +688,8 @@ class WebApplication:
                     runtime.busy = action
                 else:
                     self.busy = action
-            self._publish("busy", self.session_payload(runtime) if runtime else {"session_id": None, "busy": self.busy})
+            self._publish("preview" if viewing else "busy", self.preview_payload(runtime) if viewing else
+                          self.session_payload(runtime) if runtime else {"session_id": None, "busy": self.busy})
             if action == "delete_session":
                 future = self.management_executor.submit(operation, *arguments)
             else:
@@ -606,7 +703,10 @@ class WebApplication:
                             runtime.busy = None
                         else:
                             self.busy = None
-                    if not runtime or session_id in self.sessions.runtimes:
+                    if viewing:
+                        if preview_id in self.sessions.previews and not runtime.deleting:
+                            self._publish("preview", self.preview_payload(runtime))
+                    elif not runtime or session_id in self.sessions.runtimes:
                         self._publish("busy", self.session_payload(runtime) if runtime else {"session_id": None, "busy": self.busy})
             future.add_done_callback(completed)
             return result
@@ -747,6 +847,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._events(query)
             elif path == "/api/session":
                 self._json(200, application.session(query.get("id", [""])[0]))
+            elif path == "/api/preview":
+                self._json(200, application.preview(query.get("id", [""])[0]))
             elif path == "/api/zentao-projects":
                 with application.sessions.zentao_lock:
                     projects = application.sessions.zentao.list_projects()
@@ -797,12 +899,24 @@ class WebHandler(BaseHTTPRequestHandler):
                 raise WorkflowError("操作凭据无效，请刷新页面后重试。")
             if image_upload:
                 query = parse_qs(parsed.query)
-                unread_length = 0
-                data = self.rfile.read(length)
-                if len(data) != length:
-                    raise WorkflowError("图片传输不完整，请重新上传。")
-                self._json(200, application.upload_supplement_image(query.get("session_id", [""])[0],
-                    int(query.get("revision", ["-1"])[0]), query.get("name", [""])[0], data, purpose=query.get("purpose", ["supplement"])[0]))
+                preview_id = query.get("preview_id", [None])[0]
+                session_id = query.get("session_id", [None])[0]
+                revision = int(query.get("revision", ["-1"])[0])
+                with application.condition:
+                    if preview_id:
+                        runtime = application.sessions.get_preview(preview_id)
+                        runtime.uploads += 1
+                try:
+                    unread_length = 0
+                    data = self.rfile.read(length)
+                    if len(data) != length:
+                        raise WorkflowError("图片传输不完整，请重新上传。")
+                    self._json(200, application.upload_supplement_image(session_id, revision,
+                        query.get("name", [""])[0], data, preview_id, query.get("purpose", ["supplement"])[0]))
+                finally:
+                    if preview_id:
+                        with application.condition:
+                            runtime.uploads -= 1
                 return
             if self.headers.get_content_type() != "application/json":
                 raise WorkflowError("操作必须使用 JSON 请求。")
@@ -813,13 +927,17 @@ class WebHandler(BaseHTTPRequestHandler):
             if self.path == "/api/actions":
                 self._json(202, application.dispatch(data))
             elif self.path == "/api/supplement-images/remove":
-                self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id"), purpose=data.get("purpose", "supplement")))
+                self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"),
+                    data.get("image_id"), data.get("preview_id"), data.get("purpose", "supplement")))
             elif self.path == "/api/projects":
                 self._json(200, application.add_project(data))
             elif self.path == "/api/sessions/title":
                 self._json(200, application.rename_session(data))
             elif self.path == "/api/sessions/project":
                 self._json(200, application.move_project(data))
+            elif self.path == "/api/previews/discard":
+                application.discard_preview(data.get("preview_id"))
+                self._json(200, {"discarded": True})
             elif self.path == "/api/shutdown":
                 self._json(200, {"stopping": True})
                 Thread(target=self.server.shutdown, daemon=True).start()
@@ -834,13 +952,15 @@ class WebHandler(BaseHTTPRequestHandler):
     def _material(self, query):
         application = self.server.application
         session_id = query.get("session", [""])[0]
+        preview_id = query.get("preview_id", [None])[0]
         file_id = int(query.get("file_id", ["0"])[0])
-        state = application.session(session_id)["state"]
+        runtime = self._material_runtime(session_id, preview_id)
+        state = runtime.engine.state
         material = next((item for item in state.get("snapshot", {}).get("materials", []) if item["file_id"] == file_id), None)
         if not material:
             raise WorkflowError("附件不在该工作项的资料清单中。")
         path = Path(material["path"]).resolve()
-        allowed = (application.sessions.store.directory(session_id) / "attachments").resolve()
+        allowed = (runtime.engine.store.directory(state["id"]) / "attachments").resolve()
         if not path.is_relative_to(allowed) or not path.is_file():
             raise WorkflowError("该附件当前不可读取。")
         data = path.read_bytes()
@@ -858,7 +978,7 @@ class WebHandler(BaseHTTPRequestHandler):
     def _supplement_image(self, query):
         application = self.server.application
         session_id = query.get("session_id", [""])[0]
-        runtime = application.sessions.get(session_id)
+        runtime = self._material_runtime(session_id, query.get("preview_id", [None])[0])
         state = runtime.engine.state
         purpose = query.get("purpose", ["supplement"])[0]
         if purpose not in {"supplement", "followup"}:
@@ -873,6 +993,12 @@ class WebHandler(BaseHTTPRequestHandler):
         data = path.read_bytes()
         self._headers(200, image["content_type"], len(data))
         self.wfile.write(data)
+
+    def _material_runtime(self, session_id, preview_id):
+        if bool(session_id) == bool(preview_id):
+            raise WorkflowError("请明确指定一个会话或当前查看资料。")
+        sessions = self.server.application.sessions
+        return sessions.get_preview(preview_id) if preview_id else sessions.get(session_id)
 
     def _events(self, query):
         application = self.server.application

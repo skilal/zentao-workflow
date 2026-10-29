@@ -239,7 +239,7 @@ class Workflow(CompileFlow):
                 assign_project(self.state, self.state["project_override"])
             self.state["stage"] = "资料已读取"
             self.save()
-            self.note("系统", f"已读取 {len(items)} 个工作项的资料，将在同一会话中处理。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
+            self.note("系统", f"已读取 {len(items)} 个工作项的资料。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
         except Exception:
             self.state["stage"] = "资料读取失败"
             self.save()

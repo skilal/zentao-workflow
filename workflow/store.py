@@ -6,6 +6,7 @@ from json import dumps, loads
 from pathlib import Path
 from os import walk
 from shutil import rmtree
+from tempfile import TemporaryDirectory
 from threading import RLock
 from uuid import uuid4
 
@@ -32,8 +33,22 @@ def write_authorized(state):
     plan = state.get("approved_plan", "")
     return bool(plan and sha256(plan.encode("utf-8")).hexdigest() == state.get("approved_hash"))
 
+
 def session_repositories(state):
     return [*state["repos"], *(repo for delivery in state.get("deliveries", []) for repo in delivery["repos"])]
+
+
+def initial_state(item, record_id):
+    return {
+        "id": record_id, "item": item, "items": [item], "custom_title": "", "stage": "资料已读取", "phase": "plan",
+        "updated_at": timestamp(), "repos": [],
+        "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
+        "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],
+        "plan_round": None, "approval_source": "",
+        "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [],
+        "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
+        "delivery_round": 1, "deliveries": [], "followup_images": [],
+    }
 
 
 class SessionStore:
@@ -42,19 +57,12 @@ class SessionStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = RLock()
 
-    def new(self, item):
+    def new(self, item, *, save=True):
         session_id = f"{item['kind']}-{item['id']}-{uuid4().hex[:10]}"
-        state = {
-            "id": session_id, "item": item, "items": [item], "custom_title": "", "stage": "资料已读取", "phase": "plan",
-            "created_at": timestamp(), "updated_at": timestamp(), "repos": [],
-            "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
-            "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],
-            "plan_round": None, "approval_source": "",
-            "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [],
-            "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
-            "delivery_round": 1, "deliveries": [], "followup_images": [],
-        }
-        self.save(state)
+        state = initial_state(item, session_id)
+        state["created_at"] = timestamp()
+        if save:
+            self.save(state)
         return state
 
     def directory(self, session_id):
@@ -102,3 +110,21 @@ class SessionStore:
             state["history"].append({"time": timestamp(), "role": role, "text": text, "phase": state["phase"],
                                      "delivery_round": state.get("delivery_round", 1), **metadata})
             self.save(state)
+
+
+class PreviewStore(SessionStore):
+    """查看资料只写临时附件，不生成任何会话状态文件。"""
+
+    def __init__(self):
+        self.temporary = TemporaryDirectory(prefix="zentao-preview-")
+        self.root = Path(self.temporary.name)
+        self.lock = RLock()
+
+    def new(self, item):
+        return initial_state(item, f"preview-{uuid4().hex}")
+
+    def save(self, state):
+        state["updated_at"] = timestamp()
+
+    def close(self):
+        self.temporary.cleanup()
