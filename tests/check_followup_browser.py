@@ -4,6 +4,7 @@ from base64 import b64encode
 from copy import deepcopy
 from json import dumps
 from pathlib import Path
+from re import compile
 import sys
 from threading import Thread
 from urllib.parse import urlencode
@@ -13,6 +14,7 @@ from playwright.sync_api import expect, sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from test_followup import FollowupChecks, PNG
+from workflow.mcp_server import Tools
 from workflow.web import LocalServer
 
 
@@ -43,8 +45,11 @@ def run():
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.add_init_script("if (!sessionStorage.getItem('workflow-page')) sessionStorage.setItem('workflow-page', 'plan')")
             page.goto(server.origin)
-            send = page.get_by_role("button", name="发送并修复", exact=True)
-            reply = page.get_by_placeholder("输入复现步骤、实际结果与预期结果，可粘贴测试截图…")
+            send = page.get_by_role("button", name=compile(r"^发\s*送$"))
+            reply = page.get_by_placeholder("输入问题、需要获取的信息或修改要求，可粘贴图片…")
+            review_switch = page.get_by_role("switch", name="修改后自动 Review", exact=True)
+            expect(review_switch).not_to_be_checked()
+            review_switch.click()
             expect(send).to_be_enabled()
             expect(reply).to_be_enabled()
             expect(page.locator("#review-1 .review-actions")).to_have_count(0)
@@ -77,6 +82,7 @@ def run():
             expect(send).to_be_enabled()
             image_id = state["followup_images"][-1]["id"]
             page.reload()
+            expect(review_switch).to_be_checked()
             expect(reply).to_have_value("实际结果：保存失败；预期结果：保存成功。补充：点击保存后报错。")
             expect(page.get_by_alt_text("粘贴截图.png")).to_be_visible()
 
@@ -85,18 +91,29 @@ def run():
                 "session_id": other["id"], "image_id": image_id, "purpose": "followup"}))
             assert response.status == 400
 
+            # 发送失败保留当前开关和消息。
+            page.route("**/api/actions", lambda route: route.fulfill(status=400, json={"error": "模拟发送失败"}), times=1)
+            send.click()
+            expect(page.get_by_text("模拟发送失败", exact=True)).to_be_visible()
+            expect(review_switch).to_be_checked()
+            expect(reply).not_to_have_value("")
+
             page.screenshot(path=str(output / "完成后可继续发送.png"), full_page=True)
             send.click()
-            expect(page.get_by_text("修复中", exact=True).first).to_be_visible()
+            expect(page.get_by_text("续聊处理中", exact=True).first).to_be_visible()
             fixture.drain()
             expect(page.get_by_placeholder("输入回复、需要调整的计划内容或补充业务规则…")).to_be_disabled()
             expect(page.locator(".conversation-feed").get_by_alt_text("粘贴截图.png")).to_be_visible()
             expect(page.get_by_text("历史交付记录", exact=True)).to_be_visible()
             assert state["thread_id"] == "原需求线程"
             assert state["delivery_round"] == 2 and state["fix_round"] == 0
+            assert state["review_enabled"] is True
+            Tools(state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "开启 Review 后的修改\n"})
             fixture.finish()
             expect(send).to_be_enabled()
             expect(reply).to_have_value("")
+            expect(review_switch).not_to_be_checked()
+            assert state["stage"] == "已完成（静态审查）" and len(state["reviews"]) == 2
             expect(page.locator(".conversation-feed").get_by_alt_text("粘贴截图.png")).to_be_visible()
             expect(page.get_by_role("button", name="移除", exact=True)).to_have_count(0)
             expect(page.locator("#review-1 .review-actions, #review-2 .review-actions")).to_have_count(0)
@@ -106,22 +123,43 @@ def run():
             expect(page.get_by_alt_text("第二次截图.png")).to_be_visible()
             expect(send).to_be_enabled()
             send.click()
-            expect(page.get_by_text("修复中", exact=True).first).to_be_visible()
+            expect(page.get_by_text("续聊处理中", exact=True).first).to_be_visible()
             fixture.drain()
             assert state["delivery_round"] == 3 and state["followup"]["text"] == ""
+            assert state["review_enabled"] is False
+            Tools(state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "关闭 Review 后的修改\n"})
             fixture.finish()
             expect(send).to_be_enabled()
+            assert state["stage"] == "已完成（未审查）" and state["commits"] == {}
+            assert len(state["reviews"]) == 2
             page.reload()
+            expect(review_switch).not_to_be_checked()
             expect(page.locator(".conversation-feed img")).to_have_count(2)
+
+            # 已完成（未审查）仍可续聊，开启但无代码修改时不追加 Review。
+            reply.fill("请解释当前保存流程，不修改代码")
+            review_switch.click()
+            send.click()
+            expect(page.get_by_text("续聊处理中", exact=True).first).to_be_visible()
+            fixture.drain()
+            fixture.complete("保存流程会检查输入并持久化数据。")
+            expect(send).to_be_enabled()
+            expect(review_switch).not_to_be_checked()
+            assert state["delivery_round"] == 4 and len(state["reviews"]) == 2
+            assert state["stage"] == "已完成（未审查）"
+            expect(page.get_by_text("Review（跳过）", exact=True)).to_be_visible()
+            expect(page.get_by_text("本地提交（跳过）", exact=True)).to_be_visible()
             for width in (1500, 720, 390):
                 page.set_viewport_size({"width": width, "height": 1050})
                 page.wait_for_function("() => !document.getAnimations().some(animation => animation.playState === 'running')")
                 assert not page.evaluate("document.documentElement.scrollWidth > innerWidth"), f"页面横向溢出：{width}"
+                assert page.locator(".chat-meta").evaluate_all("nodes => nodes.every(node => node.scrollWidth <= node.clientWidth)"), f"消息标签溢出：{width}"
             page.screenshot(path=str(output / "续聊历史窄屏.png"), full_page=True)
             assert not errors, errors
             (output / "result.json").write_text(dumps({"结果": "通过", "页面错误": errors,
                 "覆盖": ["已完成会话发送", "失败图片移除", "上传预览移除", "文字与图片粘贴", "刷新草稿与截图", "跨会话图片隔离",
-                         "原线程多轮续聊", "纯图片反馈", "历史 Review 只读", "历史提交保留", "发送中禁用", "宽窄屏布局"]},
+                         "原线程多轮续聊", "纯图片反馈", "历史 Review 只读", "历史提交保留", "发送中禁用", "宽窄屏布局",
+                         "Review 默认关闭", "开关草稿恢复", "发送失败保留选择", "发送成功重置", "开启后修改审查提交", "关闭后修改保留", "纯问答跳过审查"]},
                 ensure_ascii=False, indent=2), encoding="utf-8")
             browser.close()
     finally:

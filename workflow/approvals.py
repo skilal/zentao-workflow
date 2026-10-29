@@ -19,7 +19,7 @@ def is_controlled_write(state, params):
     if metadata.get("codex_approval_kind") != "mcp_tool_call":
         return False
     tool = WRITE_TOOL_DESCRIPTIONS.get(metadata.get("tool_description"))
-    if not tool or state["stage"] not in ("实施中", "修复中"):
+    if not tool or state["stage"] not in ("实施中", "修复中", "续聊处理中"):
         return False
     if not write_authorized(state):
         return False

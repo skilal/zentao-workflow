@@ -61,7 +61,7 @@ button, input, textarea { font: inherit; }
 .conversation-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, .8fr); gap: 18px; align-items: start; }
 .conversation-feed { max-height: 490px; min-height: 280px; overflow: auto; padding-right: 5px; }
 .chat-entry { margin-bottom: 20px; }
-.chat-meta { display: flex; gap: 9px; align-items: center; color: #8a94a6; font-size: 11px; margin-bottom: 7px; }
+.chat-meta { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; color: #8a94a6; font-size: 11px; margin-bottom: 7px; }
 .chat-body { background: #f6f8fb; border: 1px solid #eef1f5; border-radius: 0 8px 8px; padding: 12px 15px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.9; color: #3d4b61; }
 .chat-entry.user .chat-body { background: #eef7ff; border-color: #dfedfc; }
 .chat-entry.system .chat-body { background: white; color: #8791a1; border-style: dashed; }

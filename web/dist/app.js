@@ -3,11 +3,12 @@
 const { useState, useEffect, useRef } = React;
 const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Checkbox,
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
-  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown } = antd;
+  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown, Switch } = antd;
 const h = React.createElement;
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
-const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中"]);
+const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中"]);
+const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
   items: ["工作项与资料", "从指派给你的需求、任务和 Bug 中，选择本次处理对象。"],
   plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
@@ -30,7 +31,8 @@ function stageTag(stage) {
 }
 function stepOf(state) {
   if (!state) return 0;
-  if (state.phase === "complete") return 4;
+  if (state.phase === "complete") return state.stage === "已完成（未审查）" ? 2 : 4;
+  if (state.phase === "followup") return 2;
   if (state.reviews?.length || state.phase === "review" || state.phase === "fix") return 3;
   if (state.phase === "implement") return 2;
   if (state.repos?.length) return 1;
@@ -43,7 +45,7 @@ function mergeHistory(history, state) {
   const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
-function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", answers: {}, review_note: "", selected_findings: [],
+function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", review_enabled: false, answers: {}, review_note: "", selected_findings: [],
   codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
 const EFFORT_NAMES = { none: "无", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最大", ultra: "超高" };
 function CodexSelection({ value, onChange, onReady, disabled }) {
@@ -419,7 +421,7 @@ function WorkflowApp() {
   const imagesUploading = transfers.some(entry => entry.status !== "error");
   const supplementEditable = Boolean(state && ["资料已读取", "准备工作区失败"].includes(stage) &&
     !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
-  const followupEditable = Boolean(state?.phase === "complete" && stage === "已完成（静态审查）" &&
+  const followupEditable = Boolean(state?.phase === "complete" && COMPLETE.has(stage) &&
     !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
   const busy = Boolean(stopped || sending || model?.busy || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
   const selectedKey = selectedItems.join("|");
@@ -498,10 +500,16 @@ function WorkflowApp() {
     if (state.phase === "complete") {
       const images = state.followup_images.filter(image => image.history_index === undefined);
       if (busy || transfers.length) return;
-      if (!draft.reply.trim() && !images.length) { notice.warning({ message: "请填写测试问题或添加截图" }); return; }
+      if (!draft.reply.trim() && !images.length) { notice.warning({ message: "请填写消息或添加图片" }); return; }
       const id = state.id;
-      if (await act("followup", { text: draft.reply, image_ids: images.map(image => image.id) }) && modelRef.current.selectedSessionId === id)
-        changeDraft({ reply: "", answers: {} });
+      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), review_enabled: draft.review_enabled });
+      if (result) {
+        if (modelRef.current.selectedSessionId === id) changeDraft({ reply: "", answers: {}, review_enabled: false });
+        else {
+          const saved = JSON.parse(sessionStorage.getItem(`workflow-draft:${id}`) || "{}");
+          sessionStorage.setItem(`workflow-draft:${id}`, JSON.stringify({ ...saved, reply: "", answers: {}, review_enabled: false }));
+        }
+      }
       return;
     }
     const questions = state?.pending?.params?.questions || [];
@@ -761,11 +769,12 @@ function WorkflowApp() {
           h("div", { className: "conversation-feed", ref: feedRef }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
             entries.map(entry => h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: entry.index },
               h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time)),
-                entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`)),
+                entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
+                typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
               h("div", { className: "chat-body" }, entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images)))),
             model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, model.stream)))),
-        h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续测试与 Bug 修复" : "补充说明与回复" },
+        h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复" },
           questions.map(question => {
             const key = `${state.pending.id}:${question.id}:${question.question}`;
             const value = draft.answers[key] || {};
@@ -777,18 +786,22 @@ function WorkflowApp() {
           }),
           h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer,
             onPaste: continuing && followupEditable ? event => pasteImages(event, "followup") : undefined,
-            placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入复现步骤、实际结果与预期结果，可粘贴测试截图…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
+            placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
           continuing && h(React.Fragment, null,
+            h("div", { className: "action-bar" },
+              h(Switch, { checked: draft.review_enabled, disabled: !followupEditable, "aria-label": "修改后自动 Review", onChange: checked => changeDraft({ review_enabled: checked }) }),
+              h(Typography.Text, null, "修改后自动 Review"),
+              h(Typography.Text, { type: "secondary" }, draft.review_enabled ? "本轮有代码修改时审查，通过后自动本地提交" : "本轮不自动审查或提交，修改保留在工作区")),
             h("div", { className: "supplement-image-tools" },
               h("input", { type: "file", ref: followupImageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", onChange: event => {
                 addImages(event.target.files, "followup"); event.target.value = "";
               } }),
-              h(Button, { disabled: !followupEditable, onClick: () => followupImageInput.current.click() }, "上传测试截图"),
-              h(Typography.Text, { type: "secondary" }, `单张不超过 ${model.settings.max_attachment_mb} MB；发送即授权修复，完成后自动 Review`)),
+              h(Button, { disabled: !followupEditable, onClick: () => followupImageInput.current.click() }, "上传图片"),
+              h(Typography.Text, { type: "secondary" }, `单张不超过 ${model.settings.max_attachment_mb} MB；可用于提问、说明或反馈问题`)),
             renderFeedbackImages(state.followup_images.filter(image => image.history_index === undefined), followupEditable),
             renderFeedbackTransfers(),
             transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再发送。")),
-          h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送并修复" : "提交补充说明")))),
+          h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明")))),
       h("div", { className: "card-stack" }, h(CardBox, { title: feedbackAuthorized ? "原需求实施计划" : "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, feedbackAuthorized ? "原计划 · 业务背景" : state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认") },
         state.plan ? h(React.Fragment, null, h("div", { className: "plan-panel" }, h("pre", { className: "plain-plan" }, state.plan)), h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
         h(Button, { type: "primary", block: true, disabled: stage !== "等待计划确认" || busy, onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")),
@@ -797,11 +810,11 @@ function WorkflowApp() {
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
           h(Button, { block: true, disabled: !review, onClick: () => navigate("review") }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
-            "发送测试反馈即授权本轮修复；需要澄清时等待回答，扩大范围时先重新计划。Review 无遗留问题后自动本地 commit，不 push。" :
+            "后续对话支持提问、获取信息和提出修改要求。每条消息的 Review 开关默认关闭；开启且有代码修改时审查，无遗留问题后自动本地 commit，不 push。需要澄清时等待回答，扩大范围时先重新计划。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
         Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
         state.deliveries.length > 0 && h(CardBox, { title: "历史交付记录" }, h(Collapse, { ghost: true, items: state.deliveries.map(delivery => ({
-          key: delivery.number, label: `第 ${delivery.number} 轮交付 · ${timeLabel(delivery.completed_at)}`,
+          key: delivery.number, label: `第 ${delivery.number} 轮交付 · ${timeLabel(delivery.completed_at)}${typeof delivery.review_enabled === "boolean" ? ` · 自动 Review ${delivery.review_enabled ? "开启" : "关闭"}` : ""}${delivery.stage ? ` · ${delivery.stage}` : ""}`,
           children: h(Descriptions, { column: 1, items: Object.entries(delivery.commits).map(([name, sha]) => ({ key: name, label: name,
             children: h(Typography.Text, { code: true, copyable: true }, sha) })) })
         })) }))));
@@ -841,7 +854,7 @@ function WorkflowApp() {
   }
 
   function renderSettings() {
-    const editable = model.history.every(entry => !entry.working && !entry.deleting && ["已完成（静态审查）", "资料已读取", "资料读取失败"].includes(entry.stage));
+    const editable = model.history.every(entry => !entry.working && !entry.deleting && (COMPLETE.has(entry.stage) || ["资料已读取", "资料读取失败"].includes(entry.stage)));
     return h(CardBox, { title: "默认配置" }, !editable && h(Alert, { type: "info", showIcon: true, message: "有会话的流程配置已固定，请结束这些流程后再修改", style: { marginBottom: 20 } }),
       h(Form, { form: settingsForm, layout: "vertical", disabled: !editable || busy, onFinish: async values => { if (await act("settings", values)) { settingsForm.setFieldValue("password", ""); notice.success({ message: "设置已提交", description: "保存后请重新连接禅道。" }); } } },
         h("div", { className: "settings-grid" },
@@ -965,7 +978,9 @@ function WorkflowApp() {
               h(Button, { size: "small", "aria-controls": "project-info", "aria-expanded": false, onClick: () => {
                 setProjectInfoHidden(false); sessionStorage.setItem("workflow-project-info-hidden", "false");
               } }, "项目信息"))),
-            h(Steps, { current: stepOf(state), size: "small", responsive: false, items: ["选择工作项", "制定计划", "实施修改", "Review", "本地提交"].map(title => ({ title })) })),
+            h(Steps, { current: stepOf(state), status: stage === "已完成（未审查）" ? "finish" : undefined, size: "small", responsive: false,
+              items: ["选择工作项", "制定计划", state?.followup ? "处理消息" : "实施修改", "Review", "本地提交"].map((title, index) =>
+                stage === "已完成（未审查）" && index > 2 ? { title: `${title}（跳过）`, status: "wait" } : { title }) })),
           h("div", { className: `session-body${showProjectInfo ? " with-project-info" : ""}` },
             h("div", { className: "workspace-main" }, renderers[page]()), showProjectInfo && renderProjectInfo()))), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
     h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },

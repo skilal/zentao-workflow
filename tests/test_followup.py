@@ -87,9 +87,9 @@ class FollowupChecks(TestCase):
         self.calls.append((method, params))
         return {"turn": {"id": f"回合-{next(self.turns)}"}}
 
-    def send(self, text="修复测试反馈", image_ids=None, request_id=None):
+    def send(self, text="修复测试反馈", image_ids=None, request_id=None, review_enabled=True):
         images = self.engine.validate_followup(text, image_ids or [])
-        self.engine.followup(text, images, request_id or uuid4().hex)
+        self.engine.followup(text, images, request_id or uuid4().hex, review_enabled)
 
     def complete(self, text):
         self.engine.last_message = text
@@ -99,10 +99,11 @@ class FollowupChecks(TestCase):
 
     def finish(self):
         self.complete("已修复并完成静态检查")
-        self.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": []}))
+        if self.state["phase"] == "review":
+            self.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": []}))
 
     def request(self, **changes):
-        return {"action": "followup", "data": {"text": "测试反馈", "image_ids": []},
+        return {"action": "followup", "data": {"text": "测试反馈", "image_ids": [], "review_enabled": True},
                 "session_id": self.state["id"], "revision": self.runtime.revision,
                 "request_id": uuid4().hex, **changes}
 
@@ -112,6 +113,89 @@ class FollowupChecks(TestCase):
     def upload(self):
         self.application.upload_supplement_image(self.state["id"], self.runtime.revision, "测试截图.png", PNG, purpose="followup")
         return self.state["followup_images"][-1]
+
+    def test_review_switch_rejects_missing_or_non_boolean_before_creating_round(self):
+        for data in ({"text": "查询"}, *({"text": "查询", "review_enabled": value} for value in (None, 0, 1, "false", [], {}))):
+            with self.subTest(data=data), self.assertRaises(WorkflowError):
+                self.application.dispatch(self.request(data=data))
+        self.assertEqual(self.state["delivery_round"], 1)
+        self.assertEqual(self.state["deliveries"], [])
+
+    def test_information_only_skips_review_with_either_switch_value(self):
+        original = deepcopy(self.state["commits"])
+        for enabled in (False, True):
+            self.send("解释保存功能的处理流程，不修改代码", review_enabled=enabled)
+            self.assertEqual(self.state["phase"], "followup")
+            context = Tools(self.state["id"]).call("task_context", {})
+            self.assertIs(context["review_enabled"], enabled)
+            prompt = self.calls[-1][1]["input"][0]["text"]
+            self.assertIn("获取信息、解释或查询时只读取资料并回答", prompt)
+            with patch.object(self.engine, "_begin_review") as review, patch("workflow.engine.commit") as committing:
+                self.complete("保存功能会先检查输入，然后写入数据。")
+            review.assert_not_called()
+            committing.assert_not_called()
+            self.assertEqual(self.state["stage"], "已完成（未审查）")
+            self.assertEqual(self.state["phase"], "complete")
+            self.assertEqual(self.state["commits"], {})
+            self.assertIn("本轮无代码修改", self.state["history"][-1]["text"])
+            self.assertEqual(self.engine.store.load(self.state["id"])["review_enabled"], enabled)
+        self.assertEqual(self.state["deliveries"][0]["commits"], original)
+        self.assertIs(self.state["deliveries"][-1]["review_enabled"], False)
+        self.assertEqual(len(self.state["reviews"]), 1)
+        self.upload()
+
+    def test_disabled_review_preserves_code_and_next_round_protects_it(self):
+        self.send("修改保存提示", review_enabled=False)
+        repository = self.state["repos"][0]
+        path = Path(repository["path"])
+        before = git(path, "rev-parse", "HEAD")
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "未审查的修改\n"})
+        with patch.object(self.engine, "_begin_review") as review, patch("workflow.engine.commit") as committing:
+            self.complete("提示已调整。")
+        review.assert_not_called()
+        committing.assert_not_called()
+        self.assertEqual(git(path, "rev-parse", "HEAD"), before)
+        self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "未审查的修改\n")
+        self.assertIn("本轮有代码修改", self.state["history"][-1]["text"])
+        self.send("新增说明文件", review_enabled=True)
+        self.assertIn("业务.txt", self.state["repos"][0]["preserved_paths"])
+        with self.assertRaises(WorkflowError):
+            Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "不能覆盖"})
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "说明.txt", "content": "本轮说明\n"})
+        self.complete("已新增说明。")
+        self.assertEqual(self.state["phase"], "review")
+        self.assertEqual(set(self.state["review_manifest"]), {"前端/说明.txt"})
+        self.assertIn((ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(), self.calls[-1][1]["input"][0]["text"])
+        self.complete(dumps({"summary": "无问题", "findings": [], "resolved_previous": []}))
+        self.assertEqual(self.state["stage"], "已完成（静态审查）")
+        self.assertEqual(git(path, "show", "HEAD:业务.txt"), "首轮交付")
+        self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "未审查的修改\n")
+
+    def test_switch_survives_clarification_replanning_and_restart(self):
+        self.send("调整提示", review_enabled=False)
+        self.complete("[需要澄清] 请明确提示内容。")
+        self.engine.answer("提示为保存成功")
+        self.assertFalse(self.state["review_enabled"])
+        self.complete("[需要重做计划] 需要补充方案。")
+        self.assertFalse(self.state["review_enabled"])
+        self.assertEqual(self.state["phase"], "plan")
+        self.engine.pause()
+        restored = WebApplication(self.settings)
+        self.addCleanup(restored.close)
+        engine = restored.sessions.get(self.state["id"]).engine
+        with patch.object(engine, "_start_turn") as start:
+            engine.resume()
+        start.assert_called_once()
+        self.assertFalse(engine.state["review_enabled"])
+        self.assertEqual(len(engine.state["deliveries"]), 1)
+
+    def test_legacy_active_followup_keeps_automatic_review(self):
+        self.send()
+        self.state.pop("review_enabled")
+        self.state["phase"] = "fix"
+        with patch.object(self.engine, "_begin_review") as review:
+            self.complete("已完成旧轮次修复")
+        review.assert_called_once()
 
     def test_repeated_deliveries_keep_thread_and_only_commit_current_changes(self):
         original = deepcopy(self.state["commits"])
@@ -207,7 +291,7 @@ class FollowupChecks(TestCase):
         other["phase"] = "complete"
         self.engine.store.save(other)
         self.engine.resume()
-        self.assertEqual(self.state["stage"], "修复中")
+        self.assertEqual(self.state["stage"], "续聊处理中")
         self.assertEqual(len([entry for entry in self.state["history"] if entry["role"] == "用户"]), 1)
         self.assertEqual(len(self.state["deliveries"]), 1)
 

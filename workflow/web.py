@@ -18,7 +18,7 @@ from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
 from workflow.store import session_repositories, session_title, timestamp
-from workflow.engine import ACTIVE
+from workflow.engine import ACTIVE, COMPLETE
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
@@ -297,12 +297,12 @@ class WebApplication:
 
     def _supplement_runtime(self, session_id, revision, purpose="supplement"):
         if not isinstance(purpose, str) or purpose not in {"supplement", "followup"}:
-            raise WorkflowError("图片用途无效，测试反馈图片必须归属正式会话。")
+            raise WorkflowError("图片用途无效，后续对话图片必须归属正式会话。")
         runtime = self.sessions.get(session_id)
         state = runtime.engine.state
         if self.closed or self.busy == "settings" or runtime.busy or runtime.engine.working():
             raise WorkflowError("该会话正在执行操作，请等待完成后修改图片。")
-        allowed = (state["stage"] == "已完成（静态审查）" and state["phase"] == "complete") if purpose == "followup" else state["stage"] in {"资料已读取", "准备工作区失败"}
+        allowed = (state["stage"] in COMPLETE and state["phase"] == "complete") if purpose == "followup" else state["stage"] in {"资料已读取", "准备工作区失败"}
         if (runtime.engine.closed or not allowed
                 or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
             raise WorkflowError("当前阶段不能修改补充图片。")
@@ -355,7 +355,7 @@ class WebApplication:
 
     def update_settings(self, data):
         if any(runtime.engine.working() or runtime.deleting or runtime.engine.state["stage"] not in
-               ("已完成（静态审查）", "资料已读取", "资料读取失败") for runtime in self.sessions.runtimes.values()):
+               COMPLETE | {"资料已读取", "资料读取失败"} for runtime in self.sessions.runtimes.values()):
             raise WorkflowError("有会话的流程配置已固定，请结束这些流程后修改默认设置。")
         account = str(data.get("account", "")).strip()
         url = str(data.get("base_url", "")).strip().rstrip("/")
@@ -497,9 +497,12 @@ class WebApplication:
                     raise WorkflowError("请明确选择待确定仓库的分支。")
                 operation, arguments = engine.choose_branches, (choices,)
             elif action == "followup":
+                review_enabled = data.get("review_enabled")
+                if not isinstance(review_enabled, bool):
+                    raise WorkflowError("请明确设置修改后自动 Review 开关。")
                 text = data.get("text", "")
                 images = engine.validate_followup(text, data.get("image_ids", []))
-                operation, arguments = engine.followup, (text, images, request_id)
+                operation, arguments = engine.followup, (text, images, request_id, review_enabled)
             elif action == "answer":
                 text, answers = str(data.get("text", "")).strip(), data.get("answers")
                 pending = state.get("pending")
