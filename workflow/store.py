@@ -25,7 +25,7 @@ class SessionStore:
             "id": session_id, "item": item, "stage": "资料已读取", "phase": "plan",
             "created_at": timestamp(), "updated_at": timestamp(), "repos": [],
             "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
-            "approved_plan": "", "approved_hash": "", "supplement": "",
+            "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],
             "plan_round": None, "approval_source": "",
             "pending": None, "history": [], "reviews": [], "decisions": [],
             "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,

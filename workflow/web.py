@@ -13,6 +13,7 @@ from secrets import compare_digest, token_urlsafe
 from threading import Condition, RLock, Thread, Timer
 from time import monotonic
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from uuid import uuid4
 from webbrowser import open as open_browser
 
 from workflow.engine import ACTIVE, Workflow
@@ -29,6 +30,7 @@ def public_state(state):
     if state is None:
         return None
     result = deepcopy(state)
+    result.setdefault("supplement_images", [])
     for source in result.get("snapshot", {}).get("sources", []):
         source.pop("raw", None)
     return result
@@ -111,6 +113,7 @@ class WebApplication:
     def public_settings(self):
         return {"base_url": self.settings["zentao"]["base_url"], "account": self.settings["zentao"]["account"],
                 "model": self.settings["codex"]["model"], "max_fix_rounds": self.settings["review"]["max_fix_rounds"],
+                "max_attachment_mb": self.settings["zentao"]["max_attachment_mb"],
                 "review_prompt": (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(),
                 "repositories": deepcopy(self.settings["repositories"]), "feishu_enabled": False}
 
@@ -120,6 +123,65 @@ class WebApplication:
                     "connected": self.connected, "profile": self.profile, "busy": self.busy,
                     "revision": self.revision, "cursor": self.sequence, "settings": self.public_settings(),
                     "history": [history_summary(state) for state in self.engine.store.sessions()]}
+
+    def _supplement_engine(self, session_id, revision):
+        engine = self.engine
+        state = engine.state
+        if not state or session_id != state["id"]:
+            raise WorkflowError("当前会话已经变化，请重新选择工作项。")
+        if self.closed or self.busy:
+            raise WorkflowError("该会话正在执行操作，请等待完成后修改图片。")
+        if state["stage"] not in {"资料已读取", "准备工作区失败"}:
+            raise WorkflowError("当前阶段不能修改补充图片。")
+        if type(revision) is not int or revision != self.revision:
+            raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再操作。")
+        return engine
+
+    def _supplement_payload(self):
+        return {"state": deepcopy(self.state), "revision": self.revision, "stream": self.stream}
+
+    def upload_supplement_image(self, session_id, revision, name, data):
+        with self.condition:
+            engine = self._supplement_engine(session_id, revision)
+            maximum = self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
+            if not isinstance(name, str) or not name.strip() or not 0 < len(data) <= maximum:
+                raise WorkflowError("图片名称不能为空，单张大小不能超过配置的附件上限。")
+            extension = Path(name).suffix.lower().lstrip(".")
+            signatures = {
+                "png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                "jpg": data.startswith(b"\xff\xd8\xff"),
+                "jpeg": data.startswith(b"\xff\xd8\xff"),
+                "gif": data.startswith((b"GIF87a", b"GIF89a")),
+                "webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+                "bmp": data.startswith(b"BM"),
+            }
+            if not signatures.get(extension):
+                raise WorkflowError("请选择格式与内容一致的 PNG、JPEG、GIF、WebP 或 BMP 图片。")
+            image_id = uuid4().hex
+            path = self.engine.store.directory(session_id) / "attachments" / "supplement" / f"{image_id}.{extension}"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            image = {"id": image_id, "name": name, "extension": extension, "size": len(data),
+                     "path": str(path), "content_type": guess_type(path.name)[0]}
+            engine.state.setdefault("supplement_images", []).append(image)
+            engine.save()
+            return self._supplement_payload()
+
+    def remove_supplement_image(self, session_id, revision, image_id):
+        with self.condition:
+            engine = self._supplement_engine(session_id, revision)
+            images = engine.state.get("supplement_images", [])
+            image = next((entry for entry in images if entry["id"] == image_id), None)
+            if image is None:
+                raise WorkflowError("图片不在当前会话的补充附件列表中。")
+            path = Path(image["path"]).resolve()
+            allowed = (self.engine.store.directory(session_id) / "attachments" / "supplement").resolve()
+            if not path.is_relative_to(allowed):
+                raise WorkflowError("补充图片路径不合法。")
+            path.unlink()
+            images.remove(image)
+            engine.save()
+            return self._supplement_payload()
 
     def update_settings(self, data):
         state = self.engine.state
@@ -362,6 +424,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._json(200, application.diff())
             elif path == "/api/material":
                 self._material(query)
+            elif path == "/api/supplement-images":
+                self._supplement_image(query)
             elif path.startswith("/api/"):
                 self._json(404, {"error": "接口不存在。"})
             else:
@@ -383,6 +447,20 @@ class WebHandler(BaseHTTPRequestHandler):
             application = self.server.application
             if not compare_digest(self.headers.get("X-Workflow-Token", ""), application.csrf_token):
                 raise WorkflowError("操作凭据无效，请刷新页面后重试。")
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/supplement-images":
+                query = parse_qs(parsed.query)
+                length = int(self.headers.get("Content-Length", "0"))
+                maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
+                if not 0 < length <= maximum:
+                    self.close_connection = True
+                    raise WorkflowError("图片为空或超过配置的附件大小上限。")
+                data = self.rfile.read(length)
+                if len(data) != length:
+                    raise WorkflowError("图片传输不完整，请重新上传。")
+                self._json(200, application.upload_supplement_image(query.get("session_id", [""])[0],
+                    int(query.get("revision", ["-1"])[0]), query.get("name", [""])[0], data))
+                return
             if self.headers.get_content_type() != "application/json":
                 raise WorkflowError("操作必须使用 JSON 请求。")
             length = int(self.headers.get("Content-Length", "0"))
@@ -393,6 +471,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 raise WorkflowError("请求格式无效。")
             if self.path == "/api/actions":
                 self._json(202, application.dispatch(data))
+            elif self.path == "/api/supplement-images/remove":
+                self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id")))
             elif self.path == "/api/shutdown":
                 self._json(200, {"stopping": True})
                 Thread(target=self.server.shutdown, daemon=True).start()
@@ -423,6 +503,21 @@ class WebHandler(BaseHTTPRequestHandler):
         if not preview:
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(str(material["title"]) + path.suffix))
         self.end_headers()
+        self.wfile.write(data)
+
+    def _supplement_image(self, query):
+        application = self.server.application
+        session_id = query.get("session_id", [""])[0]
+        state = public_state(application.engine.store.load(session_id))
+        image = next((entry for entry in state["supplement_images"] if entry["id"] == query.get("image_id", [""])[0]), None)
+        if image is None:
+            raise WorkflowError("图片不在当前会话的补充附件列表中。")
+        path = Path(image["path"]).resolve()
+        allowed = (application.engine.store.directory(session_id) / "attachments" / "supplement").resolve()
+        if not path.is_relative_to(allowed) or not path.is_file():
+            raise WorkflowError("该补充图片当前不可读取。")
+        data = path.read_bytes()
+        self._headers(200, image["content_type"], len(data))
         self.wfile.write(data)
 
     def _events(self, query):

@@ -83,3 +83,5 @@ button, input, textarea { font: inherit; }
 .empty-area { padding: 24px 0; }
 @media (max-width: 1100px) { .conversation-grid, .repository-grid { grid-template-columns: 1fr; } .app-header { padding: 0 18px; } .page-content { padding: 20px 18px; } }
 @media (max-width: 750px) { .app-sider:not(.ant-layout-sider-collapsed) { width: 156px !important; min-width: 156px !important; max-width: 156px !important; } .main-layout { margin-left: 156px; } .brand { padding: 0 12px; gap: 7px; } .brand-title { font-size: 13px; } .brand-mark { width: 30px; height: 30px; } .brand-subtitle, .header-caption { display: none; } .sider-foot { left: 14px; right: 14px; } .page-heading h1 { font-size: 20px; } .settings-grid { grid-template-columns: 1fr; } .workflow-strip .ant-steps-item-description { display: none; } .data-foot { align-items: flex-start; flex-direction: column; } }
+.supplement-image-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+.supplement-image-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; }

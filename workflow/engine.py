@@ -375,7 +375,8 @@ class Workflow:
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
         turn_cwd = session_path if phase == "branch" else session_path / "workspace"
-        context = {"item": state["item"], "supplement": state["supplement"], "plan": state.get("approved_plan"),
+        context = {"item": state["item"], "supplement": state["supplement"],
+                   "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
                    "feishu_links": state["snapshot"]["feishu_links"], "decisions": state["decisions"]}
         prompt = ("所有回答使用中文。系统命令、编译、构建、运行验证、依赖安装一律禁止。"
@@ -395,6 +396,8 @@ class Workflow:
             for material in state["snapshot"]["materials"]:
                 if material.get("image"):
                     inputs.append({"type": "localImage", "path": material["path"]})
+            for image in state.get("supplement_images", []):
+                inputs.append({"type": "localImage", "path": image["path"]})
         params = {"threadId": state["thread_id"], "input": inputs,
                   "cwd": str(turn_cwd), "approvalPolicy": "on-request",
                   "sandboxPolicy": {"type": "readOnly"},
@@ -414,7 +417,7 @@ class Workflow:
         state = self.require_state("等待计划确认")
         if not state["plan"] or sha256(state["plan"].encode("utf-8")).hexdigest() != state["plan_hash"]:
             raise WorkflowError("计划内容与待确认版本不一致。")
-        if state["snapshot"]["blockers"] and not state["supplement"].strip():
+        if state["snapshot"]["blockers"] and not state["supplement"].strip() and not state.get("supplement_images"):
             if source == "auto":
                 return
             raise WorkflowError("存在明确的资料缺失，请先补充必要内容，再确认更新后的计划。")

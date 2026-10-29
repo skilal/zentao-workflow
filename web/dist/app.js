@@ -67,6 +67,9 @@ function WorkflowApp() {
   const [query, setQuery] = useState("");
   const [draft, setDraft] = useState({ supplement: "", reply: "", answers: {}, review_note: "", selected_findings: [] });
   const draftRef = useRef(draft);
+  const imageInput = useRef(null);
+  const imageQueues = useRef({});
+  const [imageTransfers, setImageTransfers] = useState({});
   const [diffOpen, setDiffOpen] = useState(false);
   const [diffs, setDiffs] = useState(null);
   const [settingsForm] = Form.useForm();
@@ -83,6 +86,65 @@ function WorkflowApp() {
     draftRef.current = value;
     setDraft(value);
     if (modelRef.current?.state?.id) sessionStorage.setItem(`workflow-draft:${modelRef.current.state.id}`, JSON.stringify(value));
+  }
+  function publishImageTransfers() {
+    setImageTransfers(Object.fromEntries(Object.entries(imageQueues.current).map(([id, queue]) => [id, [...queue.tasks]])));
+  }
+  async function uploadImages(id) {
+    const queue = imageQueues.current[id];
+    if (queue.running) return;
+    queue.running = true;
+    try {
+      let task;
+      while ((task = queue.tasks.find(entry => entry.status === "waiting"))) {
+        task.status = "uploading";
+        publishImageTransfers();
+        try {
+          const current = modelRef.current;
+          if (current.state?.id !== id) throw new Error("会话已删除，请重新选择工作项。");
+          const query = new URLSearchParams({ session_id: id, revision: current.revision, name: task.name });
+          const payload = await fetch(`/api/supplement-images?${query}`, { method: "POST", credentials: "same-origin",
+            headers: { "Content-Type": "application/octet-stream", "X-Workflow-Token": csrf.current }, body: task.file }).then(readResponse);
+          if (modelRef.current.state?.id === id && modelRef.current.revision <= payload.revision) receiveState(payload);
+          queue.tasks = queue.tasks.filter(entry => entry.uid !== task.uid);
+        } catch (error) { task.status = "error"; task.error = error.message; }
+        publishImageTransfers();
+      }
+    } finally { queue.running = false; }
+  }
+  function addImages(files) {
+    const id = modelRef.current.state?.id;
+    if (!id || !supplementEditable) return;
+    const queue = imageQueues.current[id] ||= { tasks: [], running: false };
+    queue.tasks.push(...Array.from(files, file => ({ uid: crypto.randomUUID(), file, name: file.name,
+      status: "waiting", error: "" })));
+    publishImageTransfers();
+    uploadImages(id);
+  }
+  function pasteImages(event) {
+    const files = Array.from(event.clipboardData.items).filter(item => item.kind === "file" && item.type.startsWith("image/"))
+      .map(item => item.getAsFile()).filter(Boolean);
+    if (!files.length) return;
+    event.preventDefault();
+    const text = event.clipboardData.getData("text/plain");
+    const input = event.target;
+    if (text && input.tagName === "TEXTAREA") {
+      const start = input.selectionStart, end = input.selectionEnd;
+      changeDraft({ supplement: input.value.slice(0, start) + text + input.value.slice(end) });
+      requestAnimationFrame(() => input.setSelectionRange(start + text.length, start + text.length));
+    }
+    addImages(files);
+  }
+  async function removeImage(image) {
+    const id = state.id;
+    setSending("remove_image");
+    try {
+      const payload = await fetch("/api/supplement-images/remove", { method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
+        body: JSON.stringify({ session_id: id, revision: modelRef.current.revision, image_id: image.id }) }).then(readResponse);
+      if (modelRef.current.state?.id === id && modelRef.current.revision <= payload.revision) receiveState(payload);
+    } catch (error) { notice.error({ message: "图片未移除", description: error.message }); }
+    finally { setSending(""); }
   }
   function receiveState(payload) {
     const previous = modelRef.current;
@@ -128,7 +190,10 @@ function WorkflowApp() {
   const stage = state?.stage || "";
   const review = state?.reviews?.at(-1);
   const findings = review?.result?.findings || [];
-  const busy = Boolean(stopped || sending || model?.busy);
+  const transfers = imageTransfers[state?.id] || [];
+  const imagesUploading = transfers.some(entry => entry.status !== "error");
+  const supplementEditable = Boolean(state && ["资料已读取", "准备工作区失败"].includes(stage) && !stopped && !sending && !model?.busy);
+  const busy = Boolean(stopped || sending || model?.busy || imagesUploading);
   useEffect(() => {
     if (!state || state.id === lastSession.current) return;
     lastSession.current = state.id;
@@ -168,6 +233,7 @@ function WorkflowApp() {
     finally { setSending(""); }
   }
   async function startPlan() {
+    if (busy || imageQueues.current[state?.id]?.tasks.length) return;
     if (await act("plan", { supplement: draft.supplement })) navigate("plan");
   }
   async function answer() {
@@ -256,7 +322,7 @@ function WorkflowApp() {
     const projectId = draft.project_id ?? project.id;
     const projectName = draft.project_name ?? project.name ?? "";
     return h("div", { className: "card-stack" },
-      h(CardBox, { title: "所属项目与分支", extra: editable && !state.repos.length && h(Button, { onClick: () => act("edit_branches", { supplement: draft.supplement }) }, "更换项目常用分支") },
+      h(CardBox, { title: "所属项目与分支", extra: editable && !state.repos.length && h(Button, { disabled: transfers.length > 0, onClick: () => act("edit_branches", { supplement: draft.supplement }) }, "更换项目常用分支") },
         h(Space, { wrap: true }, h(Typography.Text, { strong: true }, project.name || state.item.project || "所属项目尚未明确"), project.id > 0 && h(Tag, null, `项目 #${project.id}`),
           ACTIVE.has(stage) && state.phase === "branch" && h(Space, null, h(Spin, { size: "small" }), stage)),
         stage === "等待确认项目" && h("div", { className: "question", style: { marginTop: 16 } },
@@ -288,9 +354,36 @@ function WorkflowApp() {
         h("div", { className: "action-bar" }, h(Button, { disabled: busy || Boolean(state.repos.length), onClick: startPlan }, "重新识别分支"),
           h(Button, { type: "primary", disabled: busy || unresolved.some(entry => !entry.catalog.some(branch => branch.name === choices[entry.role])),
             onClick: () => act("choose_branches", { choices: Object.fromEntries(unresolved.map(entry => [entry.role, choices[entry.role]])) }) }, "保存为项目常用分支并继续"))),
-      editable && h(CardBox, { title: "补充需求与验收标准" }, h(Input.TextArea, { value: draft.supplement, rows: 6, placeholder: "补充缺失的业务规则、验收标准或附件关键内容…", onChange: event => changeDraft({ supplement: event.target.value }) }),
-        h("div", { className: "data-foot" }, h("span", { className: "muted" }, "将建立独立工作区，保留原目录中的未提交修改"),
-          h(Button, { type: "primary", size: "large", onClick: startPlan }, "开始需求分析与计划"))));
+      (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&
+        h(CardBox, { title: "补充需求与验收标准" },
+          h("div", { onPaste: supplementEditable ? pasteImages : undefined },
+            h(Input.TextArea, { value: draft.supplement, rows: 6, disabled: !supplementEditable, placeholder: "补充业务规则、验收标准，可在此粘贴截图或图片…", onChange: event => changeDraft({ supplement: event.target.value }) }),
+            h("div", { className: "supplement-image-tools" },
+              h("input", { type: "file", ref: imageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", onChange: event => {
+                addImages(event.target.files); event.target.value = "";
+              } }),
+              h(Button, { disabled: !supplementEditable, onClick: () => imageInput.current.click() }, "上传图片"),
+              h(Typography.Text, { type: "secondary" }, `支持多选、分批上传及粘贴图片，单张不超过 ${model.settings.max_attachment_mb} MB`))),
+          h("div", { className: "attachment-grid" },
+            (state.supplement_images || []).map(image => h("div", { className: "attachment", key: image.id },
+              h(Image, { src: `/api/supplement-images?${new URLSearchParams({ session_id: state.id, image_id: image.id })}`, alt: image.name, preview: { mask: "查看图片" } }),
+              h("div", { className: "attachment-name" }, image.name),
+              h("div", { className: "supplement-image-actions" }, h(Tag, { color: "success" }, "已上传"),
+                editable && h(Button, { size: "small", type: "text", danger: true, onClick: () => removeImage(image) }, "移除")))),
+            transfers.map(task => h("div", { className: "attachment", key: task.uid },
+              h("div", { className: "attachment-name" }, task.name),
+              h("div", { className: "supplement-image-actions" }, task.status === "error" ? h(Tag, { color: "error" }, "上传失败") :
+                h(Space, null, h(Spin, { size: "small" }), task.status === "waiting" ? "等待上传" : "上传中")),
+              task.status === "error" && h(React.Fragment, null,
+                h(Typography.Text, { type: "danger" }, task.error),
+                h(Space, null,
+                  h(Button, { size: "small", disabled: !supplementEditable, onClick: () => { task.status = "waiting"; task.error = ""; publishImageTransfers(); uploadImages(state.id); } }, "重试"),
+                  h(Button, { size: "small", type: "text", danger: true, disabled: !supplementEditable, onClick: () => {
+                    const queue = imageQueues.current[state.id]; queue.tasks = queue.tasks.filter(entry => entry.uid !== task.uid); publishImageTransfers();
+                  } }, "移除")))))),
+          transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再开始计划。"),
+          ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "将建立独立工作区，保留原目录中的未提交修改"),
+            h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0, onClick: startPlan }, "开始需求分析与计划"))));
   }
 
   function renderPlan() {
