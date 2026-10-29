@@ -410,20 +410,20 @@ class CompileChecks(TestCase):
         self.assertTrue(app.dispatch(request)["duplicate"])
         self.assertEqual(runtime.engine.compile_decision.call_count, 1)
 
-    def test_session_override_is_saved_and_locked_when_plan_starts(self):
+    def test_session_override_is_saved_and_locked_when_preview_becomes_session(self):
         self.settings["compile_check"]["enabled"] = True
         app = WebApplication(self.settings)
         self.addCleanup(app.close)
         app.codex_catalog = {"default_model": "模拟模型", "models": [{"model": "模拟模型", "display_name": "模拟模型",
                              "reasoning_efforts": ["high"], "is_default": True}]}
         for override, expected in ((False, False), (None, True)):
-            runtime = app.sessions.add(app.sessions.store.new(self.state["item"]))
-            runtime.engine.state["snapshot"] = {"sources": [], "materials": [], "blockers": [], "feishu_links": []}
+            preview = app.sessions.new_preview(self.state["item"])
+            preview.engine.state["snapshot"] = {"sources": [], "materials": [], "blockers": [], "feishu_links": []}
             data = {"model": "模拟模型", "reasoning_effort": "high", "items": [{"kind": "task", "id": 1}]}
             if override is not None:
                 data["compile_check_enabled"] = override
             with patch.object(Workflow, "start_plan"):
-                result = app.dispatch({"action": "plan", "session_id": runtime.engine.state["id"], "revision": runtime.revision,
+                result = app.dispatch({"action": "plan", "preview_id": preview.engine.state["id"], "revision": preview.revision,
                                        "request_id": str(uuid4()), "data": data})
                 runtime = app.sessions.get(result["session_id"])
                 runtime.engine.executor.submit(lambda: None).result(timeout=5)

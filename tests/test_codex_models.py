@@ -77,13 +77,13 @@ class ModelSessionChecks(TestCase):
         self.app.codex_catalog = deepcopy(CATALOG)
 
     def preview(self, number=7):
-        runtime = self.app.sessions.add(self.app.sessions.store.new({"kind": "task", "id": number, "title": "模型选择示例"}))
+        runtime = self.app.sessions.new_preview({"kind": "task", "id": number, "title": "模型选择示例"})
         runtime.engine.state["snapshot"] = {"sources": [], "materials": [], "blockers": [], "feishu_links": []}
         return runtime
 
     def request(self, runtime, action="plan", selection=None, preview=True):
         return {"action": action, "request_id": str(uuid4()), "revision": runtime.revision,
-                "session_id": runtime.engine.state["id"],
+                "preview_id" if preview else "session_id": runtime.engine.state["id"],
                 "data": {"items": [{"kind": item["kind"], "id": item["id"]} for item in runtime.engine.state["items"]],
                          **(selection if selection is not None else SELECTION)}}
 
@@ -119,14 +119,14 @@ class ModelSessionChecks(TestCase):
             factory.return_value.catalog.return_value = deepcopy(CATALOG)
             self.assertEqual(self.app.codex_models(), CATALOG)
 
-    def test_invalid_choices_do_not_start_or_change_session(self):
+    def test_invalid_choices_do_not_promote_preview_or_create_files(self):
         runtime = self.preview()
         for selection in ({}, {"model": "unknown", "reasoning_effort": "high"}, {"model": "model-b", "reasoning_effort": "high"}):
             with self.subTest(selection=selection), self.assertRaises(WorkflowError):
                 self.app.dispatch(self.request(runtime, selection=selection))
-            self.assertNotIn("codex", runtime.engine.state)
-            self.assertNotIn("plan_started_at", runtime.engine.state)
-            self.assertEqual(len(self.app.sessions.runtimes), 1)
+            self.assertFalse(self.app.sessions.runtimes)
+            self.assertFalse(list(self.root.rglob("state.json")))
+            self.assertIn(runtime.engine.state["id"], self.app.sessions.previews)
 
     def test_duplicate_start_does_not_create_another_session_or_change_model(self):
         runtime = self.preview()
@@ -135,10 +135,10 @@ class ModelSessionChecks(TestCase):
             first = self.app.dispatch(request)
             formal = self.app.sessions.get(first["session_id"])
             formal.engine.executor.submit(lambda: None).result(timeout=5)
-            repeated = self.app.dispatch(request)
+            repeated = self.app.dispatch({**request, "request_id": str(uuid4())})
             self.assertEqual(first["session_id"], repeated["session_id"])
             with self.assertRaisesRegex(WorkflowError, "已经固定"):
-                self.app.dispatch({**request, "revision": formal.revision, "request_id": str(uuid4()), "data": {"model": "model-b"}})
+                self.app.dispatch({**request, "request_id": str(uuid4()), "data": {"model": "model-b"}})
             with self.assertRaisesRegex(WorkflowError, "已经固定"):
                 self.app.dispatch({**request, "data": {"model": "model-b"}})
             start.assert_called_once()
