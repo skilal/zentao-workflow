@@ -8,9 +8,10 @@
     "excluded_statuses": ["closed", "cancel", "cancelled", "done"]
   },
   "repositories": [
-    {"name": "服务端", "path": "D:/projects/server"},
-    {"name": "前端", "path": "D:/projects/web"}
+    {"name": "前端", "role": "frontend", "path": "D:/projects/ais-web", "remote": "origin"},
+    {"name": "后端", "role": "backend", "path": "D:/projects/ais-server", "remote": "origin"}
   ],
+  "project_branches": {},
   "codex": {
     "command": ["codex.cmd", "app-server"],
     "model": "",

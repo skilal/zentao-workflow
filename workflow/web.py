@@ -167,11 +167,11 @@ class WebApplication:
             if self.busy and action != "pause":
                 raise WorkflowError("上一个操作尚未处理完成，请等待。")
             state = self.engine.state
-            session_actions = {"plan", "answer", "approve_plan", "fix", "add_round", "rereview", "finalize", "pause", "resume"}
+            session_actions = {"plan", "confirm_project", "choose_branches", "edit_branches", "answer", "approve_plan", "fix", "add_round", "rereview", "finalize", "pause", "resume"}
             if action in session_actions:
                 if not state or request.get("session_id") != state["id"]:
                     raise WorkflowError("当前会话已经变化，请刷新后操作。")
-                if action in {"approve_plan", "fix", "finalize"} and request.get("revision") != self.revision:
+                if action in {"plan", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize"} and request.get("revision") != self.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
             affects, control = True, action == "pause"
             if action == "connect":
@@ -184,24 +184,21 @@ class WebApplication:
                 if not item:
                     raise WorkflowError("请从当前登录账号的待处理列表中选择工作项。")
                 operation, arguments = self.engine.collect, (deepcopy(item),)
-            elif action == "plan":
-                selections = data.get("selections")
-                configured = {repository["name"]: repository for repository in self.settings["repositories"]}
-                if not isinstance(selections, list) or not selections:
-                    raise WorkflowError("请至少选择一个仓库和明确分支。")
-                checked, names = [], set()
-                for selection in selections:
-                    if not isinstance(selection, dict) or selection.get("name") not in configured:
-                        raise WorkflowError("仓库未在本机配置中登记。")
-                    name = selection["name"]
-                    if name in names or not isinstance(selection.get("create"), bool):
-                        raise WorkflowError("仓库选择重复或分支类型无效。")
-                    names.add(name)
-                    branch, base = selection.get("branch"), selection.get("base")
-                    if not isinstance(branch, str) or not branch.strip() or not isinstance(base, str) or not base.strip():
-                        raise WorkflowError("目标分支和代码基准必须由人工明确选择。")
-                    checked.append({**configured[name], "branch": branch.strip(), "base": base.strip(), "create": selection["create"]})
-                operation, arguments = self.engine.prepare_and_plan, (checked, str(data.get("supplement", "")))
+            elif action in {"plan", "edit_branches"}:
+                supplement = data.get("supplement", "")
+                if not isinstance(supplement, str) or "selections" in data:
+                    raise WorkflowError("开始计划只接受补充说明，仓库与分支由服务端确定。")
+                operation, arguments = self.engine.start_plan, (supplement, action == "edit_branches")
+            elif action == "confirm_project":
+                project_id, name = data.get("project_id"), data.get("name")
+                if not isinstance(project_id, int) or isinstance(project_id, bool) or project_id <= 0 or not isinstance(name, str) or not name.strip():
+                    raise WorkflowError("请明确填写所属项目编号和名称。")
+                operation, arguments = self.engine.confirm_project, (project_id, name.strip())
+            elif action == "choose_branches":
+                choices = data.get("choices")
+                if not isinstance(choices, dict):
+                    raise WorkflowError("请明确选择待确定仓库的分支。")
+                operation, arguments = self.engine.choose_branches, (choices,)
             elif action == "answer":
                 text, answers = str(data.get("text", "")).strip(), data.get("answers")
                 pending = state.get("pending")

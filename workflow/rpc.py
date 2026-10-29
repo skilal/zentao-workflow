@@ -11,6 +11,7 @@ from subprocess import CREATE_NO_WINDOW, PIPE, Popen, TimeoutExpired, list2cmdli
 from sys import executable as python_executable
 from threading import Event, Lock, Thread
 
+from workflow.branching import BRANCH_INSTRUCTIONS
 from workflow.settings import ROOT, WorkflowError
 
 
@@ -145,6 +146,11 @@ class AppServer:
 
 def thread_parameters(state, model, disabled_mcp):
     session_path = ROOT / ".local" / "sessions" / state["id"]
+    if state["phase"] == "branch":
+        return {"cwd": str(session_path), "model": model,
+                "approvalPolicy": "on-request", "sandbox": "read-only",
+                "config": {"mcp_servers": {**disabled_mcp, "workflow": {"enabled": False}}},
+                "developerInstructions": BRANCH_INSTRUCTIONS}
     server = {"command": python_executable,
               "args": [str(ROOT / "mcp.py"), state["id"]], "cwd": str(ROOT),
               "required": True, "enabled": True, "startup_timeout_sec": 30,

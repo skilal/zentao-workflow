@@ -74,6 +74,42 @@ def identifier(value):
         raise WorkflowError("禅道关联工作项的编号格式不符合预期。")
 
 
+def project_context(*records):
+    """只合并工作项的项目字段；产品、执行和关联需求不代表所属项目。"""
+    projects, names = {}, set()
+    for record in records:
+        value = record.get("project", 0)
+        name = str(record.get("project_name") or record.get("projectName") or "").strip()
+        if isinstance(value, dict):
+            name = str(value.get("name") or name).strip()
+            value = value.get("id", 0)
+        if isinstance(value, str) and value and not value.isdecimal():
+            name, value = value, 0
+        project_id = identifier(record.get("project_id") or value)
+        if project_id:
+            projects.setdefault(project_id, {"id": project_id, "name": ""})
+            if name:
+                projects[project_id]["name"] = name
+        elif name:
+            names.add(name)
+        linked = record.get("projects") or []
+        if isinstance(linked, dict):
+            linked = [{"id": key, "name": entry} if isinstance(entry, str)
+                      else {**entry, "id": entry.get("id", key)} for key, entry in linked.items()]
+        for entry in linked:
+            linked_id = identifier(entry.get("id"))
+            if linked_id:
+                projects[linked_id] = {"id": linked_id, "name": str(entry.get("name", "")).strip()}
+    candidates = list(projects.values())
+    if len(candidates) == 1:
+        project = candidates[0]
+        if not project["name"] and len(names) == 1:
+            project["name"] = next(iter(names))
+        return {**project, "candidates": candidates}
+    return {"id": 0, "name": next(iter(names)) if len(names) == 1 and not candidates else "",
+            "candidates": candidates}
+
+
 class ZentaoClient:
     def __init__(self, settings):
         self.settings = settings["zentao"]
@@ -163,10 +199,13 @@ class ZentaoClient:
                     continue
                 if item.get("status") in self.settings["excluded_statuses"]:
                     continue
+                project = project_context(item)
                 records.append({"kind": kind, "id": item_id,
                                 "title": item.get("title") if kind != "task" else item.get("name"),
                                 "status": item.get("statusName", item.get("status", "")),
-                                "project": item.get("projectName", item.get("project", "")),
+                                "project": project["name"] or project["id"],
+                                "project_id": project["id"], "project_name": project["name"],
+                                "project_candidates": project["candidates"],
                                 "priority": item.get("pri", ""), "assigned_to": self.account})
             if not items or not new_ids:
                 if len(seen) < int(bucket["total"]):
@@ -191,6 +230,13 @@ class ZentaoClient:
 
     def collect(self, item, directory):
         primary = self.detail(item["kind"], item["id"])
+        project = project_context({**item, "projects": item.get("project_candidates", [])}, primary)
+        if project["id"] and not project["name"]:
+            data = self._fetch(f"api.php/v1/projects/{project['id']}")
+            if identifier(data.get("id")) != project["id"] or not data.get("name"):
+                raise WorkflowError("所属项目信息不符合预期。")
+            project["name"] = data["name"]
+            project["candidates"] = [{"id": project["id"], "name": project["name"]}]
         related = []
         story_id = identifier(primary.get("story"))
         from_bug = identifier(primary.get("fromBug"))
@@ -246,7 +292,7 @@ class ZentaoClient:
         if not any(source["content"].strip() for source in sources):
             blockers.append("工作项和已关联资料没有有效描述，需要补充实现目标和验收标准。")
         blockers.extend(material["issue"] for material in unique.values() if material.get("issue"))
-        return {"item": item, "sources": sources, "materials": list(unique.values()),
+        return {"item": item, "project": project, "sources": sources, "materials": list(unique.values()),
                 "blockers": blockers, "feishu_links": sorted(set(feishu)),
                 "feishu_note": "飞书链接未读取；若含必要规则，必须由用户补充。"}
 

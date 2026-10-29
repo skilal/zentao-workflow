@@ -1,4 +1,4 @@
-"""人工选择分支后的独立工作区和本地提交；不执行项目脚本。"""
+"""分支元数据、独立工作区和本地提交；不执行项目脚本。"""
 
 from hashlib import sha256
 from os import environ
@@ -29,6 +29,36 @@ def branches(repository):
     return {"local": local, "bases": local + [branch for branch in remote if not branch.endswith("/HEAD")]}
 
 
+def branch_catalog(repository):
+    remote_prefix = f"refs/remotes/{repository['remote']}/"
+    output = git(repository["path"], "for-each-ref",
+                 "--format=%(refname)%00%(objectname)%00%(committerdate:iso-strict)%00%(contents:subject)%00%(symref)",
+                 "refs/heads", remote_prefix)
+    result = {}
+    for line in output.splitlines():
+        ref, commit_id, date, subject, symbolic = line.split("\0", 4)
+        if symbolic:
+            continue
+        local = ref.startswith("refs/heads/")
+        name = ref[len("refs/heads/"):] if local else ref[len(remote_prefix):]
+        entry = result.setdefault(name, {"name": name, "local": False, "remote": False})
+        entry["local" if local else "remote"] = True
+        if local or "commit" not in entry:
+            entry.update(commit=commit_id, date=date, subject=subject)
+    return sorted(result.values(), key=lambda entry: entry["name"])
+
+
+def refresh_branches(repository):
+    reject_hooks(repository["path"])
+    git(repository["path"], "fetch", "--no-tags", "--", repository["remote"])
+    heads = git(repository["path"], "ls-remote", "--heads", "--", repository["remote"])
+    live = {line.split("\t", 1)[1][len("refs/heads/"):] for line in heads.splitlines()}
+    catalog = branch_catalog(repository)
+    for entry in catalog:
+        entry["remote"] = entry["remote"] and entry["name"] in live
+    return [entry for entry in catalog if entry["local"] or entry["remote"]]
+
+
 def reject_hooks(repository):
     configured = git(repository, "config", "--path", "--get", "core.hooksPath", optional=True)
     if configured:
@@ -45,10 +75,10 @@ def reject_hooks(repository):
                             "。按禁止运行验证的规范停止；不会自动禁用钩子。")
 
 
-def prepare(repository, destination, branch, base, create):
+def prepare(repository, destination, branch, base, create, track=False):
     repository, destination = Path(repository).resolve(), Path(destination).resolve()
     if not branch.strip() or not base.strip():
-        raise WorkflowError("目标分支和代码基准必须由人工明确选择。")
+        raise WorkflowError("目标分支和代码基准尚未确定。")
     git(repository, "check-ref-format", "--branch", branch)
     reject_hooks(repository)
     baseline = git(repository, "rev-parse", "--verify", base + "^{commit}")
@@ -62,7 +92,10 @@ def prepare(repository, destination, branch, base, create):
         raise WorkflowError("独立工作区已经存在，不会覆盖或自动清理。")
     destination.parent.mkdir(parents=True, exist_ok=True)
     if create:
-        git(repository, "worktree", "add", "-b", branch, str(destination), baseline)
+        if track:
+            git(repository, "worktree", "add", "--track", "-b", branch, str(destination), base)
+        else:
+            git(repository, "worktree", "add", "-b", branch, str(destination), baseline)
     else:
         expected = git(repository, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}")
         if expected != baseline:

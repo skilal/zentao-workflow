@@ -7,11 +7,12 @@ from re import search
 from threading import RLock
 
 from workflow.approvals import is_controlled_write
-from workflow.gitops import commit, ensure_baseline, git, manifest, prepare
+from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
+from workflow.gitops import branch_catalog, commit, ensure_baseline, git, manifest, prepare, refresh_branches
 from workflow.rpc import AppServer, thread_parameters
-from workflow.settings import ROOT, WorkflowError
+from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.store import SessionStore
-from workflow.zentao import ZentaoClient
+from workflow.zentao import ZentaoClient, project_context
 
 
 FINDING_SCHEMA = {"type": "object", "properties": {
@@ -29,8 +30,8 @@ FINDING_SCHEMA = {"type": "object", "properties": {
     }, "required": ["id", "evidence"], "additionalProperties": False}}
 }, "required": ["summary", "findings", "resolved_previous"], "additionalProperties": False}
 
-ACTIVE = {"准备工作区中", "计划中", "实施中", "审查中", "修复中"}
-PHASE_STAGE = {"plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中"}
+ACTIVE = {"识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中"}
+PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中"}
 
 
 class Workflow:
@@ -95,17 +96,176 @@ class Workflow:
         self.state = self.store.new(item)
         try:
             self.state["snapshot"] = self.zentao.collect(item, self.store.directory(self.state["id"]))
+            self.state["project"] = self.state["snapshot"]["project"]
             self.save()
-            self.note("系统", "资料已读取。请选择仓库与分支后开始计划；第一版不读取飞书。")
+            self.note("系统", "资料已读取。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
         except Exception:
             self.state["stage"] = "资料读取失败"
             self.save()
             raise
 
+    def start_plan(self, supplement, manual=False):
+        state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支")
+        if not state.get("snapshot"):
+            raise WorkflowError("需求资料尚未完整读取。")
+        if state["repos"]:
+            if manual:
+                raise WorkflowError("工作区已经创建，不能改变当前会话分支。")
+            self.prepare_and_plan(state["selections"], supplement)
+            return
+        self._close_rpc()
+        state.update(phase="branch", thread_id=None, turn_id=None, supplement=supplement.strip(),
+                     pause_requested=False, error="", branch_resolution={"repositories": [], "manual": manual})
+        if "project" not in state:
+            state["project"] = project_context(state["item"], state["snapshot"]["sources"][0]["raw"])
+        self._resolve_branches()
+
+    def confirm_project(self, project_id, name):
+        state = self.require_state("等待确认项目")
+        candidates = state["project"]["candidates"]
+        if candidates and project_id not in {entry["id"] for entry in candidates}:
+            raise WorkflowError("请从工作项关联的项目中明确选择。")
+        state["project"] = {"id": project_id, "name": name, "candidates": candidates, "confirmed": True}
+        self.note("用户", f"确认所属项目：{name}（#{project_id}）")
+        self._resolve_branches()
+
+    def _resolve_branches(self):
+        state = self.state
+        project = state["project"]
+        if not project["id"] or not project["name"]:
+            state["stage"] = "等待确认项目"
+            self.save()
+            return
+        state["stage"] = "识别分支中"
+        resolution = state["branch_resolution"]
+        if not resolution["repositories"]:
+            preferred = saved_branches(self.settings, project)
+            resolution["repositories"] = [{**repository, "catalog": branch_catalog(repository),
+                "status": "needs_user" if resolution["manual"] else "pending", "branch": "",
+                "reason": "请指定项目常用分支。" if resolution["manual"] else "", "question": "",
+                "candidates": [], "source": "", "refreshed": False, "refresh_state": "",
+                "preferred": preferred.get(repository["role"], "")}
+                for repository in configured_repositories(self.settings)]
+            self.save()
+        for repository in resolution["repositories"]:
+            if state.get("pause_requested") or self.closed:
+                state["stage"] = "已暂停"
+                self.save()
+                return
+            name = repository["preferred"]
+            if repository["status"] != "pending" or not name:
+                continue
+            if not any(entry["name"] == name for entry in repository["catalog"]) and not repository["refreshed"]:
+                self._refresh_branches(repository)
+            if any(entry["name"] == name for entry in repository["catalog"]):
+                self._select_branch(repository, name, "common", "使用人工保存的项目常用分支。")
+            else:
+                repository.update(status="needs_user", reason=f"项目常用分支 {name} 已不可用。",
+                                  question="请重新选择项目常用分支。")
+        self._advance_branches()
+
+    def _refresh_branches(self, repository):
+        repository["refresh_state"] = "running"
+        self.state["stage"] = "刷新分支中"
+        self.save()
+        try:
+            repository["catalog"] = refresh_branches(repository)
+        except WorkflowError:
+            repository["refresh_state"] = "failed"
+            self.save()
+            raise
+        repository.update(refreshed=True, refresh_state="done")
+        self.state["stage"] = "已暂停" if self.state.get("pause_requested") else "识别分支中"
+        self.save()
+
+    def _select_branch(self, repository, name, source, reason):
+        entry = next((entry for entry in repository["catalog"] if entry["name"] == name), None)
+        if entry and not entry["local"] and not repository["refreshed"]:
+            self._refresh_branches(repository)
+            entry = next((entry for entry in repository["catalog"] if entry["name"] == name), None)
+        if entry is None:
+            raise WorkflowError(f"分支 {name} 已不可用，请重新读取并选择。")
+        repository.update(status="resolved", branch=name, source=source, reason=reason, question="")
+
+    def _advance_branches(self):
+        state = self.state
+        if state.get("pause_requested") or self.closed:
+            state["stage"] = "已暂停"
+            self.save()
+            return
+        repositories = state["branch_resolution"]["repositories"]
+        for repository in repositories:
+            if not repository["catalog"] and not repository["refreshed"]:
+                self._refresh_branches(repository)
+            if not repository["catalog"]:
+                repository.update(status="needs_user", reason="远程刷新后仍没有可用分支。",
+                                  question="请先在该仓库准备对应项目分支，再重新识别。")
+        if state.get("pause_requested"):
+            state["stage"] = "已暂停"
+            self.save()
+        elif any(entry["status"] == "pending" for entry in repositories):
+            self._start_turn("请判断上下文中待识别仓库的分支，严格返回结构化结果。", BRANCH_SCHEMA)
+        elif any(entry["status"] == "needs_user" for entry in repositories):
+            state["stage"] = "等待选择分支"
+            self.save()
+        else:
+            selections = []
+            for repository in repositories:
+                branch = next(entry for entry in repository["catalog"] if entry["name"] == repository["branch"])
+                base = ("refs/heads/" if branch["local"] else f"refs/remotes/{repository['remote']}/") + branch["name"]
+                selections.append({"name": repository["name"], "path": repository["path"],
+                    "role": repository["role"], "branch": branch["name"], "base": base,
+                    "create": not branch["local"], "track": not branch["local"]})
+            self._close_rpc()
+            state.update(thread_id=None, turn_id=None, phase="plan", stage="资料已读取")
+            self.prepare_and_plan(selections, state["supplement"])
+
+    def choose_branches(self, choices):
+        state = self.require_state("等待选择分支")
+        repositories = state["branch_resolution"]["repositories"]
+        expected = {entry["role"] for entry in repositories if entry["status"] == "needs_user"}
+        if set(choices) != expected or any(not isinstance(name, str) or not name.strip() for name in choices.values()):
+            raise WorkflowError("请明确选择所有待确定仓库的分支。")
+        if any(choices[entry["role"]] not in {branch["name"] for branch in entry["catalog"]}
+               for entry in repositories if entry["role"] in choices):
+            raise WorkflowError("所选分支不在当前仓库候选中，请重新读取。")
+        for repository in repositories:
+            if repository["role"] in choices:
+                self._select_branch(repository, choices[repository["role"]], "human", "人工确认并保存为项目常用分支。")
+        project = state["project"]
+        site = self.settings["zentao"]["base_url"].rstrip("/")
+        mapping = self.settings.setdefault("project_branches", {}).setdefault(site, {})
+        saved = mapping.setdefault(str(project["id"]), {"name": project["name"], "branches": {}})
+        saved["name"] = project["name"]
+        saved["branches"].update({entry["role"]: entry["branch"] for entry in repositories if entry["source"] == "human"})
+        save_settings(self.settings)
+        self.note("用户", "确认项目常用分支：" + "；".join(f"{role}：{name}" for role, name in choices.items()))
+        self._advance_branches()
+
+    def _complete_branches(self, text):
+        state = self.state
+        repositories = state["branch_resolution"]["repositories"]
+        results = validate_result(loads(text), repositories)
+        for result in results:
+            repository = next(entry for entry in repositories if entry["role"] == result["role"])
+            repository.update(reason=result["reason"], candidates=result["candidates"], question=result["question"])
+            if result["status"] == "selected":
+                branch = next(entry for entry in repository["catalog"] if entry["name"] == result["branch"])
+                if not branch["local"] and not repository["refreshed"]:
+                    self._refresh_branches(repository)
+                else:
+                    self._select_branch(repository, branch["name"], "ai", result["reason"])
+            elif result["status"] == "not_found" and not repository["refreshed"]:
+                self._refresh_branches(repository)
+            else:
+                repository["status"] = "needs_user"
+        self.save()
+        self._advance_branches()
+
     def prepare_and_plan(self, selections, supplement):
         state = self.require_state("资料已读取", "准备工作区失败")
         if not selections:
-            raise WorkflowError("至少人工选择一个代码仓库。")
+            raise WorkflowError("尚未确定代码仓库及分支。")
         if not state.get("snapshot"):
             raise WorkflowError("需求资料尚未完整读取。")
         state["supplement"] = supplement.strip()
@@ -129,12 +289,15 @@ class Workflow:
                     raise WorkflowError("已创建的工作区选择发生变化，请新建工作流处理，不会自动删除旧工作区。")
                 continue
             try:
-                repository = prepare(selection["path"], workspace / f"repo-{index + 1}", selection["branch"], selection["base"], selection["create"])
+                repository = prepare(selection["path"], workspace / f"repo-{index + 1}", selection["branch"],
+                                     selection["base"], selection["create"], selection.get("track", False))
             except Exception:
                 state["stage"] = "准备工作区失败"
                 self.save()
                 raise
             repository["name"] = selection["name"]
+            if "role" in selection:
+                repository["role"] = selection["role"]
             state["repos"].append(repository)
             self.save()
         if set(existing) - {selection["name"] for selection in selections}:
@@ -201,6 +364,7 @@ class Workflow:
         self.note("控制器", text)
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
+        turn_cwd = session_path if phase == "branch" else session_path / "workspace"
         context = {"item": state["item"], "supplement": state["supplement"], "plan": state.get("approved_plan"),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
                    "feishu_links": state["snapshot"]["feishu_links"], "decisions": state["decisions"]}
@@ -208,13 +372,21 @@ class Workflow:
                   "当前阶段由控制器决定。只有 workflow MCP 的受控文件工具允许修改业务文件。"
                   "需要业务选择或扩大计划范围时必须提问，不得自行决定。\n" + text +
                   "\n工作流上下文：\n" + dumps(context, ensure_ascii=False))
-        inputs = [{"type": "text", "text": "$zentao-delivery\n" + prompt},
-                  {"type": "skill", "name": "zentao-delivery", "path": str(ROOT / "skills" / "zentao-delivery" / "SKILL.md")}]
-        for material in state["snapshot"]["materials"]:
-            if material.get("image"):
-                inputs.append({"type": "localImage", "path": material["path"]})
+        if phase == "branch":
+            context = {"project": state["project"], "item": state["item"], "supplement": state["supplement"],
+                       "sources": [{"title": source["title"], "content": source["content"]}
+                                   for source in state["snapshot"]["sources"]],
+                       "repositories": [{"role": entry["role"], "refreshed": entry["refreshed"], "branches": entry["catalog"]}
+                                        for entry in state["branch_resolution"]["repositories"] if entry["status"] == "pending"]}
+            inputs = [{"type": "text", "text": BRANCH_INSTRUCTIONS + "\n" + dumps(context, ensure_ascii=False)}]
+        else:
+            inputs = [{"type": "text", "text": "$zentao-delivery\n" + prompt},
+                      {"type": "skill", "name": "zentao-delivery", "path": str(ROOT / "skills" / "zentao-delivery" / "SKILL.md")}]
+            for material in state["snapshot"]["materials"]:
+                if material.get("image"):
+                    inputs.append({"type": "localImage", "path": material["path"]})
         params = {"threadId": state["thread_id"], "input": inputs,
-                  "cwd": str(session_path / "workspace"), "approvalPolicy": "on-request",
+                  "cwd": str(turn_cwd), "approvalPolicy": "on-request",
                   "sandboxPolicy": {"type": "readOnly"},
                   "collaborationMode": {"mode": mode, "settings": {"model": self.rpc.model,
                       "reasoning_effort": self.settings["codex"]["reasoning_effort"], "developer_instructions": None}}}
@@ -386,9 +558,14 @@ class Workflow:
         if state["commits"]:
             raise WorkflowError("存在部分提交，只能先完成或处理该提交过程。")
         state["pause_requested"] = False
+        if state["phase"] == "branch":
+            self._resolve_branches()
+            return
         if not state.get("prepare_complete") and not state.get("thread_id"):
             if not state.get("selections"):
-                raise WorkflowError("尚未选择仓库及分支，请先完成工作区选择。")
+                state["stage"] = "资料已读取"
+                self.start_plan(state["supplement"])
+                return
             state["stage"] = "准备工作区失败"
             self.prepare_and_plan(state["selections"], state["supplement"])
             return
@@ -403,6 +580,8 @@ class Workflow:
         if not self.state:
             return
         if params.get("threadId") and self.state.get("thread_id") and params["threadId"] != self.state["thread_id"]:
+            return
+        if params.get("turnId") and self.state.get("turn_id") and params["turnId"] != self.state["turn_id"]:
             return
         if method == "item/tool/requestUserInput":
             with self.lock:
@@ -466,6 +645,8 @@ class Workflow:
         state = self.state
         if state["id"] != session_id or epoch != self.connection_epoch or self.closed:
             return
+        if turn.get("id") and state.get("turn_id") and turn["id"] != state["turn_id"]:
+            return
         if state.get("pause_requested"):
             state["stage"] = "已暂停"
             self.save()
@@ -477,6 +658,9 @@ class Workflow:
             return
         text = self.last_message.strip()
         state["pending"] = None
+        if state["phase"] == "branch":
+            self._complete_branches(text)
+            return
         if self.plan_stream.strip():
             plan = self.plan_stream.strip()
         else:

@@ -77,11 +77,11 @@ class Tools:
     def call(self, name, arguments):
         state = self.store.load(self.session_id)
         if name == "task_context":
-            return {key: state.get(key) for key in ("item", "snapshot", "supplement", "repos", "approved_plan", "decisions", "phase", "stage")}
+            return {key: state.get(key) for key in ("item", "project", "snapshot", "supplement", "repos", "approved_plan", "decisions", "phase", "stage")}
         repositories = {repository["name"]: repository for repository in state["repos"]}
         repository = repositories.get(arguments.get("repository"))
         if repository is None:
-            raise WorkflowError("仓库未被人工选择。")
+            raise WorkflowError("仓库不属于当前会话的工作区。")
         if name == "list_files":
             results = []
             for relative, _ in self.files(repository, arguments.get("pattern", "*")):
