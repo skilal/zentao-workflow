@@ -47,6 +47,7 @@ class Workflow:
         self.control_executor = ThreadPoolExecutor(max_workers=1)
         self.output = {}
         self.plan_stream = ""
+        self.completed_plan = ""
         self.pending_turns = set()
         self.last_message = ""
         self.connection_epoch = 0
@@ -303,9 +304,15 @@ class Workflow:
         if set(existing) - {selection["name"] for selection in selections}:
             raise WorkflowError("不能移除已创建的工作区，请保留原选择。")
         state["prepare_complete"] = True
-        state["phase"] = "plan"
+        self._new_plan_round()
         self._start_turn("请以原生计划模式分析工作项。先调用 workflow.task_context，阅读选定代码。资料不足或问题影响方案时必须提问并等待。"
                          "只生成计划，不修改业务文件。最终使用 <proposed_plan>...</proposed_plan> 输出中文计划；没有该计划块不能进入实施。")
+
+    def _new_plan_round(self):
+        state = self.state
+        previous = state.get("plan_round") or {}
+        state.update(phase="plan", plan="", plan_hash="", approved_plan="", approved_hash="", approval_source="",
+                     plan_round={"number": previous.get("number", 0) + 1, "turns": 0, "asked": False})
 
     def require_state(self, *stages):
         if not self.state or self.state["stage"] not in stages:
@@ -359,7 +366,10 @@ class Workflow:
         state["pending"] = None
         self.output = {}
         self.plan_stream = ""
+        self.completed_plan = ""
         self.last_message = ""
+        if phase == "plan" and state.get("plan_round") is not None:
+            state["plan_round"]["turns"] += 1
         self.save()
         self.note("控制器", text)
         mode = "plan" if phase == "plan" else "default"
@@ -398,16 +408,28 @@ class Workflow:
             self.save()
 
     def approve_plan(self):
+        self._implement_plan("manual")
+
+    def _implement_plan(self, source):
         state = self.require_state("等待计划确认")
         if not state["plan"] or sha256(state["plan"].encode("utf-8")).hexdigest() != state["plan_hash"]:
             raise WorkflowError("计划内容与待确认版本不一致。")
         if state["snapshot"]["blockers"] and not state["supplement"].strip():
+            if source == "auto":
+                return
             raise WorkflowError("存在明确的资料缺失，请先补充必要内容，再确认更新后的计划。")
+        if self.closed or state.get("pause_requested"):
+            state["stage"] = "已暂停"
+            self.save()
+            return
         state["approved_plan"] = state["plan"]
         state["approved_hash"] = state["plan_hash"]
-        self.note("用户", "确认计划版本：" + state["approved_hash"])
+        state["approval_source"] = source
+        self.note("控制器" if source == "auto" else "用户",
+                  ("本轮计划未提问且一次完整生成，自动授权实施，计划版本：" if source == "auto" else "人工确认实施，计划版本：") + state["approved_hash"])
         state["phase"] = "implement"
-        self._start_turn("用户已经确认上下文中的计划。仅实现该计划的最小范围，先阅读已有代码与项目规范。"
+        self.save()
+        self._start_turn("控制器已授权实施上下文中的计划，授权来源见 workflow.task_context。仅实现该计划的最小范围，先阅读已有代码与项目规范。"
                          "先调用 workflow.task_context 确认当前阶段，再使用 workflow.write_file 或 replace_text 修改。"
                          "原生只读沙箱限制原生命令与文件写入，控制器单独授权的 MCP 写入工具在实施阶段可用；不得据此跳过已经授权的 MCP 修改。"
                          "出现需澄清事项必须以 [需要澄清] 开头结束回合。完成后说明修改与静态检查，不执行任何验证命令，也不要提交。")
@@ -419,7 +441,7 @@ class Workflow:
         pending = state.get("pending")
         self.note("用户", text or dumps(answers, ensure_ascii=False))
         state["supplement"] += "\n\n人工补充：" + (text or dumps(answers, ensure_ascii=False))
-        if pending and state["rpc_connected"] and self.rpc:
+        if pending and state["rpc_connected"] and self.rpc and not pending.get("turn_completed"):
             if pending["method"] != "item/tool/requestUserInput":
                 raise WorkflowError("不支持对该请求自动补充答案。")
             result = {"answers": {key: {"answers": value} for key, value in (answers or {}).items()}}
@@ -435,9 +457,8 @@ class Workflow:
         else:
             state["pending"] = None
             if state["stage"] == "等待计划确认":
-                state["phase"] = "plan"
-                state["approved_hash"] = ""
-            self._start_turn("用户已补充信息：\n" + text + "\n请从上次暂停点继续；若在计划阶段，仍需输出最终 proposed_plan 并等待确认。")
+                self._new_plan_round()
+            self._start_turn("用户已补充信息：\n" + text + "\n请从上次暂停点继续；若在计划阶段，输出最终 proposed_plan，由控制器判断是否需要人工确认。")
 
     def _begin_review(self):
         state = self.state
@@ -490,16 +511,23 @@ class Workflow:
         self.state["pause_requested"] = False
         self._begin_review()
 
-    def finalize(self, accepted_ids, acceptance_note):
+    def finalize(self, accepted_ids, acceptance_note, automatic=False):
         state = self.require_state("等待修复选择", "部分提交")
+        if self.closed or (automatic and state.get("pause_requested")):
+            return
         findings = state["reviews"][-1]["result"]["findings"]
         if set(accepted_ids) != {finding["id"] for finding in findings}:
             raise WorkflowError("结束前必须明确接受所有仍存在的问题；否则请选择修复。")
         if findings and not acceptance_note.strip():
             raise WorkflowError("接受剩余问题时必须填写原因。")
+        if not automatic:
+            state["pause_requested"] = False
         for repository in state["repos"]:
             previous = state["commits"].get(repository["name"])
-            if previous and previous != "无代码修改":
+            if previous == "无代码修改":
+                if manifest([repository]):
+                    raise WorkflowError("已记录无修改的仓库再次发生变化，已停止，不把新修改混入剩余提交。")
+            elif previous:
                 if git(repository["path"], "rev-parse", "HEAD") != previous or git(repository["path"], "status", "--porcelain"):
                     raise WorkflowError("已提交仓库再次发生变化，已停止，不把新修改混入剩余提交。")
         pending = [repo for repo in state["repos"] if repo["name"] not in state["commits"]]
@@ -507,13 +535,17 @@ class Workflow:
                     if any(key.startswith(repo["name"] + "/") for repo in pending)}
         if manifest(pending) != expected:
             raise WorkflowError("最后一次 Review 后代码发生改变，不能提交。")
-        state["acceptance"] = {"ids": accepted_ids, "reason": acceptance_note}
+        state["acceptance"] = {"ids": accepted_ids, "reason": acceptance_note, "source": "auto" if automatic else "manual"}
         self.save()
         title = str(state["item"]["title"]).replace("\n", " ").replace("\r", " ")[:100]
         message = f"feat(zentao-{state['item']['kind']}-{state['item']['id']}): {title}"
         if state["item"]["kind"] == "bug":
             message = message.replace("feat(", "fix(", 1)
         for repository in pending:
+            if self.closed or state.get("pause_requested"):
+                state["stage"] = "部分提交" if state["commits"] else "等待修复选择"
+                self.save()
+                return
             own = {key: value for key, value in expected.items() if key.startswith(repository["name"] + "/")}
             try:
                 result = commit(repository, message, own)
@@ -534,7 +566,7 @@ class Workflow:
             return
         was_active = state["stage"] in ACTIVE | {"等待人工回答"}
         state["pause_requested"] = True
-        state["stage"] = "已暂停"
+        state["stage"] = "部分提交" if state["commits"] else "已暂停"
         state["last_output"] = self.last_message or "\n\n".join(self.output.values())
         self.save()
         if self.rpc and state.get("turn_id") and was_active:
@@ -558,6 +590,10 @@ class Workflow:
         if state["commits"]:
             raise WorkflowError("存在部分提交，只能先完成或处理该提交过程。")
         state["pause_requested"] = False
+        if state.get("reviews") and state["phase"] == "review":
+            # 恢复动作只重新审查；上次结果不能在重启后直接触发提交。
+            self._begin_review()
+            return
         if state["phase"] == "branch":
             self._resolve_branches()
             return
@@ -585,6 +621,8 @@ class Workflow:
             return
         if method == "item/tool/requestUserInput":
             with self.lock:
+                if self.state["phase"] == "plan" and self.state.get("plan_round") is not None:
+                    self.state["plan_round"]["asked"] = True
                 self.state["pending"] = {"id": message["id"], "method": method, "params": params}
                 self.state["stage"] = "等待人工回答"
                 self.save()
@@ -617,7 +655,7 @@ class Workflow:
                 self.output[item.get("id", "agent")] = item["text"]
                 self.last_message = item["text"]
             elif item.get("type") == "plan" and item.get("text"):
-                self.plan_stream = item["text"]
+                self.completed_plan = item["text"].strip()
         elif method == "turn/started":
             with self.lock:
                 self.state["turn_id"] = params["turn"]["id"]
@@ -651,18 +689,25 @@ class Workflow:
             state["stage"] = "已暂停"
             self.save()
             return
+        if state["stage"] not in ACTIVE | {"等待人工回答"}:
+            return
         if turn.get("status") != "completed":
             state["stage"] = "已暂停" if turn.get("status") == "interrupted" else "已停止"
             state["error"] = str((turn.get("error") or {}).get("message", ""))
             self.save()
             return
         text = self.last_message.strip()
-        state["pending"] = None
+        if state.get("pending"):
+            # 未回答的原生问题不能被回合结束事件隐式清除。
+            state["pending"]["turn_completed"] = True
+            state["stage"] = "等待人工回答"
+            self.save()
+            return
         if state["phase"] == "branch":
             self._complete_branches(text)
             return
-        if self.plan_stream.strip():
-            plan = self.plan_stream.strip()
+        if self.completed_plan:
+            plan = self.completed_plan
         else:
             match = search(r"<proposed_plan>([\s\S]*?)</proposed_plan>", text)
             plan = match.group(1).strip() if match else ""
@@ -672,11 +717,13 @@ class Workflow:
             state["plan_hash"] = sha256(plan.encode("utf-8")).hexdigest() if plan else ""
             state["stage"] = "等待计划确认" if plan else "等待计划补充"
             self.save()
+            round_state = state.get("plan_round")
+            if plan and round_state is not None and round_state["turns"] == 1 and not round_state["asked"]:
+                self._implement_plan("auto")
         elif state["phase"] in ("implement", "fix"):
             if "[需要澄清]" in text or "[需要重做计划]" in text:
                 if "[需要重做计划]" in text:
-                    state["phase"] = "plan"
-                    state["approved_hash"] = ""
+                    self._new_plan_round()
                 state["stage"] = "等待计划补充"
                 self.save()
             else:
@@ -712,6 +759,9 @@ class Workflow:
                                      "manifest": state["review_manifest"].copy()})
             state["stage"] = "等待修复选择"
             self.save()
+            if not result["findings"] and not state.get("pause_requested") and not self.closed:
+                self.note("控制器", "Review 无遗留问题，自动执行本地提交，不 push。")
+                self.finalize([], "", automatic=True)
 
     def _close_rpc(self):
         self.connection_epoch += 1

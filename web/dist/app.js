@@ -10,8 +10,8 @@ const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停"
 const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中"]);
 const PAGES = {
   items: ["工作项与资料", "从指派给你的需求、任务和 Bug 中，选择本次处理对象。"],
-  plan: ["计划与会话", "先澄清需求，再确认计划。每一次需要决策的地方都会等待你的答复。"],
-  review: ["Review", "检查最小实现范围与相关业务链路，由你选择本轮要修复的问题。"],
+  plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
+  review: ["Review", "检查最小实现范围与相关业务链路；无遗留问题时自动本地提交，有问题时由你选择处理。"],
   settings: ["工作流设置", "管理禅道账号、固定 Review 提示词和默认修复轮次。"],
   history: ["历史会话", "查看保存的资料、计划、问题处置与本地提交记录。"]
 };
@@ -321,14 +321,14 @@ function WorkflowApp() {
           }),
           h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer, placeholder: questions.length ? "其他补充说明（可选）" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
           h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer, onClick: answer }, questions.length ? "提交回答并继续" : "提交补充说明")))),
-      h("div", { className: "card-stack" }, h(CardBox, { title: "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, state.approved_hash === state.plan_hash ? "已确认" : "待确认") },
+      h("div", { className: "card-stack" }, h(CardBox, { title: "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认") },
         state.plan ? h(React.Fragment, null, h("div", { className: "plan-panel" }, h("pre", { className: "plain-plan" }, state.plan)), h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
         h(Button, { type: "primary", block: true, disabled: stage !== "等待计划确认" || busy, onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")),
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
           h(Button, { block: true, disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
           h(Button, { block: true, disabled: !state.reviews.length, onClick: () => navigate("review") }, "查看 Review 问题")),
-          h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, "等待回答、计划确认和修复选择时，流程会停在原处。"))));
+          h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。"))));
   }
 
   function renderReview() {
@@ -359,8 +359,8 @@ function WorkflowApp() {
           h(Button, { disabled: busy || !["等待修复选择", "已暂停", "已停止"].includes(stage), onClick: () => act("rereview") }, "重新 Review"),
           h(Button, { type: "primary", disabled: !canFix || !selected.length || limitReached, onClick: async () => { if (await act("fix", { ids: selected, note: draft.review_note })) navigate("plan"); } }, `修复选中 ${selected.length} 项并复审`)),
         h(Divider), h("div", { className: "data-foot", style: { border: 0, paddingTop: 0 } },
-          h("span", { className: "muted" }, findings.length ? "结束前须选中全部剩余问题，并填写接受原因" : "没有待处置问题，可以完成本地提交"),
-          h(Button, { disabled: !canCommit, onClick: () => act("finalize", { ids: selected, note: draft.review_note }) }, findings.length ? "接受剩余问题并本地提交" : "完成并本地提交"))),
+          h("span", { className: "muted" }, findings.length ? "结束前须选中全部剩余问题，并填写接受原因" : state.phase === "complete" ? "本地提交已完成，未 push" : "无遗留问题时自动本地提交；提交失败后可手动继续"),
+          h(Button, { disabled: !canCommit, onClick: () => act("finalize", { ids: selected, note: draft.review_note }) }, findings.length ? "接受剩余问题并本地提交" : "继续本地提交"))),
       Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })));
   }
 
@@ -412,7 +412,7 @@ function WorkflowApp() {
           state?.error && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item" }, state ? `${TYPE_NAMES[state.item.kind]} #${state.item.id} · ${state.item.title}` : "选择工作项，开始一次完整的需求交付"), stageTag(stage)),
-            h(Steps, { current: stepOf(state), size: "small", responsive: false, items: ["选择工作项", "确认计划", "实施修改", "Review", "本地提交"].map(title => ({ title })) })),
+            h(Steps, { current: stepOf(state), size: "small", responsive: false, items: ["选择工作项", "制定计划", "实施修改", "Review", "本地提交"].map(title => ({ title })) })),
           renderers[page](), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
     h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
       diffs === null ? h(Spin, null) : h(Collapse, { defaultActiveKey: diffs.map((_, index) => String(index)), items: diffs.map((diff, index) => ({ key: String(index), label: diff.repository,

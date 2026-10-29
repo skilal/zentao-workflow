@@ -26,6 +26,7 @@ class SessionStore:
             "created_at": timestamp(), "updated_at": timestamp(), "repos": [],
             "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
             "approved_plan": "", "approved_hash": "", "supplement": "",
+            "plan_round": None, "approval_source": "",
             "pending": None, "history": [], "reviews": [], "decisions": [],
             "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
         }
