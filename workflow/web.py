@@ -320,19 +320,19 @@ class WebApplication:
                 return result
 
     def move_project(self, request):
-        session_id = request.get("session_id")
+        session_id, preview_id = request.get("session_id"), request.get("preview_id")
         project_id, request_id = request.get("project_id"), request.get("request_id")
-        if (not session_id or "project_id" not in request
+        if (bool(session_id) == bool(preview_id) or "project_id" not in request
                 or (project_id is not None and (type(project_id) is not int or project_id <= 0))
                 or not isinstance(request_id, str) or not 8 <= len(request_id) <= 100):
             raise WorkflowError("请明确指定会话、目标项目及请求标识。")
-        key = (session_id, request_id)
+        key = (session_id or preview_id, request_id)
         with self.condition:
             if self.closed or self.busy == "settings":
                 raise WorkflowError("服务正在关闭或修改设置，不能更换项目。")
             if key in self.requests:
                 return {**self.requests[key], "duplicate": True}
-            runtime = self.sessions.get(session_id)
+            runtime = self.sessions.get_preview(preview_id) if preview_id else self.sessions.get(session_id)
             if request.get("revision") != runtime.revision:
                 raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
             reason = project_move_error(runtime)
@@ -348,7 +348,7 @@ class WebApplication:
             runtime.engine.state = state
             self.emit(state["id"], "state", state)
             self._publish("projects", {"project_partitions": self.projects()})
-            result = self.session_payload(runtime)
+            result = self.preview_payload(runtime) if preview_id else self.session_payload(runtime)
             self.requests[key] = result
             while len(self.requests) > 512:
                 self.requests.popitem(last=False)

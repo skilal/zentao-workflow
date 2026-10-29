@@ -27,6 +27,8 @@ class ProjectPartitionChecks(TestCase):
             self.addCleanup(patched.stop)
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
         self.application = WebApplication(settings)
+        self.application.codex_catalog = {"default_model": "示例模型", "models": [
+            {"model": "示例模型", "display_name": "示例模型", "reasoning_efforts": ["high"], "is_default": True}]}
         self.addCleanup(self.application.close)
         self.application.items = [{"kind": "task", "id": 7, "title": "示例任务", "project_id": 41,
                                    "project_name": "同名项目"},
@@ -174,6 +176,27 @@ class ProjectPartitionChecks(TestCase):
         with self.assertRaisesRegex(WorkflowError, "已开始需求分析与计划"):
             self.application.move_project(self.move_request(runtime))
         self.assertTrue(self.application.sessions.store.load(runtime.engine.state["id"])["plan_started_at"])
+
+    def test_preview_project_choice_does_not_create_session_and_is_promoted_locked(self):
+        runtime = self.application.sessions.new_preview(self.application.items[0])
+        with patch.object(runtime.engine.zentao, "collect_many", return_value={
+                "project": {"id": 41, "name": "原项目"}, "materials": [], "sources": []}):
+            runtime.engine.collect([self.application.items[0]])
+        preview_id = runtime.engine.state["id"]
+        request = self.move_request(runtime, preview_id=preview_id, session_id=None)
+        self.application.move_project(request)
+        self.assertEqual(len(self.application.sessions.runtimes), 0)
+        self.assertFalse(list(self.root.glob("sessions/*/state.json")))
+        with patch("workflow.engine.Workflow.start_plan", side_effect=WorkflowError("模拟计划失败")):
+            result = self.application.dispatch({"action": "plan", "preview_id": preview_id,
+                "revision": runtime.revision, "request_id": str(uuid4()),
+                "data": {"model": "示例模型", "reasoning_effort": "high", "items": [{"kind": "task", "id": 7}]}})
+            formal = self.application.sessions.get(result["session_id"])
+            self.drain(formal)
+        self.assertEqual(len(self.application.sessions.runtimes), 1)
+        self.assertEqual(formal.engine.state["project"]["id"], 42)
+        self.assertTrue(formal.engine.state["plan_started_at"])
+        self.assertFalse(self.application.summary(formal)["can_move_project"])
 
     def test_move_and_start_plan_are_serialized_by_the_same_revision_and_lock(self):
         runtime = self.add_session()

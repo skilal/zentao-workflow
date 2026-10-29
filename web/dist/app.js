@@ -382,14 +382,15 @@ function WorkflowApp() {
   }
   async function moveProject(id, projectId) {
     const current = modelRef.current;
-    const payload = current.sessions[id];
+    const payload = current.preview?.preview_id === id ? current.preview : current.sessions[id];
     setRequestsPending(previous => ({ ...previous, [id]: "move_project" }));
     try {
       const result = await fetch("/api/sessions/project", { method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
-        body: JSON.stringify({ session_id: id, revision: payload.revision, project_id: projectId,
+        body: JSON.stringify({ ...viewAddress(id), revision: payload.revision, project_id: projectId,
           request_id: crypto.randomUUID() }) }).then(readResponse);
-      receiveState(result);
+      if (result.preview_id) receivePreview(result);
+      else receiveState(result);
       changeProjectCollapse(collapsedProjects.filter(key => key !== String(projectId || 0)));
     } catch (error) { notice.error({ message: "项目未更换", description: error.message }); }
     finally { setRequestsPending(previous => { const next = { ...previous }; delete next[id]; return next; }); }
@@ -696,8 +697,14 @@ function WorkflowApp() {
         } }, "隐藏") },
         h("div", { className: "project-info-sections" },
           h("section", { className: "project-info-section" }, h("div", { className: "project-info-label" }, "所属项目"),
-            h("div", { className: "project-info-name" }, project.name || state.item.project || "所属项目尚未明确"),
+            h("div", { className: "project-info-name" }, project.id > 0 ? project.name || `项目 #${project.id}` : "无项目对话"),
             project.id > 0 && h(Tag, { color: "blue" }, `项目 #${project.id}`),
+            model.preview && !model.selectedSessionId && h("div", { className: "project-info-select" },
+              h(Select, { className: "full-width", "aria-label": "查看阶段所属项目", showSearch: true, optionFilterProp: "label",
+                value: project.id || 0, disabled: busy || !state.can_edit,
+                options: [...projectCatalog(model).map(value => ({ value: value.id, label: `${value.name || "项目"} #${value.id}` })),
+                  { value: 0, label: "无项目对话" }], onChange: id => moveProject(state.id, id || null) }),
+              h("p", { className: "project-info-note" }, "开始需求分析与计划后锁定所属项目。")),
             stage === "等待确认项目" && h("div", { className: "project-info-form" },
               h("p", { className: "project-info-note" }, "搜索并选择本次所属的禅道项目。"),
               h(ZentaoProjectSelect, { "aria-label": "所属项目", value: projectId || undefined, disabled: busy,
