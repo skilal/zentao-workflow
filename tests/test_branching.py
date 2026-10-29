@@ -3,6 +3,7 @@
 from copy import deepcopy
 from json import dumps, loads
 from pathlib import Path
+from sys import executable as python_executable
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
@@ -10,7 +11,7 @@ from unittest.mock import Mock, patch
 from workflow.branching import BRANCH_SCHEMA, configured_repositories, saved_branches
 from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import branch_catalog, git, prepare, refresh_branches
-from workflow.rpc import thread_parameters
+from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError
 from workflow.zentao import ZentaoClient, project_context
 
@@ -240,10 +241,45 @@ class BranchWorkflowChecks(TestCase):
     def test_branch_rpc_has_no_business_tools_or_nonexistent_workspace_cwd(self):
         state = self.flow.state
         state["phase"] = "branch"
-        params = thread_parameters(state, "示例模型", {"other": {"enabled": False}})
-        self.assertFalse(params["config"]["mcp_servers"]["workflow"]["enabled"])
+        disabled_mcp = {"other": {"command": "示例命令", "enabled": False}}
+        params = thread_parameters(state, "示例模型", disabled_mcp)
+        server = params["config"]["mcp_servers"]["workflow"]
+        self.assertFalse(server["enabled"])
+        self.assertEqual(server["command"], python_executable)
+        self.assertEqual(server["args"], [str(ROOT / "mcp.py"), state["id"]])
+        self.assertEqual(params["config"]["mcp_servers"]["other"], disabled_mcp["other"])
         self.assertEqual(Path(params["cwd"]).name, state["id"])
         self.assertNotIn("zentao-delivery", params["developerInstructions"])
+
+    def test_business_phases_enable_workflow_transport(self):
+        for phase in ("plan", "implement", "review", "fix"):
+            with self.subTest(phase=phase):
+                self.flow.state["phase"] = phase
+                params = thread_parameters(self.flow.state, "示例模型", {})
+                server = params["config"]["mcp_servers"]["workflow"]
+                self.assertTrue(server["enabled"])
+                self.assertEqual(server["command"], python_executable)
+                self.assertEqual(Path(params["cwd"]).name, "workspace")
+
+    def test_disabling_inherited_mcp_preserves_stdio_and_http_transports(self):
+        configuration = {"mcp_servers": {
+            "local": {"command": "示例命令", "args": ["示例参数"], "enabled": True, "tool_timeout_sec": None},
+            "remote": {"url": "https://example.invalid/mcp", "enabled": True, "bearer_token_env_var": None},
+            "workflow": {"command": "旧工作流命令"}}}
+        original = deepcopy(configuration)
+        rpc = AppServer(self.settings, Mock())
+        rpc.request = Mock(side_effect=[{}, {"config": configuration},
+            {"data": [{"model": "示例模型", "isDefault": True}]},
+            {"data": [{"mode": "plan"}, {"mode": "default"}]}])
+        self.settings["codex"]["model"] = "示例模型"
+        with patch("workflow.rpc.which", return_value="codex.exe"), \
+             patch("workflow.rpc.Popen"), patch("workflow.rpc.Thread"), \
+             patch.object(rpc, "notify"):
+            rpc.start()
+        self.assertEqual(rpc.disabled_mcp, {
+            "local": {"command": "示例命令", "args": ["示例参数"], "enabled": False},
+            "remote": {"url": "https://example.invalid/mcp", "enabled": False}})
+        self.assertEqual(configuration, original)
 
     def test_structured_rpc_completion_enters_a_separate_business_plan(self):
         self.flow.start_plan("业务补充")

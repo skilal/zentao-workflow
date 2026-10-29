@@ -64,7 +64,9 @@ class AppServer:
         self.notify("initialized", {})
         self.initialized = True
         configuration = self.request("config/read", {"includeLayers": False}).get("config", {})
-        self.disabled_mcp = {name: {"enabled": False} for name in configuration.get("mcp_servers", {}) if name != "workflow"}
+        # 禁用时仍需保留传输配置；config/read 的未设置字段为 null，不能作为 TOML 覆盖传回。
+        self.disabled_mcp = {name: {**{key: value for key, value in server.items() if value is not None}, "enabled": False}
+                             for name, server in configuration.get("mcp_servers", {}).items() if name != "workflow"}
         models = self.request("model/list", {"includeHidden": False}).get("data", [])
         configured = self.settings["codex"]["model"] or configuration.get("model", "")
         candidates = [model for model in models if model.get("model", model.get("id")) == configured] if configured else [model for model in models if model.get("isDefault")]
@@ -156,15 +158,15 @@ class AppServer:
 
 def thread_parameters(state, model, disabled_mcp):
     session_path = ROOT / ".local" / "sessions" / state["id"]
+    server = {"command": python_executable,
+              "args": [str(ROOT / "mcp.py"), state["id"]], "cwd": str(ROOT),
+              "required": True, "enabled": state["phase"] != "branch", "startup_timeout_sec": 30,
+              "enabled_tools": ["task_context", "list_files", "read_file", "search_text", "baseline_file", "changes", "write_file", "replace_text", "delete_file"]}
     if state["phase"] == "branch":
         return {"cwd": str(session_path), "model": model,
                 "approvalPolicy": "on-request", "sandbox": "read-only",
-                "config": {"mcp_servers": {**disabled_mcp, "workflow": {"enabled": False}}},
+                "config": {"mcp_servers": {**disabled_mcp, "workflow": server}},
                 "developerInstructions": BRANCH_INSTRUCTIONS}
-    server = {"command": python_executable,
-              "args": [str(ROOT / "mcp.py"), state["id"]], "cwd": str(ROOT),
-              "required": True, "enabled": True, "startup_timeout_sec": 30,
-              "enabled_tools": ["task_context", "list_files", "read_file", "search_text", "baseline_file", "changes", "write_file", "replace_text", "delete_file"]}
     return {"cwd": str(session_path / "workspace"), "model": model,
             "approvalPolicy": "on-request", "sandbox": "read-only",
             "config": {"mcp_servers": {**disabled_mcp, "workflow": server}},
