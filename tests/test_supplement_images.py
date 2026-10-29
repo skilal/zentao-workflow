@@ -135,6 +135,12 @@ class SupplementImageChecks(SupplementImageFixture):
         self.assertEqual(self.state["phase"], "implement")
         engine._start_turn.assert_called_once()
 
+    def test_images_are_stored_under_the_session_attachment_directory(self):
+        self.upload()
+        directory = self.application.sessions.store.directory(self.state["id"]) / "attachments" / "supplement"
+        image = self.state["supplement_images"][0]
+        self.assertTrue(Path(image["path"]).is_relative_to(directory))
+
     def test_session_deletion_removes_uploaded_files(self):
         self.upload()
         directory = self.application.sessions.store.directory(self.state["id"])
