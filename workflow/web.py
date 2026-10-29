@@ -18,7 +18,7 @@ from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
 from workflow.store import session_repositories, session_title, timestamp
-from workflow.engine import ACTIVE, COMPLETE
+from workflow.engine import ACTIVE, COMPLETE, parse_review
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
@@ -38,6 +38,29 @@ def public_state(state):
     result.setdefault("followup_images", [])
     result.setdefault("delivery_round", 1)
     result.setdefault("deliveries", [])
+    # 旧记录只在响应副本中关联原文，不修改磁盘上的会话数据。
+    cursor = 0
+    for review in result.get("reviews", []):
+        if "history_index" in review:
+            cursor = review["history_index"] + 1
+            continue
+        saved = review["result"]
+        for index in range(cursor, len(result.get("history", []))):
+            entry = result["history"][index]
+            if entry["role"] != "Codex" or not entry["text"].lstrip().startswith(("{", "```")):
+                continue
+            try:
+                raw = parse_review(entry["text"])
+            except WorkflowError:
+                continue
+            if (raw["summary"] == saved.get("summary")
+                    and raw["resolved_previous"] == saved.get("resolved_previous")
+                    and len(raw["findings"]) <= len(saved["findings"])
+                    and all(all(finding.get(key) == value for key, value in source.items())
+                            for source, finding in zip(raw["findings"], saved["findings"]))):
+                review["history_index"] = index
+                cursor = index + 1
+                break
     for source in result.get("snapshot", {}).get("sources", []):
         raw = source.pop("raw", {})
         # 旧会话没有资料归属字段，从已保存的原始正文恢复图片和附件的关联。

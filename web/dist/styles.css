@@ -42,7 +42,29 @@ button, input, textarea { font: inherit; }
 .data-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 17px; border-top: 1px solid #f0f2f5; margin-top: 14px; }
 .muted { color: #8a94a6; font-size: 12px; }
 .number-text { font-variant-numeric: tabular-nums; }
-.description-text, .plain-plan { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.9; color: #425066; }
+.description-text { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.9; color: #425066; }
+.markdown-body { min-width: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.85; color: #425066; }
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { margin: 22px 0 10px; color: #25354b; font-weight: 600; line-height: 1.5; }
+.markdown-body h1 { font-size: 22px; }
+.markdown-body h2 { font-size: 19px; padding-bottom: 7px; border-bottom: 1px solid #e7ebf1; }
+.markdown-body h3 { font-size: 16px; }
+.markdown-body h4, .markdown-body h5, .markdown-body h6 { font-size: 14px; }
+.markdown-body p, .markdown-body ul, .markdown-body ol, .markdown-body blockquote, .markdown-body pre, .markdown-body table { margin: 12px 0; }
+.markdown-body ul, .markdown-body ol { padding-left: 25px; }
+.markdown-body li + li { margin-top: 4px; }
+.markdown-body li > p { margin: 5px 0; }
+.markdown-body input[type="checkbox"] { pointer-events: none; margin-right: 6px; }
+.markdown-body blockquote { padding: 7px 13px; border-left: 3px solid #91caff; background: #f2f8ff; color: #687386; }
+.markdown-body a { color: #1b8fff; text-decoration: underline; }
+.markdown-body code { padding: 2px 5px; border-radius: 4px; background: #eef1f5; font: .92em/1.7 Consolas, "Microsoft YaHei", monospace; }
+.markdown-body pre { max-width: 100%; padding: 12px 14px; overflow-x: auto; border: 1px solid #e7ebf1; border-radius: 6px; background: #f6f8fb; white-space: pre; overflow-wrap: normal; }
+.markdown-body pre code { padding: 0; background: transparent; white-space: pre; }
+.markdown-body table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; font-size: 13px; }
+.markdown-body th, .markdown-body td { padding: 8px 12px; border: 1px solid #e7ebf1; min-width: 90px; text-align: left; }
+.markdown-body th { background: #f6f8fb; color: #25354b; font-weight: 600; }
+.markdown-body hr { margin: 18px 0; border: 0; border-top: 1px solid #e7ebf1; }
 .source-block + .source-block { margin-top: 22px; padding-top: 20px; border-top: 1px solid #edf0f5; }
 .source-heading { margin-bottom: 12px; display: flex; align-items: center; gap: 7px; }
 .attachment-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px; margin-top: 16px; }
@@ -59,6 +81,7 @@ button, input, textarea { font: inherit; }
 .full-width { width: 100%; }
 .action-bar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .conversation-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(300px, .8fr); gap: 18px; align-items: start; }
+.conversation-grid > .card-stack { min-width: 0; }
 .conversation-feed { max-height: 490px; min-height: 280px; overflow: auto; padding-right: 5px; }
 .chat-entry { margin-bottom: 20px; }
 .chat-meta { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; color: #8a94a6; font-size: 11px; margin-bottom: 7px; }
@@ -75,7 +98,23 @@ button, input, textarea { font: inherit; }
 .review-summary { display: flex; gap: 15px; align-items: flex-start; }
 .review-number { min-width: 58px; padding-right: 16px; border-right: 1px solid #e8edf3; color: #1b8fff; font-size: 34px; line-height: 1.1; font-weight: 600; }
 .review-number span { display: block; margin-top: 7px; font-weight: 400; font-size: 11px; color: #8a94a6; }
-.review-copy { color: #59667b; line-height: 1.9; }
+.review-copy { min-width: 0; color: #59667b; line-height: 1.9; }
+.chat-body.review-message { background: #fff; white-space: normal; }
+.review-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; color: #25354b; }
+.review-heading .ant-tag, .finding-meta .ant-tag { margin-inline-end: 0; }
+.finding-list { display: grid; gap: 12px; margin-top: 18px; }
+.finding-card { min-width: 0; padding: 13px 14px 5px; border: 1px solid #e7ebf1; border-radius: 6px; background: #fff; }
+.finding-card.selected { border-color: #91caff; background: #f7fbff; }
+.finding-title .ant-checkbox-wrapper { align-items: flex-start; color: #25354b; line-height: 1.8; }
+.finding-title .ant-checkbox { margin-top: 5px; }
+.finding-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.finding-location { margin: 8px 0; color: #7a8597; font: 12px/1.7 Consolas, "Microsoft YaHei", monospace; overflow-wrap: anywhere; }
+.finding-card .ant-collapse-header { padding-inline: 0 !important; font-size: 12px; color: #687386 !important; }
+.finding-card .ant-collapse-content-box { padding-inline: 0 !important; }
+.review-actions { margin-top: 18px; padding-top: 16px; border-top: 1px solid #edf0f4; }
+.review-finalize { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.review-actions .ant-btn, .review-finalize .ant-btn { height: auto; white-space: normal; }
+.review-original { max-height: 320px; margin: 0; overflow: auto; white-space: pre; font: 12px/1.8 Consolas, "Microsoft YaHei", monospace; }
 .finding-details { display: grid; gap: 12px; padding: 4px 10px; }
 .finding-details strong { display: block; font-size: 12px; color: #7e8a9d; margin-bottom: 4px; font-weight: 500; }
 .finding-details p { margin: 0; line-height: 1.8; white-space: pre-wrap; }

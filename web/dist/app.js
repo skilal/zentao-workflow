@@ -5,6 +5,12 @@ const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Che
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
   Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown, Switch } = antd;
 const h = React.createElement;
+DOMPurify.addHook("afterSanitizeAttributes", node => {
+  if (node.nodeName === "INPUT") {
+    if (node.getAttribute("type") !== "checkbox") node.remove();
+    else node.setAttribute("disabled", "");
+  }
+});
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
 const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中"]);
@@ -12,7 +18,6 @@ const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查�
 const PAGES = {
   items: ["工作项与资料", "从指派给你的需求、任务和 Bug 中，选择本次处理对象。"],
   plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
-  review: ["Review", "检查最小实现范围与相关业务链路；无遗留问题时自动本地提交，有问题时由你选择处理。"],
   settings: ["工作流设置", "管理禅道账号、固定 Review 提示词和默认修复轮次。"]
 };
 
@@ -39,13 +44,22 @@ function stepOf(state) {
   return 0;
 }
 function CardBox(props) { return h(Card, { className: "app-card", ...props }, props.children); }
+function Markdown({ text }) {
+  const source = String(text || "").replace(/<\/?proposed_plan>/g, "");
+  const html = DOMPurify.sanitize(marked.parse(source, { gfm: true, breaks: false }), {
+    ALLOWED_TAGS: ["h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr", "strong", "em", "del", "ul", "ol", "li", "blockquote", "a", "pre", "code", "table", "thead", "tbody", "tr", "th", "td", "input"],
+    ALLOWED_ATTR: ["href", "title", "class", "start", "align", "type", "checked", "disabled"],
+    ALLOW_DATA_ATTR: false
+  });
+  return h("div", { className: "markdown-body", dangerouslySetInnerHTML: { __html: html } });
+}
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
   const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
-function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", review_enabled: false, answers: {}, review_note: "", selected_findings: [],
+function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
   codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
 const EFFORT_NAMES = { none: "无", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最大", ultra: "超高" };
 function CodexSelection({ value, onChange, onReady, disabled }) {
@@ -134,6 +148,7 @@ function WorkflowApp() {
   const csrf = useRef("");
   const [page, setPage] = useState(() => {
     const saved = sessionStorage.getItem("workflow-page");
+    if (saved === "review") { sessionStorage.setItem("workflow-page", "plan"); return "plan"; }
     return PAGES[saved] ? saved : "items";
   });
   const [online, setOnline] = useState(false);
@@ -169,7 +184,6 @@ function WorkflowApp() {
   const [sessionSelection, setSessionSelection] = useState(null);
   const feedRef = useRef(null);
   const lastSession = useRef(null);
-  const lastReview = useRef(null);
   const lastSettings = useRef("");
   const [notice, noticeHolder] = notification.useNotification();
   const [modal, modalHolder] = Modal.useModal();
@@ -260,7 +274,6 @@ function WorkflowApp() {
   function newSession() {
     viewEpoch.current += 1;
     lastSession.current = null;
-    lastReview.current = null;
     selectionRequest.current = "";
     setSelectedItems([]);
     draftRef.current = emptyDraft(null, modelRef.current.settings);
@@ -416,7 +429,6 @@ function WorkflowApp() {
   const state = model?.state;
   const stage = state?.stage || "";
   const review = state?.reviews?.filter(entry => (entry.delivery_round || 1) === (state.delivery_round || 1)).at(-1);
-  const findings = review?.result?.findings || [];
   const transfers = imageTransfers[state?.id] || [];
   const imagesUploading = transfers.some(entry => entry.status !== "error");
   const supplementEditable = Boolean(state && ["资料已读取", "准备工作区失败"].includes(stage) &&
@@ -452,13 +464,11 @@ function WorkflowApp() {
   }, [selectedKey, loadedKey, busy, model?.connected]);
   useEffect(() => {
     if (!state || !review) return;
-    const key = `${state.id}:${review.number}`;
-    if (lastReview.current?.startsWith(`${state.id}:`) && lastReview.current !== key) changeDraft({ selected_findings: [], review_note: "" });
-    lastReview.current = key;
+    if (draftRef.current.review_number !== review.number) changeDraft({ selected_findings: [], review_note: "", review_number: review.number });
   }, [state?.id, review?.number]);
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [model?.stream, state?.history?.length]);
+  }, [model?.stream, state?.history?.length, review?.number]);
   useEffect(() => {
     if (!model?.settings) return;
     const serialized = JSON.stringify(model.settings);
@@ -760,6 +770,7 @@ function WorkflowApp() {
     const continuing = state.phase === "complete";
     const feedbackAuthorized = state.approval_source === "followup";
     const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy;
+    const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
     const entries = state.history.map((entry, index) => ({ ...entry, index })).filter(entry => entry.role !== "控制器");
     return h("div", { className: "conversation-grid" },
       h("div", { className: "card-stack" },
@@ -771,9 +782,14 @@ function WorkflowApp() {
               h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
                 typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
-              h("div", { className: "chat-body" }, entry.text,
+              h("div", { className: `chat-body${reviewsByMessage.has(entry.index) ? " review-message" : ""}` },
+                reviewsByMessage.has(entry.index) ? renderReview(reviewsByMessage.get(entry.index), entry.text) :
+                  entry.phase === "review" && entry.role === "Codex" ?
+                    stage === "审查中" ? h("span", { className: "muted" }, "正在校验审查结果…") : h("pre", { className: "review-original" }, entry.text) :
+                    entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images)))),
-            model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, model.stream)))),
+            state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
+              model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream }))))),
         h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复" },
           questions.map(question => {
             const key = `${state.pending.id}:${question.id}:${question.question}`;
@@ -803,12 +819,12 @@ function WorkflowApp() {
             transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再发送。")),
           h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明")))),
       h("div", { className: "card-stack" }, h(CardBox, { title: feedbackAuthorized ? "原需求实施计划" : "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, feedbackAuthorized ? "原计划 · 业务背景" : state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认") },
-        state.plan ? h(React.Fragment, null, h("div", { className: "plan-panel" }, h("pre", { className: "plain-plan" }, state.plan)), h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
+        state.plan ? h(React.Fragment, null, h("div", { className: "plan-panel" }, h(Markdown, { text: state.plan })), h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
         h(Button, { type: "primary", block: true, disabled: stage !== "等待计划确认" || busy, onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")),
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
           h(Button, { block: true, disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
-          h(Button, { block: true, disabled: !review, onClick: () => navigate("review") }, "定位最新 Review")),
+          h(Button, { block: true, disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
             "后续对话支持提问、获取信息和提出修改要求。每条消息的 Review 开关默认关闭；开启且有代码修改时审查，无遗留问题后自动本地 commit，不 push。需要澄清时等待回答，扩大范围时先重新计划。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
@@ -820,37 +836,42 @@ function WorkflowApp() {
         })) }))));
   }
 
-  function renderReview() {
-    if (!review) return h(CardBox, null, h(Empty, { description: "代码实施完成后，将自动开始首次 Review" }));
-    const selected = draft.selected_findings.filter(id => findings.some(finding => finding.id === id));
+  function renderReview(entry, originalText) {
+    const latest = entry.number === review?.number && (entry.delivery_round || 1) === state.delivery_round && state.phase !== "complete";
+    const findings = entry.result.findings;
+    const selected = latest ? draft.selected_findings.filter(id => findings.some(finding => finding.id === id)) : [];
     const limitReached = state.fix_round >= state.max_fix_rounds;
-    const canFix = stage === "等待修复选择" && !busy;
-    const canCommit = ["等待修复选择", "部分提交"].includes(stage) && !busy && selected.length === findings.length && (!findings.length || draft.review_note.trim());
-    const columns = [
-      { title: "编号", dataIndex: "id", width: 95, render: value => h(Typography.Text, { code: true }, value) },
-      { title: "级别", dataIndex: "severity", width: 70, render: value => h(Tag, { color: ["P0", "P1"].includes(value) ? "error" : value === "P2" ? "warning" : "default" }, value) },
-      { title: "问题", dataIndex: "title", render: value => h("span", { className: "table-title" }, value) },
-      { title: "类别", dataIndex: "category", width: 125 },
-      { title: "来源", dataIndex: "origin", width: 105, render: value => h(Tag, { color: value === "本次引入" ? "volcano" : value === "证据不足" ? "gold" : "default" }, value) },
-      { title: "位置", width: 190, render: (_, entry) => h(Typography.Text, { style: { fontSize: 12 }, title: `${entry.repository}/${entry.path}:${entry.line}` }, `${entry.repository}/${entry.path}:${entry.line}`) }
-    ];
-    return h("div", { className: "card-stack" },
-      h(CardBox, { title: `第 ${review.number} 次 Review`, extra: h(Space, null, h(Tag, null, `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮`), stageTag(stage)) },
-        h("div", { className: "review-summary" }, h("div", { className: "review-number" }, findings.length, h("span", null, "待处置问题")), h("div", { className: "review-copy" }, review.result.summary))),
-      h(CardBox, { title: "问题清单", extra: h(Button, { onClick: openDiff, disabled: stopped }, "查看累计代码差异") },
-        h(Table, { columns, dataSource: findings, rowKey: "id", pagination: false, scroll: { x: 950 }, size: "middle", locale: { emptyText: "本轮没有发现待处理问题" },
-          rowSelection: { selectedRowKeys: selected, onChange: keys => changeDraft({ selected_findings: keys }), getCheckboxProps: () => ({ disabled: !canFix && stage !== "部分提交" }) },
-          expandable: { expandedRowRender: entry => h("div", { className: "finding-details" }, ...[["判断依据", entry.evidence], ["处理建议", entry.suggestion], ["业务影响", entry.impact]].map(([label, text]) => h("div", { key: label }, h("strong", null, label), h("p", null, text)))) } }),
-        limitReached && findings.length > 0 && h(Alert, { type: "warning", showIcon: true, style: { marginTop: 18 }, message: "已达到本次修复轮次上限", description: "如需继续修复，请明确追加一轮；仍有问题时不会自动结束。" }),
-        h(Field, { label: "修复说明 / 接受剩余问题的原因" }, h(Input.TextArea, { rows: 3, value: draft.review_note, disabled: !canFix && stage !== "部分提交", placeholder: "补充修复要求。接受剩余问题并结束时，请填写接受原因。", onChange: event => changeDraft({ review_note: event.target.value }) })),
+    const canSelect = latest && !busy && ["等待修复选择", "部分提交"].includes(stage);
+    const canFix = latest && stage === "等待修复选择" && !busy;
+    const canCommit = canSelect && selected.length === findings.length && (!findings.length || draft.review_note.trim());
+    return h("section", { className: "review-content", id: `review-${entry.number}`, "aria-label": `第 ${entry.number} 次 Review` },
+      h("div", { className: "review-heading" }, h("strong", null, `第 ${entry.number} 次 Review`),
+        h(Tag, null, latest ? `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮` : `修复第 ${entry.fix_round} 轮后`), !latest && h(Tag, null, "历史记录 · 只读")),
+      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, findings.length, h("span", null, "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
+      h("div", { className: "finding-list" }, findings.length === 0 && h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "本轮没有发现待处理问题" }),
+        findings.map(finding => h("div", { className: `finding-card${selected.includes(finding.id) ? " selected" : ""}`, key: finding.id },
+          h("div", { className: "finding-title" }, h(Checkbox, { checked: selected.includes(finding.id), disabled: !canSelect,
+            onChange: event => changeDraft({ selected_findings: event.target.checked ? [...selected, finding.id] : selected.filter(id => id !== finding.id) }) },
+            h(Tag, { color: ["P0", "P1"].includes(finding.severity) ? "error" : finding.severity === "P2" ? "warning" : "default" }, finding.severity),
+            h("strong", null, finding.title))),
+          h("div", { className: "finding-meta" }, h(Typography.Text, { code: true }, finding.id), h(Tag, null, finding.category),
+            h(Tag, { color: finding.origin === "本次引入" ? "volcano" : finding.origin === "证据不足" ? "gold" : "default" }, finding.origin)),
+          h("div", { className: "finding-location" }, `${finding.repository}/${finding.path}:${finding.line}`),
+          h(Collapse, { ghost: true, size: "small", items: [{ key: "details", label: "判断依据、处理建议与业务影响",
+            children: h("div", { className: "finding-details" }, ...[["判断依据", finding.evidence], ["处理建议", finding.suggestion], ["业务影响", finding.impact]].map(([label, value]) => h("div", { key: label }, h("strong", null, label), h(Markdown, { text: value })))) }] })))),
+      latest && h("div", { className: "review-actions" },
+        h(Button, { onClick: openDiff, disabled: stopped }, "查看累计代码差异"),
+        limitReached && findings.length > 0 && h(Alert, { type: "warning", showIcon: true, style: { marginTop: 14 }, message: "已达到本次修复轮次上限", description: "如需继续修复，请明确追加一轮；仍有问题时不会自动结束。" }),
+        h(Field, { label: "修复说明 / 接受剩余问题的原因" }, h(Input.TextArea, { rows: 3, value: draft.review_note, disabled: !canSelect,
+          placeholder: "补充修复要求。接受剩余问题并结束时，请填写接受原因。", onChange: event => changeDraft({ review_note: event.target.value }) })),
         h("div", { className: "action-bar" },
           h(Button, { disabled: !canFix, onClick: () => act("add_round") }, "追加一轮"),
           h(Button, { disabled: busy || !["等待修复选择", "已暂停", "已停止"].includes(stage), onClick: () => act("rereview") }, "重新 Review"),
-          h(Button, { type: "primary", disabled: !canFix || !selected.length || limitReached, onClick: async () => { if (await act("fix", { ids: selected, note: draft.review_note })) navigate("plan"); } }, `修复选中 ${selected.length} 项并复审`)),
-        h(Divider), h("div", { className: "data-foot", style: { border: 0, paddingTop: 0 } },
+          h(Button, { type: "primary", disabled: !canFix || !selected.length || limitReached, onClick: () => act("fix", { ids: selected, note: draft.review_note }) }, `修复选中 ${selected.length} 项并复审`)),
+        h(Divider), h("div", { className: "review-finalize" },
           h("span", { className: "muted" }, findings.length ? "结束前须选中全部剩余问题，并填写接受原因" : state.phase === "complete" ? "本地提交已完成，未 push" : "无遗留问题时自动本地提交；提交失败后可手动继续"),
           h(Button, { disabled: !canCommit, onClick: () => act("finalize", { ids: selected, note: draft.review_note }) }, findings.length ? "接受剩余问题并本地提交" : "继续本地提交"))),
-      Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })));
+      h(Collapse, { ghost: true, size: "small", items: [{ key: "original", label: "输出原文", children: h("pre", { className: "review-original" }, originalText) }] }));
   }
 
   function renderSettings() {
@@ -918,7 +939,7 @@ function WorkflowApp() {
                 const selected = model.selectedSessionId === entry.id;
                 const canMove = entry.can_move_project && !stopped && !requestsPending[entry.id];
                 const cannotDelete = stopped || entry.working || entry.busy || ACTIVE.has(entry.stage) || entry.stage === "等待人工回答" || entry.stage === "资料读取中";
-                const open = () => selectSession(entry.id, ["资料已读取", "资料读取失败"].includes(entry.stage) ? "items" : model.sessions[entry.id]?.state.reviews?.length ? "review" : "plan");
+                const open = () => selectSession(entry.id, ["资料已读取", "资料读取失败"].includes(entry.stage) ? "items" : "plan");
                 return h(List.Item, { key: entry.id, className: `session-entry${selected ? " selected" : ""}`, onClick: open, draggable: Boolean(canMove),
                   title: entry.project_move_reason || "可拖动到其他项目分区",
                   onDragStart: event => { event.dataTransfer.setData("application/x-workflow-session", entry.id); event.dataTransfer.effectAllowed = "move"; setDragSessionId(entry.id); },
@@ -947,8 +968,8 @@ function WorkflowApp() {
   if (fatal) return h("div", { style: { maxWidth: 650, margin: "100px auto" } }, h(Alert, { type: "error", showIcon: true, message: "无法连接本地网页服务", description: fatal, action: h(Button, { onClick: () => location.reload() }, "重新打开") }));
   if (!model) return h("div", { className: "initial-loading" }, h(Spin, null), " 正在加载工作流…");
   const heading = PAGES[page];
-  const renderers = { items: renderItems, plan: renderPlan, review: renderReview, settings: renderSettings };
-  const menuIcons = ["▦", "☷", "◇", "⚙"];
+  const renderers = { items: renderItems, plan: renderPlan, settings: renderSettings };
+  const menuIcons = ["▦", "☷", "⚙"];
   const hasProjectInfo = page !== "settings" && selectionMatches;
   const showProjectInfo = hasProjectInfo && !projectInfoHidden;
   return h(ConfigProvider, { locale: antd.locales.zh_CN, theme: { token: { colorPrimary: "rgb(27, 143, 255)", borderRadius: 6, fontSize: 14,

@@ -3,8 +3,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from hashlib import sha256
-from json import dumps, loads
-from re import search
+from json import JSONDecodeError, dumps, loads
+from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
 
 from workflow.approvals import is_controlled_write
@@ -35,6 +35,34 @@ FINDING_SCHEMA = {"type": "object", "properties": {
 ACTIVE = {"识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中"}
 COMPLETE = {"已完成（静态审查）", "已完成（未审查）"}
 PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中"}
+
+
+def parse_review(text):
+    """只接收完整 JSON 或单个代码块，并按固定审查协议校验。"""
+    match = fullmatch(r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```", text.strip(), IGNORECASE)
+    try:
+        result = loads(match.group(1) if match else text)
+    except JSONDecodeError as error:
+        raise WorkflowError("Review 结果不是完整的 JSON，已停止。") from error
+    pending = [(result, FINDING_SCHEMA)]
+    types = {"object": dict, "array": list, "string": str, "integer": int}
+    while pending:
+        value, schema = pending.pop()
+        kind = schema["type"]
+        if not isinstance(value, types[kind]) or (kind == "integer" and isinstance(value, bool)):
+            raise WorkflowError("Review 结果字段类型不符合约定结构，已停止。")
+        if "enum" in schema and value not in schema["enum"]:
+            raise WorkflowError("Review 结果包含不支持的类别、来源或优先级，已停止。")
+        if kind == "object":
+            if set(value) != set(schema["required"]):
+                raise WorkflowError("Review 结果缺少必要字段或包含未知字段，已停止。")
+            pending.extend((value[key], child) for key, child in schema["properties"].items())
+        elif kind == "array":
+            pending.extend((entry, schema["items"]) for entry in value)
+    if any(not finding[key].strip() for finding in result["findings"]
+           for key in ("title", "evidence", "suggestion", "impact")):
+        raise WorkflowError("Review 问题缺少必要证据或字段，已停止。")
+    return result
 
 
 class Workflow:
@@ -895,9 +923,7 @@ class Workflow:
         elif state["phase"] == "review":
             if manifest(state["repos"]) != state["review_manifest"]:
                 raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
-            result = loads(text)
-            if not isinstance(result.get("findings"), list) or not isinstance(result.get("summary"), str) or not isinstance(result.get("resolved_previous"), list):
-                raise WorkflowError("Review 结果不符合约定结构，已停止。")
+            result = parse_review(text)
             review_number = len(state["reviews"]) + 1
             reviews = self.current_reviews()
             previous = {finding["id"]: finding for finding in reviews[-1]["result"]["findings"]} if reviews else {}
@@ -906,9 +932,6 @@ class Workflow:
                 raise WorkflowError("Review 声称解决了不存在的旧问题，已停止。")
             seen = set()
             for number, finding in enumerate(result["findings"], 1):
-                required = FINDING_SCHEMA["properties"]["findings"]["items"]["required"]
-                if any(key not in finding for key in required) or not all(isinstance(finding[key], str) and finding[key].strip() for key in ("title", "evidence", "suggestion", "impact")):
-                    raise WorkflowError("Review 问题缺少必要证据或字段，已停止。")
                 old_id = finding["previous_id"]
                 if old_id and old_id not in previous:
                     raise WorkflowError("Review 引用了不存在的旧问题。")
