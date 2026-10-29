@@ -174,7 +174,7 @@ button, input, textarea { font: inherit; }
 .session-entry-title { color: #25354b; font-weight: 500; font-size: 13px; line-height: 1.7; }
 .session-entry-title > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-entry-status { margin: 9px 0 5px; display: flex; align-items: center; gap: 6px; }
-.session-entry-foot { display: flex; justify-content: space-between; align-items: center; gap: 4px; }
+.session-entry-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
 .session-entry-foot .muted { font-size: 11px; }
 .session-panel-note { padding-top: 14px; border-top: 1px solid #edf0f4; line-height: 1.8; }
 .delete-description .repo-path { margin-bottom: 10px; }
