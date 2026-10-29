@@ -32,6 +32,7 @@ class SupplementImageFixture(TestCase):
         self.application = WebApplication(self.settings)
         self.addCleanup(self.application.close)
         self.state = self.application.sessions.store.new({"kind": "task", "id": 7, "title": "图片补充需求"})
+        self.state["codex"] = {"model": "模拟模型", "reasoning_effort": "high"}
         self.state["snapshot"] = {"sources": [], "materials": [], "blockers": [], "feishu_links": []}
         self.runtime = self.application.sessions.add(self.state)
         self.application.emit(self.state["id"], "state", self.state)

@@ -86,6 +86,7 @@ class BranchWorkflowChecks(TestCase):
         state["snapshot"] = {"sources": [{"title": "示例任务", "content": "需求内容", "raw": {"project": 41}}],
                              "materials": [], "blockers": [], "feishu_links": []}
         self.flow.state = state
+        state["codex"] = {"model": "示例模型", "reasoning_effort": "high"}
         self.turns = Mock(side_effect=lambda *args: state.update(stage=PHASE_STAGE[state["phase"]]))
         self.flow._start_turn = self.turns
         self.prepared = []
@@ -272,13 +273,12 @@ class BranchWorkflowChecks(TestCase):
         original = deepcopy(configuration)
         rpc = AppServer(self.settings, Mock())
         rpc.request = Mock(side_effect=[{}, {"config": configuration},
-            {"data": [{"model": "示例模型", "isDefault": True}]},
             {"data": [{"mode": "plan"}, {"mode": "default"}]}])
         self.settings["codex"]["model"] = "示例模型"
         with patch("workflow.rpc.which", return_value="codex.exe"), \
              patch("workflow.rpc.Popen"), patch("workflow.rpc.Thread"), \
              patch.object(rpc, "notify"):
-            rpc.start()
+            rpc.start("示例模型")
         self.assertEqual(rpc.disabled_mcp, {
             "local": {"command": "示例命令", "args": ["示例参数"], "enabled": False},
             "remote": {"url": "https://example.invalid/mcp", "enabled": False}})

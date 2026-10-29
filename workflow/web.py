@@ -21,6 +21,7 @@ from workflow.store import session_title, timestamp
 from workflow.engine import ACTIVE
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
+from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
 from workflow.zentao import KINDS, ZentaoClient, identifier, parse_description
 
@@ -76,6 +77,8 @@ class WebApplication:
         self.sessions = SessionManager(self.settings, self.emit)
         self.project_partitions = ProjectPartitions(self.sessions.store.root.parent / "project-partitions.json")
         self.project_lock = RLock()
+        self.codex_catalog_lock = RLock()
+        self.codex_catalog = None
         self.management_executor = ThreadPoolExecutor(max_workers=1)
         self.pointer = LOCAL / "current-session.json"
         self.default_session_id = None
@@ -157,10 +160,25 @@ class WebApplication:
 
     def public_settings(self):
         return {"base_url": self.settings["zentao"]["base_url"], "account": self.settings["zentao"]["account"],
-                "model": self.settings["codex"]["model"], "max_fix_rounds": self.settings["review"]["max_fix_rounds"],
+                "model": self.settings["codex"]["model"], "reasoning_effort": self.settings["codex"]["reasoning_effort"],
+                "max_fix_rounds": self.settings["review"]["max_fix_rounds"],
                 "max_attachment_mb": self.settings["zentao"]["max_attachment_mb"],
                 "review_prompt": (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(),
                 "repositories": deepcopy(self.settings["repositories"]), "feishu_enabled": False}
+
+    def codex_models(self, refresh=False):
+        with self.codex_catalog_lock:
+            if self.codex_catalog is None or refresh:
+                self.codex_catalog = None
+                rpc = AppServer(self.settings, lambda message: None)
+                try:
+                    rpc.connect()
+                    self.codex_catalog = rpc.catalog()
+                except (KeyError, TypeError) as error:
+                    raise WorkflowError("Codex 模型列表格式不符合当前协议，已停止读取。") from error
+                finally:
+                    rpc.close()
+            return deepcopy(self.codex_catalog)
 
     def snapshot(self):
         with self.lock:
@@ -343,13 +361,15 @@ class WebApplication:
             raise WorkflowError("账号、非负整数轮次及 Review 提示词不能为空。")
         if account != self.settings["zentao"]["account"] and not password:
             raise WorkflowError("更换账号时请同时填写对应密码。")
+        model, effort = data.get("model"), data.get("reasoning_effort")
+        validate_selection(self.codex_models(), model, effort, allow_default=True)
         if password:
             if not isinstance(password, str):
                 raise WorkflowError("密码格式无效。")
             save_password(password)
         with self.sessions.settings_lock:
             self.settings["zentao"].update(base_url=url, account=account)
-            self.settings["codex"]["model"] = str(data.get("model", "")).strip()
+            self.settings["codex"].update(model=model, reasoning_effort=effort)
             self.settings["review"]["max_fix_rounds"] = maximum
             (ROOT / self.settings["review"]["prompt_file"]).write_text(prompt + "\n", encoding="utf-8")
             save_settings(self.settings)
@@ -381,6 +401,11 @@ class WebApplication:
                 raise WorkflowError("会话标识无效。")
             request_key = (session_id, request_id)
             if request_key in self.requests:
+                previous = self.requests[request_key]
+                if previous.get("session_id") in self.sessions.runtimes:
+                    saved = self.sessions.runtimes[previous["session_id"]].engine.state.get("codex")
+                    if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
+                        raise WorkflowError("会话模型配置已经固定，不能通过重复请求修改。")
                 return {**self.requests[request_key], "duplicate": True}
             if action == "restore":
                 return {"accepted": True, **self.session(data.get("id"))}
@@ -397,8 +422,13 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
+                saved = state.get("codex")
+                if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
+                    raise WorkflowError("会话模型配置已经固定，请新建会话使用其他配置。")
+                if not saved and action not in {"collect", "pause", "delete_session", "configure_codex", "plan"}:
+                    raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
             affects, control = True, action == "pause"
             if action == "connect":
                 operation, arguments, affects = engine.connect, (), False
@@ -433,10 +463,18 @@ class WebApplication:
                 supplement = data.get("supplement", "")
                 if not isinstance(supplement, str) or "selections" in data:
                     raise WorkflowError("开始计划只接受补充说明，仓库与分支由服务端确定。")
+                if not state.get("codex"):
+                    state["codex"] = validate_selection(self.codex_models(), data.get("model"), data.get("reasoning_effort"))
+                    engine.save()
                 if "plan_started_at" not in engine.state:
                     engine.state["plan_started_at"] = timestamp()
                     engine.store.save(engine.state)
                 operation, arguments = engine.start_plan, (supplement, action == "edit_branches")
+            elif action == "configure_codex":
+                if state.get("codex"):
+                    raise WorkflowError("会话模型配置已经固定，不能再次设置。")
+                selection = validate_selection(self.codex_models(), data.get("model"), data.get("reasoning_effort"))
+                operation, arguments = self.configure_codex, (engine, selection)
             elif action == "confirm_project":
                 project_id, name = data.get("project_id"), data.get("name")
                 if not isinstance(project_id, int) or isinstance(project_id, bool) or project_id <= 0 or not isinstance(name, str) or not name.strip():
@@ -513,6 +551,11 @@ class WebApplication:
                         self._publish("busy", self.session_payload(runtime) if runtime else {"session_id": None, "busy": self.busy})
             future.add_done_callback(completed)
             return result
+
+    @staticmethod
+    def configure_codex(engine, selection):
+        engine.state["codex"] = selection
+        engine.save()
 
     def delete_session(self, session_id, runtime):
         engine = runtime.engine
@@ -649,6 +692,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 with application.sessions.zentao_lock:
                     projects = application.sessions.zentao.list_projects()
                 self._json(200, {"projects": projects})
+            elif path == "/api/codex-models":
+                self._json(200, application.codex_models(refresh=query.get("refresh") == ["1"]))
             elif path == "/api/branches":
                 name = query.get("repository", [""])[0]
                 repository = next((entry for entry in application.settings["repositories"] if entry["name"] == name), None)

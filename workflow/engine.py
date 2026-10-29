@@ -358,6 +358,8 @@ class Workflow:
         return self.state
 
     def ensure_rpc(self):
+        if not self.state.get("codex"):
+            raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
         if self.closed:
             raise WorkflowError("客户端已经关闭，不能启动新会话。")
         if self.rpc is not None and self.rpc.process.poll() is not None:
@@ -367,7 +369,7 @@ class Workflow:
             epoch = self.connection_epoch
             self.rpc = AppServer(self.settings, lambda message: self._event(message, epoch))
             try:
-                self.rpc.start()
+                self.rpc.start(self.state["codex"]["model"])
             except Exception:
                 self.rpc.close()
                 self.rpc = None
@@ -440,8 +442,8 @@ class Workflow:
         params = {"threadId": state["thread_id"], "input": inputs,
                   "cwd": str(turn_cwd), "approvalPolicy": "on-request",
                   "sandboxPolicy": {"type": "readOnly"},
-                  "collaborationMode": {"mode": mode, "settings": {"model": self.rpc.model,
-                      "reasoning_effort": self.settings["codex"]["reasoning_effort"], "developer_instructions": None}}}
+                  "collaborationMode": {"mode": mode, "settings": {"model": state["codex"]["model"],
+                      "reasoning_effort": state["codex"]["reasoning_effort"], "developer_instructions": None}}}
         if output_schema:
             params["outputSchema"] = output_schema
         self.turn_running = True

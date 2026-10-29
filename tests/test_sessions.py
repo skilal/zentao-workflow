@@ -33,6 +33,7 @@ class SessionFixture(TestCase):
 
     def add_session(self, number):
         state = self.application.sessions.store.new({"kind": "task", "id": number, "title": f"脱敏任务{number}"})
+        state["codex"] = {"model": "示例模型", "reasoning_effort": "high"}
         runtime = self.application.sessions.add(state)
         self.application.emit(state["id"], "state", state)
         return runtime

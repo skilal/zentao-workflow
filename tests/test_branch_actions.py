@@ -25,6 +25,7 @@ class BranchActionChecks(TestCase):
         self.application = WebApplication(settings)
         self.addCleanup(self.application.close)
         self.state = self.application.sessions.store.new({"kind": "task", "id": 7, "title": "脱敏工作项"})
+        self.state["codex"] = {"model": "示例模型", "reasoning_effort": "high"}
         self.runtime = self.application.sessions.add(self.state)
         self.application.emit(self.state["id"], "state", self.state)
         self.runtime.engine.submit = Mock(side_effect=self.submit)

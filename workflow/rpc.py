@@ -31,10 +31,11 @@ class AppServer:
         self.stderr_ready = Event()
         self.initialized = False
         self.disabled_mcp = {}
+        self.configuration = {}
         self.reader = None
         self.stderr_reader = None
 
-    def start(self):
+    def connect(self):
         if self.process and self.process.poll() is None:
             return
         self.closing = False
@@ -64,15 +65,34 @@ class AppServer:
         self.notify("initialized", {})
         self.initialized = True
         configuration = self.request("config/read", {"includeLayers": False}).get("config", {})
+        self.configuration = configuration
         # 禁用时仍需保留传输配置；config/read 的未设置字段为 null，不能作为 TOML 覆盖传回。
         self.disabled_mcp = {name: {**{key: value for key, value in server.items() if value is not None}, "enabled": False}
                              for name, server in configuration.get("mcp_servers", {}).items() if name != "workflow"}
-        models = self.request("model/list", {"includeHidden": False}).get("data", [])
-        configured = self.settings["codex"]["model"] or configuration.get("model", "")
-        candidates = [model for model in models if model.get("model", model.get("id")) == configured] if configured else [model for model in models if model.get("isDefault")]
-        if len(candidates) != 1:
-            raise WorkflowError("无法唯一确定可用模型，请在设置中明确填写账号可用的模型标识。")
-        self.model = candidates[0].get("model", candidates[0].get("id"))
+
+    def catalog(self):
+        models, cursor, cursors = [], None, set()
+        while True:
+            page = self.request("model/list", {"includeHidden": False, "cursor": cursor})
+            for entry in page["data"]:
+                models.append({"model": entry["model"], "display_name": entry["displayName"],
+                               "reasoning_efforts": [option["reasoningEffort"] for option in entry["supportedReasoningEfforts"]],
+                               "is_default": entry["isDefault"]})
+            cursor = page.get("nextCursor")
+            if cursor is None:
+                break
+            if cursor in cursors:
+                raise WorkflowError("Codex 模型列表分页游标重复，已停止读取。")
+            cursors.add(cursor)
+        default = self.configuration.get("model")
+        if not default:
+            defaults = [entry["model"] for entry in models if entry["is_default"]]
+            default = defaults[0] if len(defaults) == 1 else None
+        return {"models": models, "default_model": default}
+
+    def start(self, model):
+        self.connect()
+        self.model = model
         modes = self.request("collaborationMode/list", {}).get("data", [])
         self.modes = {mode.get("mode"): mode for mode in modes if mode.get("mode")}
         if "plan" not in self.modes or "default" not in self.modes:
@@ -156,6 +176,18 @@ class AppServer:
                     raise WorkflowError("Codex 通道仍未退出，已停止清理会话。")
 
 
+def validate_selection(catalog, model, effort, *, allow_default=False):
+    if not isinstance(model, str) or not isinstance(effort, str) or not effort:
+        raise WorkflowError("请明确选择模型和推理强度。")
+    selected = catalog["default_model"] if allow_default and model == "" else model
+    candidates = [entry for entry in catalog["models"] if entry["model"] == selected]
+    if len(candidates) != 1:
+        raise WorkflowError("所选模型不可用，请刷新模型列表并重新选择。")
+    if effort not in candidates[0]["reasoning_efforts"]:
+        raise WorkflowError("所选模型不支持该推理强度，请重新选择。")
+    return {"model": selected, "reasoning_effort": effort}
+
+
 def thread_parameters(state, model, disabled_mcp):
     session_path = ROOT / ".local" / "sessions" / state["id"]
     server = {"command": python_executable,
@@ -165,9 +197,11 @@ def thread_parameters(state, model, disabled_mcp):
     if state["phase"] == "branch":
         return {"cwd": str(session_path), "model": model,
                 "approvalPolicy": "on-request", "sandbox": "read-only",
-                "config": {"mcp_servers": {**disabled_mcp, "workflow": server}},
+                "config": {"model_reasoning_effort": state["codex"]["reasoning_effort"],
+                           "mcp_servers": {**disabled_mcp, "workflow": server}},
                 "developerInstructions": BRANCH_INSTRUCTIONS}
     return {"cwd": str(session_path / "workspace"), "model": model,
             "approvalPolicy": "on-request", "sandbox": "read-only",
-            "config": {"mcp_servers": {**disabled_mcp, "workflow": server}},
+            "config": {"model_reasoning_effort": state["codex"]["reasoning_effort"],
+                       "mcp_servers": {**disabled_mcp, "workflow": server}},
             "developerInstructions": (ROOT / "skills" / "zentao-delivery" / "SKILL.md").read_text(encoding="utf-8")}

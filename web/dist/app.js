@@ -43,7 +43,51 @@ function mergeHistory(history, state) {
   const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
-function emptyDraft(state) { return { supplement: state?.supplement || "", reply: "", answers: {}, review_note: "", selected_findings: [] }; }
+function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", answers: {}, review_note: "", selected_findings: [],
+  codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
+const EFFORT_NAMES = { none: "无", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最大", ultra: "超高" };
+function CodexSelection({ value, onChange, onReady, disabled }) {
+  const [catalog, setCatalog] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    let disposed = false;
+    setLoading(true);
+    setError("");
+    fetch(`/api/codex-models${version ? "?refresh=1" : ""}`, { credentials: "same-origin", cache: "no-store" })
+      .then(readResponse).then(result => { if (!disposed) setCatalog(result); })
+      .catch(error => { if (!disposed) { setCatalog(null); setError(error.message); } })
+      .finally(() => { if (!disposed) setLoading(false); });
+    return () => { disposed = true; };
+  }, [version]);
+  const selected = value.model === "" ? catalog?.default_model : value.model;
+  const current = catalog?.models.find(entry => entry.model === selected);
+  const valid = !loading && !error && current?.reasoning_efforts.includes(value.reasoning_effort);
+  useEffect(() => {
+    onReady(valid ? { model: selected, reasoning_effort: value.reasoning_effort } : null);
+  }, [valid, selected, value.reasoning_effort, onReady]);
+  const options = catalog ? [{ value: "", label: `沿用本机 Codex（${catalog.default_model || "默认模型未确定"}）` },
+    ...catalog.models.map(entry => ({ value: entry.model, label: `${entry.display_name} · ${entry.model}` }))] : [];
+  return h("div", { className: "codex-selection" },
+    h("div", { className: "settings-grid" },
+      h(Field, { label: "模型" }, h(Select, { "aria-label": "模型", className: "full-width", showSearch: true, optionFilterProp: "label",
+        value: value.model, options, loading, disabled: disabled || loading || Boolean(error),
+        notFoundContent: loading ? "正在读取模型…" : "暂无可用模型", onChange: model => {
+          const entry = catalog.models.find(entry => entry.model === (model === "" ? catalog.default_model : model));
+          onChange({ model, reasoning_effort: entry?.reasoning_efforts.includes(value.reasoning_effort) ? value.reasoning_effort : "" });
+        } })),
+      h(Field, { label: "推理强度" }, h(Select, { "aria-label": "推理强度", className: "full-width", placeholder: "请选择推理强度",
+        value: value.reasoning_effort || undefined, disabled: disabled || loading || Boolean(error) || !current,
+        options: (current?.reasoning_efforts || []).map(effort => ({ value: effort, label: `${EFFORT_NAMES[effort] || effort}（${effort}）` })),
+        onChange: reasoning_effort => onChange({ ...value, reasoning_effort }) }))),
+    h("div", { className: "action-bar" },
+      h(Typography.Text, { type: "secondary" }, loading ? "正在读取本机 Codex 模型…" : current ? `实际模型：${selected}` : "请从当前可用列表中选择模型"),
+      h(Button, { size: "small", loading, disabled: disabled || loading, onClick: () => setVersion(previous => previous + 1) }, "刷新模型列表")),
+    error && h(Alert, { type: "error", showIcon: true, message: "读取模型失败", description: error }),
+    !loading && !error && catalog?.models.length === 0 && h(Alert, { type: "warning", showIcon: true, message: "本机 Codex 未返回可用模型，请检查账号后刷新列表。" }),
+    !loading && current && value.reasoning_effort && !valid && h(Alert, { type: "warning", showIcon: true, message: "当前模型不支持已选推理强度，请重新选择。" }));
+}
 function projectCatalog(model) {
   const projects = new Map((model.project_partitions || []).map(project => [project.id, { ...project }]));
   for (const entry of model.history) {
@@ -116,6 +160,10 @@ function WorkflowApp() {
   const [diffOpen, setDiffOpen] = useState(false);
   const [diffs, setDiffs] = useState(null);
   const [settingsForm] = Form.useForm();
+  const settingsModel = Form.useWatch("model", settingsForm);
+  const settingsEffort = Form.useWatch("reasoning_effort", settingsForm);
+  const [settingsSelection, setSettingsSelection] = useState(null);
+  const [sessionSelection, setSessionSelection] = useState(null);
   const feedRef = useRef(null);
   const lastSession = useRef(null);
   const lastReview = useRef(null);
@@ -212,7 +260,7 @@ function WorkflowApp() {
     lastReview.current = null;
     selectionRequest.current = "";
     setSelectedItems([]);
-    draftRef.current = emptyDraft();
+    draftRef.current = emptyDraft(null, modelRef.current.settings);
     setDraft(draftRef.current);
     sessionStorage.setItem("workflow-session", "");
     applyModel({ ...modelRef.current, selectedSessionId: null });
@@ -380,7 +428,7 @@ function WorkflowApp() {
     selectionRequest.current = "";
     const itemKeys = sessionItems(state).map(itemKey);
     const saved = sessionStorage.getItem(`workflow-draft:${state.id}`);
-    const value = saved ? JSON.parse(saved) : emptyDraft(state);
+    const value = { ...emptyDraft(state, model.settings), ...(saved ? JSON.parse(saved) : {}) };
     setSelectedItems(state.can_edit && value.selected_items ? value.selected_items : itemKeys);
     draftRef.current = value;
     setDraft(value);
@@ -426,6 +474,7 @@ function WorkflowApp() {
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
         body: JSON.stringify({ action, data, request_id: crypto.randomUUID(), session_id: id, revision: current.sessions[id]?.revision }) }).then(readResponse);
       if (action === "collect" && !id && epoch === viewEpoch.current) {
+        changeDraft({ codex: { model: current.settings.model, reasoning_effort: current.settings.reasoning_effort } });
         lastSession.current = result.session_id;
         sessionStorage.setItem("workflow-session", result.session_id);
         sessionStorage.setItem(`workflow-draft:${result.session_id}`, JSON.stringify(draftRef.current));
@@ -438,9 +487,9 @@ function WorkflowApp() {
     finally { setRequestsPending(previous => { const next = { ...previous }; delete next[pendingKey]; return next; }); }
   }
   async function startPlan() {
-    if (!selectionMatches || busy || imageQueues.current[state.id]?.tasks.length) return;
+    if (!selectionMatches || busy || imageQueues.current[state.id]?.tasks.length || (!state.codex && !sessionSelection)) return;
     const id = state.id;
-    if (await act("plan", { supplement: draft.supplement }) && modelRef.current.selectedSessionId === id) navigate("plan");
+    if (await act("plan", { ...(state.codex || sessionSelection), supplement: draft.supplement }) && modelRef.current.selectedSessionId === id) navigate("plan");
   }
   async function answer() {
     const questions = state?.pending?.params?.questions || [];
@@ -642,14 +691,26 @@ function WorkflowApp() {
                     const queue = imageQueues.current[state.id]; queue.tasks = queue.tasks.filter(entry => entry.uid !== task.uid); publishImageTransfers();
                   } }, "移除")))))),
           transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再开始计划。"),
-          ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "优先复用目标分支或切换空闲目录，已有改动保留且不提交"),
-            h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0, onClick: startPlan }, "开始需求分析与计划"))));
+          ["资料已读取", "准备工作区失败"].includes(stage) && !state.codex && h(CodexSelection, {
+            key: state.id, value: draft.codex, disabled: !editable, onReady: setSessionSelection,
+            onChange: codex => changeDraft({ codex }) }),
+          state.codex && h(Typography.Paragraph, { type: "secondary" }, `会话模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
+          ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "开始后固定模型与推理强度；已有改动保留且不提交"),
+            h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0 || (!state.codex && !sessionSelection), onClick: startPlan }, "开始需求分析与计划"))));
   }
 
   function renderPlan() {
     if (!state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "先选择工作项并等待读取完成，再开始需求分析与计划" }));
+    if (!state.codex && !["资料已读取", "资料读取失败"].includes(stage)) return h(CardBox, { title: "确认历史会话的模型配置" },
+      h(Typography.Paragraph, null, "该历史会话未保存模型与推理强度。请选择一次，保存后按原阶段继续。"),
+      h(CodexSelection, { key: state.id, value: draft.codex, disabled: busy, onReady: setSessionSelection, onChange: codex => changeDraft({ codex }) }),
+      h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy || !sessionSelection,
+        onClick: () => act("configure_codex", sessionSelection) }, "保存会话模型配置"),
+      h(Button, { disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段")));
     if (state.phase === "branch" || !state.repos.length) return h("div", { className: "card-stack" }, renderBranches(),
-      h(CardBox, { title: "流程操作" }, h(Space, null,
+      h(CardBox, { title: "流程操作" },
+        state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
+        h(Space, null,
         h(Button, { disabled: stopped || !ACTIVE.has(stage), onClick: () => act("pause") }, "暂停当前阶段"),
         h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"))));
     const questions = state.pending?.params?.questions || [];
@@ -659,6 +720,7 @@ function WorkflowApp() {
       h("div", { className: "card-stack" },
         renderBranches(),
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
+        state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           h("div", { className: "conversation-feed", ref: feedRef }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
             entries.map((entry, index) => h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: index },
               h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time))), h("div", { className: "chat-body" }, entry.text))),
@@ -726,11 +788,15 @@ function WorkflowApp() {
           h(Form.Item, { name: "base_url", label: "禅道地址", rules: [{ required: true, message: "请填写禅道地址" }] }, h(Input, { autoComplete: "off" })),
           h(Form.Item, { name: "account", label: "登录账号", rules: [{ required: true, message: "请填写账号" }] }, h(Input, { autoComplete: "off" })),
           h(Form.Item, { name: "password", label: "登录密码", extra: "留空保持已保存值；填写后使用本机加密保存" }, h(Input.Password, { autoComplete: "new-password", placeholder: "不回显已保存的密码" })),
-          h(Form.Item, { name: "model", label: "模型标识", extra: "留空沿用本机 Codex 配置" }, h(Input, { placeholder: "沿用 Codex 配置", autoComplete: "off" })),
           h(Form.Item, { name: "max_fix_rounds", label: "默认修复轮次上限", rules: [{ required: true, message: "请填写轮次" }] }, h(InputNumber, { min: 0, precision: 0, className: "full-width" }))),
+        h(Form.Item, { name: "model", hidden: true }, h(Input)),
+        h(Form.Item, { name: "reasoning_effort", hidden: true }, h(Input)),
+        h(Form.Item, { label: "新会话默认模型", extra: "开始会话前可单独调整，已开始的会话保持原配置。" },
+          h(CodexSelection, { value: { model: settingsModel ?? "", reasoning_effort: settingsEffort ?? "" }, disabled: !editable || busy,
+            onReady: setSettingsSelection, onChange: values => settingsForm.setFieldsValue(values) })),
         h(Form.Item, { name: "review_prompt", label: "固定 Review 提示词", rules: [{ required: true, message: "请填写固定 Review 提示词" }] }, h(Input.TextArea, { rows: 5 })),
         h(Descriptions, { size: "small", column: 1, items: [{ key: "feishu", label: "飞书文档", children: "第一版暂不读取" }, ...model.settings.repositories.map(repository => ({ key: repository.name, label: `${repository.name}仓库`, children: repository.path }))] }),
-        h("div", { className: "action-bar" }, h(Button, { type: "primary", htmlType: "submit", loading: model.busy === "settings" }, "保存设置"))),
+        h("div", { className: "action-bar" }, h(Button, { type: "primary", htmlType: "submit", disabled: !settingsSelection, loading: model.busy === "settings" }, "保存设置"))),
       h(Divider), h("div", { className: "data-foot", style: { border: 0, paddingTop: 0 } }, h("span", { className: "muted" }, "停止服务会保存记录，并暂停正在执行的阶段。"),
         h(Button, { danger: true, disabled: stopped || sending === "shutdown", onClick: stopService }, "暂停并停止本地服务")));
   }

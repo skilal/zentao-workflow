@@ -35,6 +35,7 @@ class AutoDeliveryChecks(TestCase):
         self.addCleanup(self.flow.close)
         self.state = self.flow.store.new({"kind": "task", "id": 7, "title": "自动交付"})
         self.flow.state = self.state
+        self.state["codex"] = {"model": "模拟模型", "reasoning_effort": "high"}
         self.state.update(snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []},
                           thread_id="会话", prepare_complete=True, max_fix_rounds=3)
         self.flow.rpc = Mock()

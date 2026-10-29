@@ -35,6 +35,7 @@ class ProjectPartitionChecks(TestCase):
 
     def add_session(self, project_id=41):
         state = self.application.sessions.store.new(self.application.items[0])
+        state["codex"] = {"model": "示例模型", "reasoning_effort": "high"}
         state["snapshot"] = {"project": {"id": project_id, "name": "同名项目", "candidates": []},
                              "sources": [{"raw": {"project": project_id}, "material_ids": []}],
                              "materials": [], "blockers": [], "feishu_links": []}
