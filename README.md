@@ -16,7 +16,9 @@ Set-Location -LiteralPath '.\zentao-codex-workflow'
 Copy-Item -LiteralPath '.\settings.example.json' -Destination '.\settings.json'
 ```
 
-在 `settings.json` 中填写禅道地址、账号及实际仓库路径，并确认 `codex.command` 对应本机可用的 Codex CLI。示例使用 Windows 的 `codex.cmd app-server`；密码在启动后的“工作流设置”中保存。已有本地配置时直接使用，不要再次复制模板覆盖。
+在 `settings.json` 中填写禅道地址、账号及实际仓库路径，并确认 `codex.command` 对应本机可用的 Codex CLI。示例使用 Windows 的 `["codex.cmd"]`，`app-server --listen stdio://` 由程序统一追加，不要写入配置。密码在启动后的“工作流设置”中保存。已有本地配置时直接使用，不要再次复制模板覆盖。
+
+若提示“找不到配置中的 Codex 命令”，在能使用 Codex 的 PowerShell 中执行 `(Get-Command codex).Source`，将实际可执行文件的绝对路径填入 `codex.command` 的第一个元素，例如 `["C:/实际安装目录/codex.exe"]`，保存后重启本地服务。网页设置不提供命令路径编辑。短命令名只从服务进程继承的 `PATH` 查找，可能与终端环境不同；安装位置改变后需更新该路径。
 
 启动已有项目：
 

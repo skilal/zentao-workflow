@@ -1,8 +1,10 @@
 """补充图片的会话隔离、接口约束、持久化与分析输入。"""
 
 from base64 import b64decode
+from email.message import Message
 from hashlib import sha256
 from http.client import HTTPConnection
+from io import BytesIO
 from json import dumps, loads
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,7 +15,7 @@ from urllib.parse import urlencode
 
 from workflow.mcp_server import Tools
 from workflow.settings import ROOT, WorkflowError
-from workflow.web import COOKIE_NAME, LocalServer, WebApplication, public_state
+from workflow.web import COOKIE_NAME, LocalServer, WebApplication, WebHandler, public_state
 
 
 PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=")
@@ -197,6 +199,33 @@ class SupplementImageHttpChecks(SupplementImageFixture):
         url = self.upload_url()
         self.assertEqual(self.request("POST", url, PNG)[0], 200)
         self.assertEqual(self.request("POST", url, PNG)[0], 400)
+
+    def test_rejected_requests_consume_bounded_body_before_responding_without_upload(self):
+        for path, body in ((self.upload_url(), PNG), ("/api/actions", b'{"action":"connect"}')):
+            for invalid in ({"Cookie": ""}, {"X-Workflow-Token": "invalid-token"}, {"Origin": "https://other.invalid"}):
+                with self.subTest(path=path, headers=list(invalid)):
+                    handler = object.__new__(WebHandler)
+                    handler.server, handler.path, handler.command = self.server, path, "POST"
+                    handler.headers = Message()
+                    for name, value in {"Host": f"127.0.0.1:{self.server.server_port}",
+                                        "Cookie": f"{COOKIE_NAME}={self.application.cookie_token}",
+                                        "X-Workflow-Token": self.application.csrf_token,
+                                        "Content-Length": str(len(body)), **invalid}.items():
+                        handler.headers[name] = value
+                    handler.rfile = BytesIO(body)
+                    handler._json = Mock(side_effect=lambda *_: self.assertEqual(handler.rfile.tell(), len(body)))
+                    with patch.object(self.application, "upload_supplement_image") as upload, \
+                         patch.object(self.application, "dispatch") as dispatch:
+                        handler.do_POST()
+                    self.assertEqual(handler._json.call_args.args[0], 400)
+                    upload.assert_not_called()
+                    dispatch.assert_not_called()
+
+    def test_repeated_unauthorized_uploads_keep_error_responses_readable(self):
+        for attempt in range(10):
+            for headers in ({"Cookie": ""}, {"X-Workflow-Token": "invalid-token"}, {"Origin": "https://other.invalid"}):
+                with self.subTest(attempt=attempt, headers=list(headers)):
+                    self.assertEqual(self.request("POST", self.upload_url(), PNG, **headers)[0], 400)
 
     def test_http_enforces_size_before_reading_body(self):
         self.settings["zentao"]["max_attachment_mb"] = 1

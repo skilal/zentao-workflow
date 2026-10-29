@@ -781,19 +781,23 @@ class WebHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(error)})
 
     def do_POST(self):
+        unread_length = 0
         try:
-            self._check(authenticated=True)
             application = self.server.application
+            parsed = urlparse(self.path)
+            image_upload = parsed.path == "/api/supplement-images"
+            length = int(self.headers.get("Content-Length", "0"))
+            maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024 if image_upload else 1024 * 1024
+            if not 0 < length <= maximum:
+                self.close_connection = True
+                raise WorkflowError("图片为空或超过配置的附件大小上限。" if image_upload else "请求内容为空或超过大小限制。")
+            unread_length = length
+            self._check(authenticated=True)
             if not compare_digest(self.headers.get("X-Workflow-Token", ""), application.csrf_token):
                 raise WorkflowError("操作凭据无效，请刷新页面后重试。")
-            parsed = urlparse(self.path)
-            if parsed.path == "/api/supplement-images":
+            if image_upload:
                 query = parse_qs(parsed.query)
-                length = int(self.headers.get("Content-Length", "0"))
-                maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
-                if not 0 < length <= maximum:
-                    self.close_connection = True
-                    raise WorkflowError("图片为空或超过配置的附件大小上限。")
+                unread_length = 0
                 data = self.rfile.read(length)
                 if len(data) != length:
                     raise WorkflowError("图片传输不完整，请重新上传。")
@@ -802,9 +806,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 return
             if self.headers.get_content_type() != "application/json":
                 raise WorkflowError("操作必须使用 JSON 请求。")
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 1024 * 1024:
-                raise WorkflowError("请求内容为空或超过大小限制。")
+            unread_length = 0
             data = loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(data, dict):
                 raise WorkflowError("请求格式无效。")
@@ -824,6 +826,9 @@ class WebHandler(BaseHTTPRequestHandler):
             else:
                 self._json(404, {"error": "接口不存在。"})
         except (WorkflowError, ValueError, OSError, KeyError) as error:
+            # 拒绝的请求也消费完限额内的请求体，避免关闭连接时因未读数据触发 TCP 中断。
+            if unread_length:
+                self.rfile.read(unread_length)
             self._json(400, {"error": str(error)})
 
     def _material(self, query):

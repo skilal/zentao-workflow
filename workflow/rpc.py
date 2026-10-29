@@ -42,7 +42,8 @@ class AppServer:
         command = list(self.settings["codex"]["command"])
         executable = which(command[0])
         if not executable:
-            raise WorkflowError("找不到配置中的 Codex 命令，请在设置中填写已安装命令的路径。")
+            raise WorkflowError("找不到配置中的 Codex 命令。请编辑 settings.json 的 codex.command，"
+                                "将第一个元素设为本机 Codex 可执行文件的绝对路径，保存后重启本地服务。")
         command[0] = executable
         command += ["-c", "features.shell_tool=false", "-c", "features.hooks=false",
                     "-c", "features.multi_agent=false", "-c", "features.apps=false", "-c", "features.goals=false",
