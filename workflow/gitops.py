@@ -1,15 +1,20 @@
 """分支元数据、独立工作区和本地提交；不执行项目脚本。"""
 
 from hashlib import sha256
+from contextlib import ExitStack
+from functools import wraps
 from os import environ
 from pathlib import Path, PureWindowsPath
 from subprocess import CREATE_NO_WINDOW, PIPE, run
+from threading import Lock, RLock
 
 from workflow.settings import WorkflowError
 
 
 HOOK_NAMES = ("post-checkout", "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "pre-auto-gc",
               "post-index-change", "reference-transaction")
+REPOSITORY_LOCKS = {}
+LOCK_REGISTRY = Lock()
 
 
 def git(repository, *arguments, optional=False, binary=False):
@@ -21,6 +26,37 @@ def git(repository, *arguments, optional=False, binary=False):
     if process.returncode and not optional:
         raise WorkflowError("Git 操作停止：" + process.stderr.decode("utf-8", errors="replace").strip())
     return process.stdout if binary else process.stdout.decode("utf-8", errors="replace").strip()
+
+
+def repository_lock(repository):
+    root = Path(repository).resolve()
+    common = Path(git(root, "rev-parse", "--git-common-dir"))
+    common = (root / common).resolve() if not common.is_absolute() else common.resolve()
+    with LOCK_REGISTRY:
+        return REPOSITORY_LOCKS.setdefault(str(common).casefold(), RLock())
+
+
+def locked_repository(operation):
+    @wraps(operation)
+    def locked(repository, *args, **kwargs):
+        path = repository["path"] if isinstance(repository, dict) else repository
+        with repository_lock(path):
+            return operation(repository, *args, **kwargs)
+    return locked
+
+
+def worktrees(repository):
+    output = git(repository, "worktree", "list", "--porcelain", "-z", binary=True)
+    result = []
+    for record in output.split(b"\0\0"):
+        entry = {}
+        for field in record.split(b"\0"):
+            key, _, value = field.decode("utf-8").partition(" ")
+            if key:
+                entry[key] = value
+        if "worktree" in entry:
+            result.append(entry)
+    return result
 
 
 def branches(repository):
@@ -48,6 +84,7 @@ def branch_catalog(repository):
     return sorted(result.values(), key=lambda entry: entry["name"])
 
 
+@locked_repository
 def refresh_branches(repository):
     reject_hooks(repository["path"])
     git(repository["path"], "fetch", "--no-tags", "--", repository["remote"])
@@ -75,12 +112,18 @@ def reject_hooks(repository):
                             "。按禁止运行验证的规范停止；不会自动禁用钩子。")
 
 
+@locked_repository
 def prepare(repository, destination, branch, base, create, track=False):
     repository, destination = Path(repository).resolve(), Path(destination).resolve()
     if not branch.strip() or not base.strip():
         raise WorkflowError("目标分支和代码基准尚未确定。")
     git(repository, "check-ref-format", "--branch", branch)
     reject_hooks(repository)
+    occupied = next((entry for entry in worktrees(repository) if entry.get("branch") == "refs/heads/" + branch), None)
+    if occupied:
+        path = Path(occupied["worktree"])
+        owner = next((path.parts[index + 1] for index, part in enumerate(path.parts[:-1]) if part == "sessions"), "外部工作区")
+        raise WorkflowError(f"分支 {branch} 已被占用：{path}（会话：{owner}）。请切换到该会话或明确选择其他分支。")
     baseline = git(repository, "rev-parse", "--verify", base + "^{commit}")
     configured_hooks = git(repository, "config", "--path", "--get", "core.hooksPath", optional=True)
     if configured_hooks and not Path(configured_hooks).is_absolute():
@@ -159,6 +202,7 @@ def differences(repository):
             "patch": patch, "untracked": [part.decode("utf-8") for part in new_files.split(b"\0") if part]}
 
 
+@locked_repository
 def commit(repository, message, expected_manifest):
     ensure_baseline(repository)
     reject_hooks(repository["path"])
@@ -177,3 +221,66 @@ def commit(repository, message, expected_manifest):
         raise WorkflowError("暂存期间文件发生变化，已停止提交。")
     git(repository["path"], "commit", "-m", message)
     return git(repository["path"], "rev-parse", "HEAD")
+
+
+def cleanup_workspaces(store, state, repositories):
+    """全部预检后逐个移除；每次成功都保存进度，不强制清理代码。"""
+    directory = store.directory(state["id"])
+    workspace = directory / "workspace"
+    if not state["repos"] and not state.get("selections") and not workspace.exists():
+        return
+    sources = {str(Path(entry["path"]).resolve()) for entry in repositories}
+    sources.update(str(Path(entry["source"]).resolve()) for entry in state["repos"])
+    sources.update(str(Path(entry["path"]).resolve()) for entry in state.get("selections", []))
+    removed = state.setdefault("cleanup", {}).setdefault("removed", [])
+    with ExitStack() as stack:
+        for source in sorted(sources, key=str.casefold):
+            stack.enter_context(repository_lock(source))
+        registered = {}
+        for source in sorted(sources, key=str.casefold):
+            reject_hooks(source)
+            for entry in worktrees(source):
+                raw_path = Path(entry["worktree"])
+                path = raw_path.resolve()
+                if path.is_relative_to(directory):
+                    if path.parent != workspace or raw_path.is_symlink() or (raw_path.exists() and getattr(raw_path.lstat(), "st_file_attributes", 0) & 0x400):
+                        raise WorkflowError(f"工作区路径不符合会话目录约束：{raw_path}")
+                    if "locked" in entry or "prunable" in entry:
+                        raise WorkflowError(f"工作区被锁定或注册失效，已停止删除：{path}")
+                    registered[str(path)] = source
+        expected = {str(Path(entry["path"]).resolve()): entry["source"] for entry in state["repos"]}
+        for index, selection in enumerate(state.get("selections", [])):
+            expected.setdefault(str(workspace / f"repo-{index + 1}"), selection["path"])
+        for name, source in expected.items():
+            path = Path(name)
+            if path.parent != workspace:
+                raise WorkflowError(f"工作区不在目标会话内，已停止删除：{path}")
+            if str(path) in removed and not path.exists() and str(path) not in registered:
+                continue
+            if not path.exists() and str(path) not in registered:
+                continue
+            if registered.get(str(path)) != str(Path(source).resolve()):
+                raise WorkflowError(f"工作区与来源仓库的注册信息不匹配：{path}")
+        if workspace.exists():
+            for path in workspace.iterdir():
+                if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
+                    raise WorkflowError(f"工作区目录包含链接：{path}")
+                if path.is_dir() and str(path.resolve()) not in registered:
+                    raise WorkflowError(f"发现未登记的工作区目录，已停止删除：{path}")
+        for name, source in registered.items():
+            path = Path(name)
+            common = Path(git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+            expected_common = Path(git(source, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+            if common != expected_common or not (path / ".git").is_file():
+                raise WorkflowError(f"工作区与来源仓库不匹配：{path}")
+            if git(path, "status", "--porcelain=v1", "--untracked-files=all", "--ignored"):
+                raise WorkflowError(f"工作区存在未提交或未跟踪文件，请处理后再删除：{path}")
+        for name, source in sorted(registered.items()):
+            try:
+                git(source, "worktree", "remove", "--", name)
+            except WorkflowError as error:
+                remaining = [path for path in registered if path not in removed]
+                raise WorkflowError(f"工作区清理停止。已清理：{'、'.join(removed) or '无'}；未清理：{'、'.join(remaining)}。{error}") from None
+            if name not in removed:
+                removed.append(name)
+            store.save(state)

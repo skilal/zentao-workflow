@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from json import dumps, loads
 from re import search
-from threading import RLock
+from threading import Lock, RLock
 
 from workflow.approvals import is_controlled_write
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
@@ -35,11 +35,13 @@ PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "�
 
 
 class Workflow:
-    def __init__(self, settings, emit):
+    def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
         self.emit = emit
-        self.store = SessionStore()
-        self.zentao = ZentaoClient(settings)
+        self.store = store or SessionStore()
+        self.zentao = zentao or ZentaoClient(settings)
+        self.zentao_lock = zentao_lock or RLock()
+        self.settings_lock = settings_lock or RLock()
         self.rpc = None
         self.state = None
         self.lock = RLock()
@@ -52,8 +54,19 @@ class Workflow:
         self.last_message = ""
         self.connection_epoch = 0
         self.closed = False
+        self.job_lock = Lock()
+        self.jobs = 0
+        self.turn_running = False
+
+    def working(self):
+        with self.job_lock:
+            return self.jobs > 0 or self.turn_running
 
     def submit(self, action, *args, affects_session=True, control=False):
+        with self.job_lock:
+            if self.closed:
+                raise WorkflowError("会话已经关闭。")
+            self.jobs += 1
         def work():
             if self.closed:
                 return
@@ -68,7 +81,18 @@ class Workflow:
                             self.state["stage"] = "已停止"
                         self.save()
                 self.emit("error", str(error))
-        return (self.control_executor if control else self.executor).submit(work)
+        try:
+            future = (self.control_executor if control else self.executor).submit(work)
+        except RuntimeError:
+            with self.job_lock:
+                self.jobs -= 1
+            raise
+        def finished(_):
+            with self.job_lock:
+                self.jobs -= 1
+            self.emit("activity", None)
+        future.add_done_callback(finished)
+        return future
 
     def save(self):
         if self.state:
@@ -80,30 +104,42 @@ class Workflow:
         self.emit("message", {"role": role, "text": text})
 
     def connect(self):
-        profile = self.zentao.login()
+        with self.zentao_lock:
+            profile = self.zentao.login()
         self.emit("connected", profile)
         self.refresh()
 
     def refresh(self):
         items = []
-        for kind in ("story", "task", "bug"):
-            items.extend(self.zentao.list_items(kind))
+        with self.zentao_lock:
+            for kind in ("story", "task", "bug"):
+                items.extend(self.zentao.list_items(kind))
         self.emit("items", items)
 
-    def collect(self, item):
-        if self.state and self.state["stage"] in ACTIVE | {"等待人工回答"}:
-            raise WorkflowError("当前会话尚未暂停，不能切换工作项。")
-        self._close_rpc()
-        self.state = self.store.new(item)
+    def collect(self, items):
+        if self.state and not self.editable():
+            raise WorkflowError("开始计划后不能改变工作项，请新建会话。")
+        if not self.state:
+            self.state = self.store.new(items[0])
+        self.state.update(item=items[0], items=items, stage="资料读取中", error="")
+        self.state.pop("snapshot", None)
+        self.save()
         try:
-            self.state["snapshot"] = self.zentao.collect(item, self.store.directory(self.state["id"]))
+            with self.zentao_lock:
+                self.state["snapshot"] = self.zentao.collect_many(items, self.store.directory(self.state["id"]))
             self.state["project"] = self.state["snapshot"]["project"]
+            self.state["stage"] = "资料已读取"
             self.save()
-            self.note("系统", "资料已读取。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
+            self.note("系统", f"已读取 {len(items)} 个工作项的资料，将在同一会话中处理。补充必要说明后开始计划，将自动确定前后端分支；第一版不读取飞书。")
         except Exception:
             self.state["stage"] = "资料读取失败"
             self.save()
             raise
+
+    def editable(self):
+        state = self.state
+        return bool(state and state["stage"] in {"资料已读取", "资料读取失败"}
+                    and not state["repos"] and not state.get("branch_resolution") and not state.get("thread_id"))
 
     def start_plan(self, supplement, manual=False):
         state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支")
@@ -140,7 +176,8 @@ class Workflow:
         state["stage"] = "识别分支中"
         resolution = state["branch_resolution"]
         if not resolution["repositories"]:
-            preferred = saved_branches(self.settings, project)
+            with self.settings_lock:
+                preferred = dict(saved_branches(self.settings, project))
             resolution["repositories"] = [{**repository, "catalog": branch_catalog(repository),
                 "status": "needs_user" if resolution["manual"] else "pending", "branch": "",
                 "reason": "请指定项目常用分支。" if resolution["manual"] else "", "question": "",
@@ -235,11 +272,12 @@ class Workflow:
                 self._select_branch(repository, choices[repository["role"]], "human", "人工确认并保存为项目常用分支。")
         project = state["project"]
         site = self.settings["zentao"]["base_url"].rstrip("/")
-        mapping = self.settings.setdefault("project_branches", {}).setdefault(site, {})
-        saved = mapping.setdefault(str(project["id"]), {"name": project["name"], "branches": {}})
-        saved["name"] = project["name"]
-        saved["branches"].update({entry["role"]: entry["branch"] for entry in repositories if entry["source"] == "human"})
-        save_settings(self.settings)
+        with self.settings_lock:
+            mapping = self.settings.setdefault("project_branches", {}).setdefault(site, {})
+            saved = mapping.setdefault(str(project["id"]), {"name": project["name"], "branches": {}})
+            saved["name"] = project["name"]
+            saved["branches"].update({entry["role"]: entry["branch"] for entry in repositories if entry["source"] == "human"})
+            save_settings(self.settings)
         self.note("用户", "确认项目常用分支：" + "；".join(f"{role}：{name}" for role, name in choices.items()))
         self._advance_branches()
 
@@ -375,15 +413,17 @@ class Workflow:
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
         turn_cwd = session_path if phase == "branch" else session_path / "workspace"
-        context = {"item": state["item"], "supplement": state["supplement"], "plan": state.get("approved_plan"),
+        context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"],
+                   "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
                    "feishu_links": state["snapshot"]["feishu_links"], "decisions": state["decisions"]}
         prompt = ("所有回答使用中文。系统命令、编译、构建、运行验证、依赖安装一律禁止。"
                   "当前阶段由控制器决定。只有 workflow MCP 的受控文件工具允许修改业务文件。"
-                  "需要业务选择或扩大计划范围时必须提问，不得自行决定。\n" + text +
+                  "需要业务选择或扩大计划范围时必须提问，不得自行决定。"
+                  "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。\n" + text +
                   "\n工作流上下文：\n" + dumps(context, ensure_ascii=False))
         if phase == "branch":
-            context = {"project": state["project"], "item": state["item"], "supplement": state["supplement"],
+            context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                        "sources": [{"title": source["title"], "content": source["content"]}
                                    for source in state["snapshot"]["sources"]],
                        "repositories": [{"role": entry["role"], "refreshed": entry["refreshed"], "branches": entry["catalog"]}
@@ -395,6 +435,8 @@ class Workflow:
             for material in state["snapshot"]["materials"]:
                 if material.get("image"):
                     inputs.append({"type": "localImage", "path": material["path"]})
+            for image in state.get("supplement_images", []):
+                inputs.append({"type": "localImage", "path": image["path"]})
         params = {"threadId": state["thread_id"], "input": inputs,
                   "cwd": str(turn_cwd), "approvalPolicy": "on-request",
                   "sandboxPolicy": {"type": "readOnly"},
@@ -402,7 +444,12 @@ class Workflow:
                       "reasoning_effort": self.settings["codex"]["reasoning_effort"], "developer_instructions": None}}}
         if output_schema:
             params["outputSchema"] = output_schema
-        response = self.rpc.request("turn/start", params)
+        self.turn_running = True
+        try:
+            response = self.rpc.request("turn/start", params)
+        except Exception:
+            self.turn_running = False
+            raise
         with self.lock:
             state["turn_id"] = response["turn"]["id"]
             self.save()
@@ -414,7 +461,7 @@ class Workflow:
         state = self.require_state("等待计划确认")
         if not state["plan"] or sha256(state["plan"].encode("utf-8")).hexdigest() != state["plan_hash"]:
             raise WorkflowError("计划内容与待确认版本不一致。")
-        if state["snapshot"]["blockers"] and not state["supplement"].strip():
+        if state["snapshot"]["blockers"] and not state["supplement"].strip() and not state.get("supplement_images"):
             if source == "auto":
                 return
             raise WorkflowError("存在明确的资料缺失，请先补充必要内容，再确认更新后的计划。")
@@ -539,6 +586,11 @@ class Workflow:
         self.save()
         title = str(state["item"]["title"]).replace("\n", " ").replace("\r", " ")[:100]
         message = f"feat(zentao-{state['item']['kind']}-{state['item']['id']}): {title}"
+        items = state.get("items", [state["item"]])
+        if len(items) > 1:
+            ids = ",".join(str(item["id"]) for item in items)
+            title = "；".join(str(item["title"]).replace("\n", " ").replace("\r", " ") for item in items)[:100]
+            message = f"feat(zentao-tasks-{ids}): {title}"
         if state["item"]["kind"] == "bug":
             message = message.replace("feat(", "fix(", 1)
         for repository in pending:
@@ -657,12 +709,14 @@ class Workflow:
             elif item.get("type") == "plan" and item.get("text"):
                 self.completed_plan = item["text"].strip()
         elif method == "turn/started":
+            self.turn_running = True
             with self.lock:
                 self.state["turn_id"] = params["turn"]["id"]
                 self.save()
             if self.state.get("pause_requested"):
                 self.submit(self.pause, control=True)
         elif method == "turn/completed":
+            self.turn_running = False
             turn = params.get("turn", {})
             turn_id = turn.get("id")
             key = (self.state["id"], turn_id)
@@ -670,6 +724,7 @@ class Workflow:
                 self.pending_turns.add(key)
                 self.submit(self._completed, turn, self.state["id"], epoch)
         elif method in ("client/error", "client/disconnected"):
+            self.turn_running = False
             with self.lock:
                 if self.state:
                     self.state["rpc_connected"] = False
@@ -770,14 +825,19 @@ class Workflow:
             self.rpc = None
         if self.state:
             self.state["rpc_connected"] = False
+        self.turn_running = False
 
     def close(self):
         self.closed = True
-        if self.state:
-            self.state["rpc_connected"] = False
-            if self.state["stage"] in ACTIVE:
-                self.state["stage"] = "已暂停"
-            self.store.save(self.state)
-        self._close_rpc()
-        self.executor.shutdown(wait=False, cancel_futures=True)
-        self.control_executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            self._close_rpc()
+        finally:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+            self.control_executor.shutdown(wait=True, cancel_futures=True)
+            if self.state:
+                self.state["rpc_connected"] = False
+                if self.state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}:
+                    self.state["stage"] = "已暂停"
+                    self.state["pending"] = None
+                    self.state["pause_requested"] = True
+                self.store.save(self.state)

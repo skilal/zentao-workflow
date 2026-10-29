@@ -276,6 +276,22 @@ class BranchWorkflowChecks(TestCase):
         with self.assertRaises(WorkflowError):
             configured_repositories(settings)
 
+    def test_branch_and_plan_turns_receive_all_selected_tasks(self):
+        state = self.flow.state
+        state["items"] = [state["item"], {"kind": "task", "id": 8, "title": "示例前端任务"}]
+        self.flow.start_plan("")
+        rpc = Mock()
+        rpc.model, rpc.disabled_mcp = "示例模型", {}
+        rpc.request.side_effect = lambda method, params: {"thread": {"id": "模拟会话"}} if method == "thread/start" else {"turn": {"id": "模拟轮次"}}
+        with patch("workflow.engine.AppServer", return_value=rpc):
+            for phase in ("branch", "plan"):
+                state["phase"] = phase
+                Workflow._start_turn(self.flow, "读取全部任务")
+                text = rpc.request.call_args.args[1]["input"][0]["text"]
+                self.assertIn('"items":', text)
+                self.assertIn("示例后端任务", text)
+                self.assertIn("示例前端任务", text)
+
     def test_second_repository_read_failure_cannot_leave_a_one_repository_resolution(self):
         def catalog(repository):
             if repository["role"] == "backend":

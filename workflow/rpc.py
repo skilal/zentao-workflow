@@ -9,7 +9,7 @@ from queue import Empty, Queue
 from shutil import which
 from subprocess import CREATE_NO_WINDOW, PIPE, Popen, TimeoutExpired, list2cmdline
 from sys import executable as python_executable
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, current_thread
 
 from workflow.branching import BRANCH_INSTRUCTIONS
 from workflow.settings import ROOT, WorkflowError
@@ -31,6 +31,8 @@ class AppServer:
         self.stderr_ready = Event()
         self.initialized = False
         self.disabled_mcp = {}
+        self.reader = None
+        self.stderr_reader = None
 
     def start(self):
         if self.process and self.process.poll() is None:
@@ -53,8 +55,10 @@ class AppServer:
         self.process = Popen(command, cwd=ROOT, stdin=PIPE, stdout=PIPE, stderr=PIPE,
                              text=True, encoding="utf-8", errors="strict", bufsize=1,
                              creationflags=CREATE_NO_WINDOW)
-        Thread(target=self._read, daemon=True).start()
-        Thread(target=self._stderr, daemon=True).start()
+        self.reader = Thread(target=self._read, daemon=True)
+        self.stderr_reader = Thread(target=self._stderr, daemon=True)
+        self.reader.start()
+        self.stderr_reader.start()
         self.request("initialize", {"clientInfo": {"name": "zentao_local_workflow", "version": "0.1.0"},
                                     "capabilities": {"experimentalApi": True}})
         self.notify("initialized", {})
@@ -142,6 +146,12 @@ class AppServer:
                 self.process.wait(timeout=3)
             except (OSError, TimeoutExpired):
                 self.process.terminate()
+                self.process.wait(timeout=3)
+        for thread in (self.reader, self.stderr_reader):
+            if thread and thread is not current_thread():
+                thread.join(timeout=3)
+                if thread.is_alive():
+                    raise WorkflowError("Codex 通道仍未退出，已停止清理会话。")
 
 
 def thread_parameters(state, model, disabled_mcp):

@@ -229,28 +229,41 @@ class ZentaoClient:
         return data
 
     def collect(self, item, directory):
-        primary = self.detail(item["kind"], item["id"])
-        project = project_context({**item, "projects": item.get("project_candidates", [])}, primary)
-        if project["id"] and not project["name"]:
-            data = self._fetch(f"api.php/v1/projects/{project['id']}")
-            if identifier(data.get("id")) != project["id"] or not data.get("name"):
-                raise WorkflowError("所属项目信息不符合预期。")
-            project["name"] = data["name"]
-            project["candidates"] = [{"id": project["id"], "name": project["name"]}]
-        related = []
-        story_id = identifier(primary.get("story"))
-        from_bug = identifier(primary.get("fromBug"))
-        if item["kind"] == "task" and not from_bug and story_id:
-            related.append({"kind": "story", "origin": "task", "version": primary.get("storyVersion"),
-                            "data": {"id": story_id, "title": primary.get("storyTitle", ""),
-                                     "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
-                                     "files": primary.get("storyFiles", [])}})
-        elif item["kind"] != "story" and story_id:
-            related.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
-        if item["kind"] == "task" and from_bug:
-            related.append({"kind": "bug", "data": self.detail("bug", from_bug, require_assignee=False)})
-        materials, sources, blockers, feishu = [], [], [], []
-        documents = [{"kind": item["kind"], "data": primary}] + related
+        return self.collect_many([item], directory)
+
+    def collect_many(self, items, directory):
+        documents, projects = [], []
+        for item in items:
+            primary = self.detail(item["kind"], item["id"])
+            project = project_context({**item, "projects": item.get("project_candidates", [])}, primary)
+            if project["id"] and not project["name"]:
+                data = self._fetch(f"api.php/v1/projects/{project['id']}")
+                if identifier(data.get("id")) != project["id"] or not data.get("name"):
+                    raise WorkflowError("所属项目信息不符合预期。")
+                project["name"] = data["name"]
+                project["candidates"] = [{"id": project["id"], "name": project["name"]}]
+            projects.append(project)
+            documents.append({"kind": item["kind"], "data": primary, "selected": True})
+            story_id = identifier(primary.get("story"))
+            from_bug = identifier(primary.get("fromBug"))
+            if item["kind"] == "task" and not from_bug and story_id:
+                documents.append({"kind": "story", "origin": "task", "version": primary.get("storyVersion"),
+                                  "data": {"id": story_id, "title": primary.get("storyTitle", ""),
+                                           "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
+                                           "files": primary.get("storyFiles", [])}})
+            elif item["kind"] != "story" and story_id:
+                documents.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
+            if item["kind"] == "task" and from_bug:
+                documents.append({"kind": "bug", "data": self.detail("bug", from_bug, require_assignee=False)})
+        project = projects[0]
+        if len(projects) > 1:
+            known = [{entry["id"] for entry in value["candidates"]} for value in projects if value["candidates"]]
+            common = set.intersection(*known) if known else set()
+            if known and not common:
+                raise WorkflowError("所选任务没有共同的所属项目，请选择同一项目的任务联合开发。")
+            candidates = {entry["id"]: entry for value in projects for entry in value["candidates"] if entry["id"] in common}
+            project = project_context({"projects": list(candidates.values())})
+        materials, sources, blockers, feishu, seen = {}, [], [], [], set()
         for document in documents:
             data = document["data"]
             content = []
@@ -259,14 +272,14 @@ class ZentaoClient:
                 if data.get(key):
                     parsed = parse_description(data[key])
                     parsers.append(parsed)
-                    if item["kind"] != "task" or parsed.text() or parsed.images:
+                    if items[0]["kind"] != "task" or parsed.text() or parsed.images:
                         content.append(f"【{key}】\n{parsed.text()}")
             source = {"kind": document["kind"], "id": data["id"],
                       "title": data.get("title", data.get("name", "")),
-                      "content": "\n\n".join(content), "raw": data}
+                      "content": "\n\n".join(content), "raw": data, "selected": document.get("selected", False),
+                      "material_ids": []}
             if document.get("origin") == "task":
                 source.update(origin="task", version=document["version"], note="来自任务详情的关联需求资料")
-            sources.append(source)
             image_urls = {unescape(url) for parser in parsers for url in parser.images}
             links = {unescape(url) for parser in parsers for url in parser.links}
             feishu.extend(sorted(url for url in links if urlparse(url).hostname and
@@ -277,7 +290,9 @@ class ZentaoClient:
             for file in files:
                 file_id = identifier(file.get("id"))
                 extension = str(file.get("extension", "")).lower().lstrip(".")
-                materials.append(self._download(file_id, extension, str(file.get("title", file_id)), directory))
+                source["material_ids"].append(file_id)
+                if file_id not in materials:
+                    materials[file_id] = self._download(file_id, extension, str(file.get("title", file_id)), directory)
             for image_url in sorted(image_urls):
                 parsed_url = urlparse(urljoin(self.base, image_url))
                 if parsed_url.netloc != urlparse(self.base).netloc:
@@ -285,15 +300,22 @@ class ZentaoClient:
                     continue
                 query = parse_qs(parsed_url.query)
                 if "fileID" in query:
-                    materials.append(self._download(identifier(query["fileID"][0]), query.get("t", ["png"])[0], "正文图片", directory))
+                    file_id = identifier(query["fileID"][0])
+                    source["material_ids"].append(file_id)
+                    if file_id not in materials:
+                        materials[file_id] = self._download(file_id, query.get("t", ["png"])[0], "正文图片", directory)
                 else:
                     blockers.append("正文图片未包含可识别的禅道 fileID：" + image_url)
-        unique = {material["file_id"]: material for material in materials}
+            source["material_ids"] = list(dict.fromkeys(source["material_ids"]))
+            key = (source["kind"], source["id"], source.get("version"), source["content"], tuple(source["material_ids"]))
+            if key not in seen:
+                sources.append(source)
+                seen.add(key)
         if not any(source["content"].strip() for source in sources):
             blockers.append("工作项和已关联资料没有有效描述，需要补充实现目标和验收标准。")
-        blockers.extend(material["issue"] for material in unique.values() if material.get("issue"))
-        return {"item": item, "project": project, "sources": sources, "materials": list(unique.values()),
-                "blockers": blockers, "feishu_links": sorted(set(feishu)),
+        blockers.extend(material["issue"] for material in materials.values() if material.get("issue"))
+        return {"item": items[0], "items": items, "project": project, "sources": sources, "materials": list(materials.values()),
+                "blockers": list(dict.fromkeys(blockers)), "feishu_links": sorted(set(feishu)),
                 "feishu_note": "飞书链接未读取；若含必要规则，必须由用户补充。"}
 
     def _download(self, file_id, extension, title, directory):

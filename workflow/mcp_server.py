@@ -77,7 +77,8 @@ class Tools:
     def call(self, name, arguments):
         state = self.store.load(self.session_id)
         if name == "task_context":
-            return {key: state.get(key) for key in ("item", "project", "snapshot", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "decisions", "phase", "stage")}
+            return {**{key: state.get(key) for key in ("item", "items", "project", "snapshot", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "decisions", "phase", "stage")},
+                    "supplement_images": state.get("supplement_images", [])}
         repositories = {repository["name"]: repository for repository in state["repos"]}
         repository = repositories.get(arguments.get("repository"))
         if repository is None:

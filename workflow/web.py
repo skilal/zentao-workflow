@@ -1,6 +1,7 @@
 """本机网页接口：复用工作流引擎，浏览器断开不结束后台会话。"""
 
 from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from difflib import unified_diff
 from http.cookies import SimpleCookie
@@ -11,14 +12,15 @@ from os import getpid
 from pathlib import Path
 from secrets import compare_digest, token_urlsafe
 from threading import Condition, RLock, Thread, Timer
-from time import monotonic
 from urllib.parse import parse_qs, quote, unquote, urlparse
+from uuid import uuid4
 from webbrowser import open as open_browser
 
-from workflow.engine import ACTIVE, Workflow
-from workflow.gitops import branches, differences, safe_file
+from workflow.engine import ACTIVE
+from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
+from workflow.sessions import SessionManager
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
-from workflow.zentao import KINDS, ZentaoClient
+from workflow.zentao import KINDS, ZentaoClient, identifier, parse_description
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -29,13 +31,26 @@ def public_state(state):
     if state is None:
         return None
     result = deepcopy(state)
+    result.setdefault("supplement_images", [])
     for source in result.get("snapshot", {}).get("sources", []):
-        source.pop("raw", None)
+        raw = source.pop("raw", {})
+        # 旧会话没有资料归属字段，从已保存的原始正文恢复图片和附件的关联。
+        if "material_ids" not in source:
+            files = raw.get("files", [])
+            if isinstance(files, dict):
+                files = files.values()
+            material_ids = [identifier(file.get("id")) for file in files]
+            for field in ("spec", "verify", "desc", "steps", "bugSteps"):
+                for url in parse_description(raw.get(field)).images:
+                    query = parse_qs(urlparse(url).query)
+                    if "fileID" in query:
+                        material_ids.append(identifier(query["fileID"][0]))
+            source["material_ids"] = list(dict.fromkeys(material_ids))
     return result
 
 
 def history_summary(state):
-    return {key: state.get(key) for key in ("id", "item", "stage", "updated_at", "fix_round", "commits")}
+    return {key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")}
 
 
 class WebApplication:
@@ -46,26 +61,29 @@ class WebApplication:
         self.events = deque()
         self.event_bytes = 0
         self.sequence = 0
-        self.revision = 0
         self.cookie_token = token_urlsafe(32)
         self.csrf_token = token_urlsafe(32)
         self.items = []
-        self.state = None
-        self.stream = ""
         self.connected = False
         self.profile = None
         self.busy = None
         self.requests = OrderedDict()
         self.server = None
         self.closed = False
-        self.engine = Workflow(self.settings, self.emit)
+        self.sessions = SessionManager(self.settings, self.emit)
+        self.management_executor = ThreadPoolExecutor(max_workers=1)
         self.pointer = LOCAL / "current-session.json"
+        self.default_session_id = None
         if self.pointer.is_file():
             pointer = loads(self.pointer.read_text(encoding="utf-8"))
-            self.engine.restore(pointer["id"])
+            if pointer["id"] in self.sessions.runtimes:
+                self.default_session_id = pointer["id"]
 
     def _publish(self, kind, value):
         self.sequence += 1
+        if isinstance(value, dict) and value.get("session_id") in self.sessions.runtimes:
+            self.sessions.runtimes[value["session_id"]].event_cursor = self.sequence
+            value = {**value, "event_cursor": self.sequence}
         packet = f"id: {self.sequence}\nevent: {kind}\ndata: {dumps(value, ensure_ascii=False)}\n\n".encode("utf-8")
         self.events.append((self.sequence, packet))
         self.event_bytes += len(packet)
@@ -73,20 +91,34 @@ class WebApplication:
             self.event_bytes -= len(self.events.popleft()[1])
         self.condition.notify_all()
 
-    def emit(self, kind, value):
+    def session_payload(self, runtime):
+        state = public_state(runtime.engine.state)
+        state["can_edit"] = runtime.engine.editable() and not runtime.engine.closed and not state.get("cleanup", {}).get("finalizing")
+        return {"session_id": state["id"], "state": state, "revision": runtime.revision,
+                "event_cursor": runtime.event_cursor, "stream": runtime.stream,
+                "busy": runtime.busy, "working": runtime.engine.working(),
+                "directory": str(self.sessions.store.directory(state["id"])),
+                "workspaces": sorted({entry["path"] for entry in state["repos"]} |
+                    {str(self.sessions.store.directory(state["id"]) / "workspace" / f"repo-{index + 1}")
+                     for index, _ in enumerate(state.get("selections", []))})}
+
+    def summary(self, runtime):
+        return {**history_summary(runtime.engine.state), "busy": runtime.busy,
+                "working": runtime.engine.working(), "deleting": runtime.deleting}
+
+    def emit(self, session_id, kind, value):
         with self.condition:
             if self.closed:
                 return
+            runtime = self.sessions.runtimes.get(session_id) if session_id else None
+            if session_id and (not runtime or runtime.deleting):
+                return
             if kind == "state":
-                old = self.state
-                self.state = public_state(value)
-                self.revision += 1
-                if not old or old["id"] != value["id"] or old.get("turn_id") != value.get("turn_id"):
-                    self.stream = ""
-                temporary = self.pointer.with_suffix(".json.tmp")
-                temporary.write_text(dumps({"id": value["id"]}), encoding="utf-8")
-                temporary.replace(self.pointer)
-                self._publish("state", {"state": self.state, "revision": self.revision, "stream": self.stream})
+                runtime.revision += 1
+                if getattr(runtime, "turn_id", None) != value.get("turn_id"):
+                    runtime.stream = ""
+                runtime.turn_id = value.get("turn_id")
+                self._publish("state", self.session_payload(runtime))
             elif kind == "items":
                 self.items = deepcopy(value)
                 self._publish("items", self.items)
@@ -94,37 +126,100 @@ class WebApplication:
                 self.connected, self.profile = True, value
                 self._publish("connected", value)
             elif kind == "delta":
-                self.stream += value
-                self._publish("delta", value)
+                runtime.stream += value
+                self._publish("delta", {"session_id": session_id, "delta": value})
             elif kind in ("message", "history"):
-                self.state = public_state(self.engine.state)
                 if kind == "message" and value["role"] in ("控制器", "Codex"):
-                    self.stream = ""
-                self._publish("conversation", {"state": self.state, "stream": self.stream})
+                    runtime.stream = ""
+                self._publish("conversation", self.session_payload(runtime))
             elif kind == "error":
-                if not self.engine.zentao.token:
+                if not self.sessions.zentao.token:
                     self.connected = False
-                self._publish("operation_error", {"message": value, "connected": self.connected})
+                self._publish("operation_error", {"session_id": session_id, "message": value, "connected": self.connected})
             elif kind == "questions":
-                self._publish("questions", value)
+                self._publish("questions", {"session_id": session_id, "questions": value})
+            elif kind == "activity" and runtime:
+                self._publish("busy", self.session_payload(runtime))
 
     def public_settings(self):
         return {"base_url": self.settings["zentao"]["base_url"], "account": self.settings["zentao"]["account"],
                 "model": self.settings["codex"]["model"], "max_fix_rounds": self.settings["review"]["max_fix_rounds"],
+                "max_attachment_mb": self.settings["zentao"]["max_attachment_mb"],
                 "review_prompt": (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(),
                 "repositories": deepcopy(self.settings["repositories"]), "feishu_enabled": False}
 
     def snapshot(self):
         with self.lock:
-            return {"state": deepcopy(self.state), "items": deepcopy(self.items), "stream": self.stream,
+            return {"items": deepcopy(self.items), "default_session_id": self.default_session_id,
                     "connected": self.connected, "profile": self.profile, "busy": self.busy,
-                    "revision": self.revision, "cursor": self.sequence, "settings": self.public_settings(),
-                    "history": [history_summary(state) for state in self.engine.store.sessions()]}
+                    "cursor": self.sequence, "settings": self.public_settings(),
+                    "sessions": {session_id: self.session_payload(runtime) for session_id, runtime in self.sessions.runtimes.items()},
+                    "history": sorted((self.summary(runtime) for runtime in self.sessions.runtimes.values()),
+                                      key=lambda entry: (entry["updated_at"], entry["id"]), reverse=True)}
+
+    def session(self, session_id):
+        with self.lock:
+            return self.session_payload(self.sessions.get(session_id))
+
+    def _supplement_runtime(self, session_id, revision):
+        runtime = self.sessions.get(session_id)
+        state = runtime.engine.state
+        if self.closed or self.busy == "settings" or runtime.busy or runtime.engine.working():
+            raise WorkflowError("该会话正在执行操作，请等待完成后修改图片。")
+        if (runtime.engine.closed or state["stage"] not in {"资料已读取", "准备工作区失败"}
+                or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
+            raise WorkflowError("当前阶段不能修改补充图片。")
+        if type(revision) is not int or revision != runtime.revision:
+            raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再操作。")
+        return runtime
+
+    def upload_supplement_image(self, session_id, revision, name, data):
+        with self.condition:
+            runtime = self._supplement_runtime(session_id, revision)
+            maximum = self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
+            if not isinstance(name, str) or not name.strip() or not 0 < len(data) <= maximum:
+                raise WorkflowError("图片名称不能为空，单张大小不能超过配置的附件上限。")
+            extension = Path(name).suffix.lower().lstrip(".")
+            signatures = {
+                "png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                "jpg": data.startswith(b"\xff\xd8\xff"),
+                "jpeg": data.startswith(b"\xff\xd8\xff"),
+                "gif": data.startswith((b"GIF87a", b"GIF89a")),
+                "webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP",
+                "bmp": data.startswith(b"BM"),
+            }
+            if not signatures.get(extension):
+                raise WorkflowError("请选择格式与内容一致的 PNG、JPEG、GIF、WebP 或 BMP 图片。")
+            image_id = uuid4().hex
+            path = self.sessions.store.directory(session_id) / "attachments" / "supplement" / f"{image_id}.{extension}"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            image = {"id": image_id, "name": name, "extension": extension, "size": len(data),
+                     "path": str(path), "content_type": guess_type(path.name)[0]}
+            runtime.engine.state.setdefault("supplement_images", []).append(image)
+            runtime.engine.save()
+            return self.session_payload(runtime)
+
+    def remove_supplement_image(self, session_id, revision, image_id):
+        with self.condition:
+            runtime = self._supplement_runtime(session_id, revision)
+            images = runtime.engine.state.get("supplement_images", [])
+            image = next((entry for entry in images if entry["id"] == image_id), None)
+            if image is None:
+                raise WorkflowError("图片不在当前会话的补充附件列表中。")
+            path = Path(image["path"]).resolve()
+            allowed = (self.sessions.store.directory(session_id) / "attachments" / "supplement").resolve()
+            if not path.is_relative_to(allowed):
+                raise WorkflowError("补充图片路径不合法。")
+            path.unlink()
+            images.remove(image)
+            runtime.engine.save()
+            return self.session_payload(runtime)
 
     def update_settings(self, data):
-        state = self.engine.state
-        if state and state["stage"] not in ("已完成（静态审查）", "资料已读取", "资料读取失败"):
-            raise WorkflowError("当前流程已经固定配置，请结束流程后修改默认设置。")
+        if any(runtime.engine.working() or runtime.deleting or runtime.engine.state["stage"] not in
+               ("已完成（静态审查）", "资料已读取", "资料读取失败") for runtime in self.sessions.runtimes.values()):
+            raise WorkflowError("有会话的流程配置已固定，请结束这些流程后修改默认设置。")
         account = str(data.get("account", "")).strip()
         url = str(data.get("base_url", "")).strip().rstrip("/")
         parsed = urlparse(url)
@@ -141,13 +236,18 @@ class WebApplication:
             if not isinstance(password, str):
                 raise WorkflowError("密码格式无效。")
             save_password(password)
-        self.settings["zentao"].update(base_url=url, account=account)
-        self.settings["codex"]["model"] = str(data.get("model", "")).strip()
-        self.settings["review"]["max_fix_rounds"] = maximum
-        (ROOT / self.settings["review"]["prompt_file"]).write_text(prompt + "\n", encoding="utf-8")
-        save_settings(self.settings)
-        self.engine.settings = self.settings
-        self.engine.zentao = ZentaoClient(self.settings)
+        with self.sessions.settings_lock:
+            self.settings["zentao"].update(base_url=url, account=account)
+            self.settings["codex"]["model"] = str(data.get("model", "")).strip()
+            self.settings["review"]["max_fix_rounds"] = maximum
+            (ROOT / self.settings["review"]["prompt_file"]).write_text(prompt + "\n", encoding="utf-8")
+            save_settings(self.settings)
+        with self.sessions.zentao_lock:
+            client = ZentaoClient(self.settings)
+            self.sessions.zentao = client
+            self.sessions.connection.zentao = client
+            for runtime in self.sessions.runtimes.values():
+                runtime.engine.zentao = client
         with self.condition:
             self.connected, self.profile = False, None
             self.items = []
@@ -162,43 +262,76 @@ class WebApplication:
         if not isinstance(data, dict) or not isinstance(request_id, str) or not 8 <= len(request_id) <= 100:
             raise WorkflowError("操作参数或请求标识无效。")
         with self.condition:
-            if request_id in self.requests:
-                return {"accepted": True, "request_id": request_id, "duplicate": True}
-            if self.busy and action != "pause":
-                raise WorkflowError("上一个操作尚未处理完成，请等待。")
-            state = self.engine.state
-            session_actions = {"plan", "confirm_project", "choose_branches", "edit_branches", "answer", "approve_plan", "fix", "add_round", "rereview", "finalize", "pause", "resume"}
-            if action in session_actions:
-                if not state or request.get("session_id") != state["id"]:
-                    raise WorkflowError("当前会话已经变化，请刷新后操作。")
-                if action in {"plan", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize"} and request.get("revision") != self.revision:
+            if self.closed:
+                raise WorkflowError("服务正在关闭。")
+            session_id = request.get("session_id")
+            if session_id is not None and not isinstance(session_id, str):
+                raise WorkflowError("会话标识无效。")
+            request_key = (session_id, request_id)
+            if request_key in self.requests:
+                return {**self.requests[request_key], "duplicate": True}
+            if action == "restore":
+                return {"accepted": True, **self.session(data.get("id"))}
+            global_action = action in {"connect", "refresh", "settings"}
+            runtime = None if global_action or (action == "collect" and not session_id) else self.sessions.get(session_id)
+            engine = runtime.engine if runtime else self.sessions.connection
+            state = engine.state
+            if self.busy == "settings" or (global_action and self.busy):
+                raise WorkflowError("全局操作尚未完成，请等待。")
+            if runtime:
+                if runtime.busy and action != "pause":
+                    raise WorkflowError("该会话上一个操作尚未完成，请等待。")
+                if action not in {"pause", "delete_session", "answer"} and engine.working():
+                    raise WorkflowError("该会话仍在执行，请等待或先暂停。")
+                if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
+                    raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
+                if action in {"plan", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
             affects, control = True, action == "pause"
             if action == "connect":
-                operation, arguments, affects = self.engine.connect, (), False
+                operation, arguments, affects = engine.connect, (), False
             elif action == "refresh":
-                operation, arguments, affects = self.engine.refresh, (), False
+                operation, arguments, affects = engine.refresh, (), False
             elif action == "collect":
-                kind, item_id = data.get("kind"), data.get("id")
-                item = next((item for item in self.items if item["kind"] == kind and item["id"] == item_id), None)
-                if not item:
-                    raise WorkflowError("请从当前登录账号的待处理列表中选择工作项。")
-                operation, arguments = self.engine.collect, (deepcopy(item),)
+                choices = data.get("items")
+                if not isinstance(choices, list) or not choices:
+                    raise WorkflowError("请选择至少一个工作项。")
+                available = {(item["kind"], item["id"]): item for item in self.items}
+                selected, seen = [], set()
+                for choice in choices:
+                    if (not isinstance(choice, dict) or not isinstance(choice.get("kind"), str) or choice["kind"] not in KINDS
+                            or type(choice.get("id")) is not int):
+                        raise WorkflowError("工作项类型或编号无效。")
+                    key = (choice["kind"], choice["id"])
+                    if key not in available or key in seen:
+                        raise WorkflowError("请从当前登录账号的待处理列表中选择不重复的工作项。")
+                    selected.append(deepcopy(available[key]))
+                    seen.add(key)
+                if len(selected) > 1 and any(item["kind"] != "task" for item in selected):
+                    raise WorkflowError("仅任务支持多选联合开发，需求和 Bug 请单独选择。")
+                if runtime and not engine.editable():
+                    raise WorkflowError("开始计划后不能改变工作项，请新建会话。")
+                if not runtime:
+                    runtime = self.sessions.add(self.sessions.store.new(selected[0]))
+                    engine = runtime.engine
+                    session_id = engine.state["id"]
+                    self.emit(session_id, "state", engine.state)
+                operation, arguments = engine.collect, (selected,)
             elif action in {"plan", "edit_branches"}:
                 supplement = data.get("supplement", "")
                 if not isinstance(supplement, str) or "selections" in data:
                     raise WorkflowError("开始计划只接受补充说明，仓库与分支由服务端确定。")
-                operation, arguments = self.engine.start_plan, (supplement, action == "edit_branches")
+                operation, arguments = engine.start_plan, (supplement, action == "edit_branches")
             elif action == "confirm_project":
                 project_id, name = data.get("project_id"), data.get("name")
                 if not isinstance(project_id, int) or isinstance(project_id, bool) or project_id <= 0 or not isinstance(name, str) or not name.strip():
                     raise WorkflowError("请明确填写所属项目编号和名称。")
-                operation, arguments = self.engine.confirm_project, (project_id, name.strip())
+                operation, arguments = engine.confirm_project, (project_id, name.strip())
             elif action == "choose_branches":
                 choices = data.get("choices")
                 if not isinstance(choices, dict):
                     raise WorkflowError("请明确选择待确定仓库的分支。")
-                operation, arguments = self.engine.choose_branches, (choices,)
+                operation, arguments = engine.choose_branches, (choices,)
             elif action == "answer":
                 text, answers = str(data.get("text", "")).strip(), data.get("answers")
                 pending = state.get("pending")
@@ -210,48 +343,88 @@ class WebApplication:
                         raise WorkflowError("每个问题都需要明确回答，不能自动选择或留空。")
                 elif answers is not None and not isinstance(answers, dict):
                     raise WorkflowError("回答参数无效。")
-                operation, arguments = self.engine.answer, (text, answers)
+                operation, arguments = engine.answer, (text, answers)
             elif action == "approve_plan":
                 if data.get("plan_hash") != state.get("plan_hash"):
                     raise WorkflowError("你确认的计划版本已经变化，请重新查看。")
-                operation, arguments = self.engine.approve_plan, ()
+                operation, arguments = engine.approve_plan, ()
             elif action == "fix":
                 ids = self._ids(data)
-                operation, arguments = self.engine.fix, (ids, str(data.get("note", "")))
+                operation, arguments = engine.fix, (ids, str(data.get("note", "")))
             elif action == "add_round":
-                operation, arguments = self.engine.add_round, ()
+                operation, arguments = engine.add_round, ()
             elif action == "rereview":
-                operation, arguments = self.engine.rereview, ()
+                operation, arguments = engine.rereview, ()
             elif action == "finalize":
                 ids = self._ids(data)
-                operation, arguments = self.engine.finalize, (ids, str(data.get("note", "")))
+                operation, arguments = engine.finalize, (ids, str(data.get("note", "")))
             elif action == "pause":
-                operation, arguments = self.engine.pause, ()
+                operation, arguments = engine.pause, ()
             elif action == "resume":
-                operation, arguments = self.engine.resume, ()
-            elif action == "restore":
-                session_id = data.get("id")
-                if not isinstance(session_id, str):
-                    raise WorkflowError("会话标识无效。")
-                operation, arguments = self.engine.restore, (session_id,)
+                operation, arguments = engine.resume, ()
+            elif action == "delete_session":
+                if engine.working() or state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}:
+                    raise WorkflowError("该会话仍在执行，请先暂停并等待操作结束后再删除。")
+                runtime.deleting = True
+                operation, arguments, affects = self.delete_session, (session_id, runtime), False
             elif action == "settings":
                 operation, arguments, affects = self.update_settings, (data,), False
             else:
                 raise WorkflowError("不支持该操作。")
-            self.requests[request_id] = monotonic()
+            result = {"accepted": True, "request_id": request_id, "session_id": session_id if runtime else None}
+            self.requests[request_key] = result
             while len(self.requests) > 512:
                 self.requests.popitem(last=False)
             if not control:
-                self.busy = action
-            self._publish("busy", self.busy)
-            future = self.engine.submit(operation, *arguments, affects_session=affects, control=control)
+                if runtime:
+                    runtime.busy = action
+                else:
+                    self.busy = action
+            self._publish("busy", self.session_payload(runtime) if runtime else {"session_id": None, "busy": self.busy})
+            if action == "delete_session":
+                future = self.management_executor.submit(operation, *arguments)
+            else:
+                future = engine.submit(operation, *arguments, affects_session=affects, control=control)
             def completed(_):
                 with self.condition:
+                    if self.closed:
+                        return
                     if not control:
-                        self.busy = None
-                    self._publish("busy", self.busy)
+                        if runtime:
+                            runtime.busy = None
+                        else:
+                            self.busy = None
+                    if not runtime or session_id in self.sessions.runtimes:
+                        self._publish("busy", self.session_payload(runtime) if runtime else {"session_id": None, "busy": self.busy})
             future.add_done_callback(completed)
-            return {"accepted": True, "request_id": request_id}
+            return result
+
+    def delete_session(self, session_id, runtime):
+        engine = runtime.engine
+        try:
+            engine._close_rpc()
+            if not engine.closed:
+                engine.executor.submit(lambda: None).result()
+                engine.control_executor.submit(lambda: None).result()
+            cleanup_workspaces(self.sessions.store, engine.state, self.settings["repositories"])
+            engine.state.setdefault("cleanup", {})["finalizing"] = True
+            engine.store.save(engine.state)
+            engine.close()
+            self.sessions.store.remove(session_id)
+            with self.condition:
+                if self.pointer.is_file() and loads(self.pointer.read_text(encoding="utf-8")).get("id") == session_id:
+                    self.pointer.unlink()
+                if self.default_session_id == session_id:
+                    self.default_session_id = None
+                del self.sessions.runtimes[session_id]
+                self._publish("session_deleted", {"session_id": session_id})
+        except Exception as error:
+            with self.condition:
+                runtime.deleting = False
+                engine.state["error"] = str(error)
+                engine.store.save(engine.state)
+                self.emit(session_id, "state", engine.state)
+                self.emit(session_id, "error", str(error))
 
     @staticmethod
     def _ids(data):
@@ -260,8 +433,9 @@ class WebApplication:
             raise WorkflowError("问题编号清单无效。")
         return ids
 
-    def diff(self):
-        state = self.engine.state
+    def diff(self, session_id):
+        with self.lock:
+            state = deepcopy(self.sessions.get(session_id).engine.state)
         if not state or not state["repos"]:
             raise WorkflowError("当前还没有准备代码工作区。")
         result = []
@@ -286,10 +460,11 @@ class WebApplication:
         return result
 
     def close(self):
-        self.engine.close()
         with self.condition:
             self.closed = True
             self.condition.notify_all()
+        self.management_executor.shutdown(wait=True, cancel_futures=True)
+        self.sessions.close()
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -352,6 +527,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._json(200, {**application.snapshot(), "csrf_token": application.csrf_token})
             elif path == "/api/events":
                 self._events(query)
+            elif path == "/api/session":
+                self._json(200, application.session(query.get("id", [""])[0]))
             elif path == "/api/branches":
                 name = query.get("repository", [""])[0]
                 repository = next((entry for entry in application.settings["repositories"] if entry["name"] == name), None)
@@ -359,9 +536,11 @@ class WebHandler(BaseHTTPRequestHandler):
                     raise WorkflowError("仓库未在配置中登记。")
                 self._json(200, branches(repository["path"]))
             elif path == "/api/diff":
-                self._json(200, application.diff())
+                self._json(200, application.diff(query.get("session_id", [""])[0]))
             elif path == "/api/material":
                 self._material(query)
+            elif path == "/api/supplement-images":
+                self._supplement_image(query)
             elif path.startswith("/api/"):
                 self._json(404, {"error": "接口不存在。"})
             else:
@@ -383,6 +562,20 @@ class WebHandler(BaseHTTPRequestHandler):
             application = self.server.application
             if not compare_digest(self.headers.get("X-Workflow-Token", ""), application.csrf_token):
                 raise WorkflowError("操作凭据无效，请刷新页面后重试。")
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/supplement-images":
+                query = parse_qs(parsed.query)
+                length = int(self.headers.get("Content-Length", "0"))
+                maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
+                if not 0 < length <= maximum:
+                    self.close_connection = True
+                    raise WorkflowError("图片为空或超过配置的附件大小上限。")
+                data = self.rfile.read(length)
+                if len(data) != length:
+                    raise WorkflowError("图片传输不完整，请重新上传。")
+                self._json(200, application.upload_supplement_image(query.get("session_id", [""])[0],
+                    int(query.get("revision", ["-1"])[0]), query.get("name", [""])[0], data))
+                return
             if self.headers.get_content_type() != "application/json":
                 raise WorkflowError("操作必须使用 JSON 请求。")
             length = int(self.headers.get("Content-Length", "0"))
@@ -393,6 +586,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 raise WorkflowError("请求格式无效。")
             if self.path == "/api/actions":
                 self._json(202, application.dispatch(data))
+            elif self.path == "/api/supplement-images/remove":
+                self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"), data.get("image_id")))
             elif self.path == "/api/shutdown":
                 self._json(200, {"stopping": True})
                 Thread(target=self.server.shutdown, daemon=True).start()
@@ -405,12 +600,12 @@ class WebHandler(BaseHTTPRequestHandler):
         application = self.server.application
         session_id = query.get("session", [""])[0]
         file_id = int(query.get("file_id", ["0"])[0])
-        state = application.engine.store.load(session_id)
+        state = application.session(session_id)["state"]
         material = next((item for item in state.get("snapshot", {}).get("materials", []) if item["file_id"] == file_id), None)
         if not material:
             raise WorkflowError("附件不在该工作项的资料清单中。")
         path = Path(material["path"]).resolve()
-        allowed = (application.engine.store.directory(session_id) / "attachments").resolve()
+        allowed = (application.sessions.store.directory(session_id) / "attachments").resolve()
         if not path.is_relative_to(allowed) or not path.is_file():
             raise WorkflowError("该附件当前不可读取。")
         data = path.read_bytes()
@@ -423,6 +618,21 @@ class WebHandler(BaseHTTPRequestHandler):
         if not preview:
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(str(material["title"]) + path.suffix))
         self.end_headers()
+        self.wfile.write(data)
+
+    def _supplement_image(self, query):
+        application = self.server.application
+        session_id = query.get("session_id", [""])[0]
+        state = application.session(session_id)["state"]
+        image = next((entry for entry in state["supplement_images"] if entry["id"] == query.get("image_id", [""])[0]), None)
+        if image is None:
+            raise WorkflowError("图片不在当前会话的补充附件列表中。")
+        path = Path(image["path"]).resolve()
+        allowed = (application.sessions.store.directory(session_id) / "attachments" / "supplement").resolve()
+        if not path.is_relative_to(allowed) or not path.is_file():
+            raise WorkflowError("该补充图片当前不可读取。")
+        data = path.read_bytes()
+        self._headers(200, image["content_type"], len(data))
         self.wfile.write(data)
 
     def _events(self, query):

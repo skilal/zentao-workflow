@@ -204,6 +204,88 @@ class TaskCollectionChecks(TestCase):
             old["sources"][1].pop(key)
         self.assertEqual(len(public_state({"snapshot": old})["snapshot"]["sources"]), 2)
 
+    def test_multiple_tasks_share_story_and_download_each_attachment_once(self):
+        second = {**self.task, "id": 4229, "name": "示例前端任务"}
+        file = {"id": 99, "extension": "txt", "title": "共同验收标准"}
+        for task in (self.task, second):
+            task.update(project={"id": 41, "name": "示例项目"}, storyFiles=[file])
+        items = [self.item, {"kind": "task", "id": 4229, "title": second["name"]}]
+        def fetch(path, payload=None, binary=False):
+            if path == "api.php/v1/files/99":
+                return "共同验收标准".encode(), "text/plain"
+            return {"api.php/v1/tasks/4228": self.task, "api.php/v1/tasks/4229": second}[path]
+        with patch.object(self.client, "_fetch", side_effect=fetch) as request:
+            snapshot = self.client.collect_many(items, self.directory)
+        self.assertEqual(snapshot["items"], items)
+        self.assertEqual([source["id"] for source in snapshot["sources"] if source["selected"]], [4228, 4229])
+        self.assertEqual(len([source for source in snapshot["sources"] if source["kind"] == "story"]), 1)
+        self.assertEqual(len(snapshot["materials"]), 1)
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual(snapshot["project"]["id"], 41)
+
+    def test_multiple_tasks_keep_different_story_versions_and_contents(self):
+        second = {**self.task, "id": 4229, "storyVersion": 2, "storySpec": "新增前端交互规则"}
+        items = [self.item, {"kind": "task", "id": 4229, "title": "前端任务"}]
+        with patch.object(self.client, "_fetch", side_effect=[self.task, second]):
+            snapshot = self.client.collect_many(items, self.directory)
+        stories = [source for source in snapshot["sources"] if source["kind"] == "story"]
+        self.assertEqual([source["version"] for source in stories], [1, 2])
+        self.assertIn("新增前端交互规则", stories[1]["content"])
+        second["storyVersion"] = 1
+        with patch.object(self.client, "_fetch", side_effect=[self.task, second]):
+            snapshot = self.client.collect_many(items, self.directory)
+        self.assertEqual(len([source for source in snapshot["sources"] if source["kind"] == "story"]), 2)
+
+    def test_multiple_tasks_require_common_project_and_check_each_assignee(self):
+        self.task["project"] = {"id": 41, "name": "甲项目"}
+        second = {**self.task, "id": 4229, "project": {"id": 42, "name": "乙项目"}}
+        items = [self.item, {"kind": "task", "id": 4229, "title": "前端任务"}]
+        with patch.object(self.client, "_fetch", side_effect=[self.task, second]):
+            with self.assertRaisesRegex(WorkflowError, "共同的所属项目"):
+                self.client.collect_many(items, self.directory)
+        second.update(project=self.task["project"], assignedTo="其他账号")
+        with patch.object(self.client, "_fetch", side_effect=[self.task, second]):
+            with self.assertRaisesRegex(WorkflowError, "不再指派"):
+                self.client.collect_many(items, self.directory)
+
+    def test_multiple_stories_keep_images_with_their_own_source(self):
+        self.task["storySpec"] += '<img src="/index.php?m=file&amp;fileID=100&amp;t=png">'
+        second = {**self.task, "id": 4229, "story": 2873, "storyTitle": "另一个需求",
+                  "storySpec": '<p>另一个需求的正文</p><img src="/index.php?m=file&amp;fileID=101&amp;t=png">'}
+        items = [self.item, {"kind": "task", "id": 4229, "title": "另一个任务"}]
+        def fetch(path, payload=None, binary=False):
+            if binary:
+                return b"simulated image", "image/png"
+            return {"api.php/v1/tasks/4228": self.task, "api.php/v1/tasks/4229": second}[path]
+        with patch.object(self.client, "_fetch", side_effect=fetch):
+            snapshot = self.client.collect_many(items, self.directory)
+        sources = {(source["kind"], source["id"]): source for source in snapshot["sources"]}
+        self.assertEqual(sources[("task", 4228)]["material_ids"], [])
+        self.assertEqual(sources[("task", 4229)]["material_ids"], [])
+        self.assertEqual(sources[("story", 2872)]["material_ids"], [100])
+        self.assertEqual(sources[("story", 2873)]["material_ids"], [101])
+
+    def test_same_story_text_with_different_images_is_not_merged(self):
+        self.task["storySpec"] += '<img src="/index.php?fileID=100&amp;t=png">'
+        second = {**self.task, "id": 4229, "storySpec": self.task["storySpec"].replace("100", "101")}
+        items = [self.item, {"kind": "task", "id": 4229, "title": "另一个任务"}]
+        with patch.object(self.client, "_fetch", side_effect=[self.task, second,
+                (b"first image", "image/png"), (b"second image", "image/png")]):
+            snapshot = self.client.collect_many(items, self.directory)
+        stories = [source for source in snapshot["sources"] if source["kind"] == "story"]
+        self.assertEqual([source["material_ids"] for source in stories], [[100], [101]])
+
+    def test_old_snapshots_restore_source_materials_without_changing_saved_data(self):
+        state = {"snapshot": {"sources": [
+            {"kind": "story", "id": 1, "raw": {"spec": '<img src="/index.php?fileID=100&amp;t=png">',
+                "files": {"99": {"id": 99}}, "verify": '<img src="/index.php?fileID=100&amp;t=png">'}},
+            {"kind": "story", "id": 2, "raw": {"spec": '<img src="/index.php?fileID=101&amp;t=png">'}},
+        ]}}
+        result = public_state(state)
+        self.assertEqual([source["material_ids"] for source in result["snapshot"]["sources"]], [[99, 100], [101]])
+        self.assertTrue(all("raw" not in source for source in result["snapshot"]["sources"]))
+        self.assertTrue(all("material_ids" not in source for source in state["snapshot"]["sources"]))
+
 
 if __name__ == "__main__":
     main()
