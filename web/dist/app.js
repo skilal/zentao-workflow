@@ -155,6 +155,7 @@ function WorkflowApp() {
   const [online, setOnline] = useState(false);
   const [stopped, setStopped] = useState(false);
   const [projectInfoHidden, setProjectInfoHidden] = useState(() => sessionStorage.getItem("workflow-project-info-hidden") === "true");
+  const [implementationPlanHidden, setImplementationPlanHidden] = useState(() => sessionStorage.getItem("workflow-implementation-plan-hidden") === "true");
   const eventSource = useRef(null);
   const [fatal, setFatal] = useState("");
   const [requestsPending, setRequestsPending] = useState({});
@@ -692,7 +693,7 @@ function WorkflowApp() {
     const projectId = draft.project_id ?? project.id;
     const projectName = draft.project_name ?? project.name ?? "";
     return h("aside", { className: "project-info-panel", id: "project-info", "aria-label": "项目信息" },
-      h(CardBox, { size: "small", className: "app-card project-info-card", title: "项目信息",
+      h(CardBox, { size: "small", className: "app-card sidebar-card project-info-card", title: "项目信息",
         extra: h(Button, { type: "text", size: "small", "aria-label": "隐藏项目信息", onClick: () => {
           setProjectInfoHidden(true); sessionStorage.setItem("workflow-project-info-hidden", "true");
         } }, "隐藏") },
@@ -737,6 +738,23 @@ function WorkflowApp() {
             h(Button, { type: "primary", block: true, disabled: busy || unresolved.some(entry => !entry.catalog.some(branch => branch.name === choices[entry.role])),
               onClick: () => act("choose_branches", { choices: Object.fromEntries(unresolved.map(entry => [entry.role, choices[entry.role]])) }) }, "保存为项目常用分支并继续"),
             h(Button, { type: "text", block: true, disabled: busy || Boolean(state.repos.length), onClick: startPlan }, "重新识别分支")))));
+  }
+
+  function renderImplementationPlan() {
+    const feedbackAuthorized = state.approval_source === "followup";
+    return h("section", { id: "implementation-plan", "aria-label": implementationPlanTitle },
+      h(CardBox, { size: "small", className: "app-card sidebar-card implementation-plan-card", title: implementationPlanTitle,
+        extra: h(Button, { type: "text", size: "small", "aria-label": `隐藏${implementationPlanTitle}`, onClick: () => {
+          setImplementationPlanHidden(true); sessionStorage.setItem("workflow-implementation-plan-hidden", "true");
+        } }, "隐藏") },
+        state.plan ? h(React.Fragment, null,
+          h("div", { className: "plan-status" }, h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" },
+            feedbackAuthorized ? "原计划 · 业务背景" : state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认")),
+          h("div", { className: "plan-panel" }, h(Markdown, { text: state.plan })),
+          h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) :
+          h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
+        h(Button, { type: "primary", block: true, disabled: stage !== "等待计划确认" || busy,
+          onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")));
   }
 
   function renderBranches() {
@@ -841,7 +859,6 @@ function WorkflowApp() {
         h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"))));
     const questions = state.pending?.params?.questions || [];
     const continuing = state.phase === "complete";
-    const feedbackAuthorized = state.approval_source === "followup";
     const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
@@ -896,9 +913,7 @@ function WorkflowApp() {
             renderFeedbackTransfers(),
             transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再发送。")),
           h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明")))),
-      h("div", { className: "card-stack" }, h(CardBox, { title: feedbackAuthorized ? "原需求实施计划" : "实施计划", extra: state.plan && h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" }, feedbackAuthorized ? "原计划 · 业务背景" : state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认") },
-        state.plan ? h(React.Fragment, null, h("div", { className: "plan-panel" }, h(Markdown, { text: state.plan })), h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
-        h(Button, { type: "primary", block: true, disabled: stage !== "等待计划确认" || busy, onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")),
+      h("div", { className: "card-stack" },
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
           h(Button, { block: true, disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
@@ -1086,6 +1101,11 @@ function WorkflowApp() {
   const menuIcons = ["▦", "☷", "⚙"];
   const hasProjectInfo = page !== "settings" && selectionMatches;
   const showProjectInfo = hasProjectInfo && !projectInfoHidden;
+  const implementationPlanTitle = state?.approval_source === "followup" ? "原需求实施计划" : "实施计划";
+  const hasImplementationPlan = page === "plan" && model.selectedSessionId && selectionMatches &&
+    (state.codex || ["资料已读取", "资料读取失败"].includes(stage)) && state.phase !== "branch" && (state.repos.length > 0 || state.followup);
+  const showImplementationPlan = hasImplementationPlan && !implementationPlanHidden;
+  const showSidebar = showProjectInfo || showImplementationPlan;
   return h(ConfigProvider, { locale: antd.locales.zh_CN, theme: { token: { colorPrimary: "rgb(27, 143, 255)", borderRadius: 6, fontSize: 14,
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif' }, components: { Button: { colorLink: "rgb(27, 143, 255)", defaultColor: "rgb(27, 143, 255)", defaultHoverColor: "rgb(27, 143, 255)" } } } },
     noticeHolder, modalHolder,
@@ -1112,12 +1132,16 @@ function WorkflowApp() {
             h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasProjectInfo && projectInfoHidden &&
               h(Button, { size: "small", "aria-controls": "project-info", "aria-expanded": false, onClick: () => {
                 setProjectInfoHidden(false); sessionStorage.setItem("workflow-project-info-hidden", "false");
-              } }, "项目信息"))),
+              } }, "项目信息"), hasImplementationPlan && implementationPlanHidden &&
+              h(Button, { size: "small", "aria-controls": "implementation-plan", "aria-expanded": false, onClick: () => {
+                setImplementationPlanHidden(false); sessionStorage.setItem("workflow-implementation-plan-hidden", "false");
+              } }, implementationPlanTitle))),
             h(Steps, { current: stepOf(state), status: stage === "已完成（未审查）" ? "finish" : undefined, size: "small", responsive: false,
               items: ["选择工作项", "制定计划", state?.followup ? "处理消息" : "实施修改", "Review", "本地提交"].map((title, index) =>
                 stage === "已完成（未审查）" && index > 2 ? { title: `${title}（跳过）`, status: "wait" } : { title }) })),
-          h("div", { className: `session-body${showProjectInfo ? " with-project-info" : ""}` },
-            h("div", { className: "workspace-main" }, renderers[page]()), showProjectInfo && renderProjectInfo()))), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
+          h("div", { className: `session-body${showSidebar ? " with-sidebar" : ""}` },
+            h("div", { className: "workspace-main" }, renderers[page]()), showSidebar &&
+              h("div", { className: "session-sidebar card-stack" }, showProjectInfo && renderProjectInfo(), showImplementationPlan && renderImplementationPlan())))), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
     h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
       diffs === null ? h(Spin, null) : h(Collapse, { defaultActiveKey: diffs.map((_, index) => String(index)), items: diffs.map((diff, index) => ({ key: String(index), label: diff.repository,
         children: diff.commit ? h(Typography.Text, { copyable: true }, diff.commit) : h(React.Fragment, null, h("pre", { className: "diff-text" }, diff.stat || "没有已跟踪文件差异"), diff.patch && h("pre", { className: "diff-text" }, diff.patch),
