@@ -216,6 +216,7 @@ class Workflow(CompileFlow):
                          "本轮首次修改不占用 Review 后修复次数。Review 是否执行由控制器根据 review_enabled 和代码差异决定，"
                          "用户明确要求重新 Review、提交或重新提交时，先调用 workflow.request_review 登记请求，"
                          "引用用户原话；需纳入的历史任务文件从 task_context.previous_task_changes 选择，"
+                         "先核对当前差异与本次任务范围；范围明确时直接登记，不因 unchanged 为 false 重复要求确认提交。"
                          "提交标题按用户要求概括并传入 commit_message，未指定则传空字符串。"
                          "此显式请求不受修改后自动 Review 开关限制。模型不要自行审查或提交。\n本轮消息：\n" + state["followup"]["text"])
 

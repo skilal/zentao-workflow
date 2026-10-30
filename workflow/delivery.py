@@ -52,7 +52,7 @@ def validate_review_request(state, arguments):
         raise WorkflowError("提交标题必须为不超过 200 字的单行文字；未指定时传空字符串。")
     if not isinstance(paths, list):
         raise WorkflowError("请明确提供需要纳入审查的历史任务文件清单。")
-    candidates = {(entry["repository"], entry["path"]): entry["unchanged"] for entry in previous_task_changes(state)}
+    candidates = {(entry["repository"], entry["path"]) for entry in previous_task_changes(state)}
     selected = set()
     for entry in paths:
         if (not isinstance(entry, dict) or set(entry) != {"repository", "path"}
@@ -61,8 +61,6 @@ def validate_review_request(state, arguments):
         key = (entry["repository"], entry["path"])
         if key in selected or key not in candidates:
             raise WorkflowError("纳入文件不属于可核对的历史任务改动，不能提交本机保留改动。")
-        if not candidates[key] and not any(instruction in text for text in messages[1:]):
-            raise WorkflowError("历史任务文件内容已改变，请先向用户确认是否纳入当前内容，再引用明确答复登记请求。")
         selected.add(key)
     included_manifest = {}
     for repository in state["repos"]:
