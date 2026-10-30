@@ -1,6 +1,6 @@
 "use strict";
 
-const { useState, useEffect, useRef } = React;
+const { useState, useEffect, useLayoutEffect, useRef } = React;
 const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Checkbox,
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
   Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown, Switch } = antd;
@@ -509,9 +509,9 @@ function WorkflowApp() {
     if (!state || !review) return;
     if (draftRef.current.review_number !== review.number) changeDraft({ selected_findings: [], review_note: "", review_number: review.number });
   }, [state?.id, review?.number]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [model?.stream, state?.history?.length, review?.number]);
+  }, [page, state?.id, selectionMatches, state?.phase, model?.stream, state?.history?.length, review?.number]);
   useEffect(() => {
     if (!model?.settings) return;
     const serialized = JSON.stringify(model.settings);
