@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from hashlib import sha256
 from json import JSONDecodeError, dumps, loads
+from pathlib import Path
 from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
 
@@ -11,12 +12,14 @@ from workflow.approvals import is_controlled_write
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
 from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
+from workflow.context import context_hash, requirement_context
 from workflow.delivery import validate_review_request
 from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.store import SessionStore, timestamp
+from workflow.user_input import input_request_path, pending_input
 from workflow.zentao import ZentaoClient, project_context
 
 
@@ -528,6 +531,8 @@ class Workflow(CompileFlow):
         if self.closed:
             return
         state = self.state
+        if pending_input(self.store, state):
+            raise WorkflowError("仍有问题等待明确答复，不能启动新的模型回合。")
         phase = state["phase"]
         for repository in state["repos"]:
             ensure_baseline(repository)
@@ -544,6 +549,7 @@ class Workflow(CompileFlow):
             return
         state["error"] = ""
         state["pending"] = None
+        state["turn_id"] = None
         self.output = {}
         self.plan_stream = ""
         self.completed_plan = ""
@@ -563,17 +569,39 @@ class Workflow(CompileFlow):
                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                    "review_enabled": state.get("review_enabled", True),
                    "compile_check": state.get("compile_check", {"enabled": False}),
-                   "compile_checks": compile_context(state)}
+                   "compile_checks": compile_context(state),
+                   "materials_revision": context_hash(requirement_context(state))}
         scope = ("原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
                  "获取信息时只读取并回答；明确要求修改时才处理对应修改。是否自动 Review 由控制器决定。"
                  if state.get("followup") else
                  "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。")
-        prompt = ("所有回答使用中文。模型禁止执行系统命令、编译、构建、运行验证和依赖安装。"
-                  "开启编译检查时仅由控制器执行，模型只处理控制器明确授权的编译代码修复。"
-                  "当前阶段由控制器决定。只有 workflow MCP 的受控文件工具允许修改业务文件。"
-                  "需要业务选择或扩大计划范围时必须提问，不得自行决定。"
-                  + scope + "\n" + text +
-                  "\n工作流上下文：\n" + dumps(context, ensure_ascii=False))
+        previous_input = state.get("thread_input", {})
+        if previous_input.get("thread_id") != state["thread_id"]:
+            previous_input = {}
+        image_hashes = set(previous_input.get("images", []))
+        image_inputs = []
+        if phase != "branch":
+            images = [material for material in state["snapshot"]["materials"] if material.get("image")]
+            images += state.get("supplement_images", [])
+            images += (state.get("followup") or {}).get("images", [])
+            references = []
+            for image in images:
+                digest = sha256(Path(image["path"]).read_bytes()).hexdigest()
+                references.append({"path": image["path"], "content_hash": digest})
+                if digest not in image_hashes:
+                    image_inputs.append({"type": "localImage", "path": image["path"]})
+                    image_hashes.add(digest)
+            context["image_references"] = references
+        hashes = {key: context_hash(value) for key, value in context.items()}
+        changed = {key: value for key, value in context.items()
+                   if hashes[key] != previous_input.get("context_hashes", {}).get(key)}
+        material_instruction = ("资料首次读取或版本已变更，先调用 workflow.task_context(include_materials=true)。"
+                                if "materials_revision" in changed else
+                                "先调用 workflow.task_context 获取当前授权；原需求资料沿用本线程，需核对时再设置 include_materials=true。")
+        prompt = ("当前阶段：" + phase + "。" + scope + "\n" + text + "\n" + material_instruction +
+                  "需要人工选择或确认时调用 workflow.ask_user，立即结束回合，不得 sleep 或轮询。"
+                  "以下只包含变化字段，未出现的字段沿用本线程上次值。"
+                  "\n工作流上下文：\n" + dumps(changed, ensure_ascii=False))
         if phase == "branch":
             context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                        "sources": [{"title": source["title"], "content": source["content"]}
@@ -582,15 +610,8 @@ class Workflow(CompileFlow):
                                         for entry in state["branch_resolution"]["repositories"] if entry["status"] == "pending"]}
             inputs = [{"type": "text", "text": BRANCH_INSTRUCTIONS + "\n" + dumps(context, ensure_ascii=False)}]
         else:
-            inputs = [{"type": "text", "text": "$zentao-delivery\n" + prompt},
-                      {"type": "skill", "name": "zentao-delivery", "path": str(ROOT / "skills" / "zentao-delivery" / "SKILL.md")}]
-            for material in state["snapshot"]["materials"]:
-                if material.get("image"):
-                    inputs.append({"type": "localImage", "path": material["path"]})
-            for image in state.get("supplement_images", []):
-                inputs.append({"type": "localImage", "path": image["path"]})
-            for image in (state.get("followup") or {}).get("images", []):
-                inputs.append({"type": "localImage", "path": image["path"]})
+            # 技能已由 thread/start 或 thread/resume 的 developerInstructions 提供。
+            inputs = [{"type": "text", "text": prompt}, *image_inputs]
         params = {"threadId": state["thread_id"], "input": inputs,
                   "cwd": str(turn_cwd), "approvalPolicy": "on-request",
                   "sandboxPolicy": {"type": "readOnly"},
@@ -606,6 +627,9 @@ class Workflow(CompileFlow):
             raise
         with self.lock:
             state["turn_id"] = response["turn"]["id"]
+            if phase != "branch":
+                state["thread_input"] = {"thread_id": state["thread_id"], "context_hashes": hashes,
+                                         "images": sorted(image_hashes)}
             self.save()
 
     def approve_plan(self):
@@ -633,15 +657,64 @@ class Workflow(CompileFlow):
         self._start_turn("控制器已授权实施上下文中的计划，授权来源见 workflow.task_context。仅实现该计划的最小范围，先阅读已有代码与项目规范。"
                          "先调用 workflow.task_context 确认当前阶段，再使用 workflow.write_file 或 replace_text 修改。"
                          "原生只读沙箱限制原生命令与文件写入，控制器单独授权的 MCP 写入工具在实施阶段可用；不得据此跳过已经授权的 MCP 修改。"
-                         "出现需澄清事项必须以 [需要澄清] 开头结束回合。完成后说明修改与静态检查，不执行任何验证命令，也不要提交。")
+                         "出现需澄清事项必须调用 workflow.ask_user 后立即结束回合，由控制器等待明确答复。"
+                         "完成后说明修改与静态检查，不执行任何验证命令，也不要提交。")
+
+    def _capture_user_input(self):
+        with self.lock:
+            request = pending_input(self.store, self.state)
+            if not request:
+                return False
+            if (self.state.get("pending") or {}).get("id") != request["id"]:
+                self.state.update(stage="等待人工回答", pending={"id": request["id"], "method": "workflow/ask_user",
+                                  "params": {"questions": request["questions"]}, "turn_completed": False})
+                if self.state["phase"] == "plan" and self.state.get("plan_round") is not None:
+                    self.state["plan_round"]["asked"] = True
+                self.note("Codex", "需要你的明确答复：\n" + "\n".join(question["question"] for question in request["questions"]))
+                self.save()
+                self.emit("questions", request["questions"])
+            return True
+
+    def _wait_for_user_input(self, session_id, epoch):
+        with self.lock:
+            if self.closed or self.state["id"] != session_id or epoch != self.connection_epoch:
+                return
+            if self.state.get("pause_requested") or not self._capture_user_input():
+                return
+            pending = self.state["pending"]
+            interrupt = self.turn_running and not pending.get("turn_completed") and not pending.get("interrupt_requested")
+            if interrupt:
+                pending["interrupt_requested"] = True
+                self.save()
+                thread_id, turn_id = self.state["thread_id"], self.state["turn_id"]
+        if interrupt:
+            self.rpc.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
     def answer(self, text, answers=None):
         state = self.require_state("等待人工回答", "等待计划补充", "等待计划确认")
         if not text.strip() and not answers:
             raise WorkflowError("请明确回答，不能以空内容继续。")
         pending = state.get("pending")
-        self.note("用户", text or dumps(answers, ensure_ascii=False))
-        state["supplement"] += "\n\n人工补充：" + (text or dumps(answers, ensure_ascii=False))
+        controlled = pending and pending["method"] == "workflow/ask_user"
+        if controlled:
+            if not pending.get("turn_completed"):
+                raise WorkflowError("控制器正在结束当前回合，请稍后提交回答。")
+            questions = pending["params"]["questions"]
+            if answers is not None:
+                if (not isinstance(answers, dict) or set(answers) != {question["id"] for question in questions}
+                        or any(not isinstance(values, list) or not values
+                               or any(not isinstance(value, str) or not value.strip() for value in values)
+                               for values in answers.values())):
+                    raise WorkflowError("请逐项明确回答所有问题，不能使用空答案。")
+            elif len(questions) != 1:
+                raise WorkflowError("多个问题必须逐项明确回答。")
+        reply = text.strip() or dumps(answers, ensure_ascii=False)
+        if controlled and answers is not None:
+            response = "\n\n".join(question["question"] + "\n回答：" + "\n".join(answers[question["id"]])
+                                   for question in questions)
+            reply = "\n\n".join(part for part in (response, text.strip()) if part)
+        self.note("用户", reply)
+        state["supplement"] += "\n\n人工补充：" + reply
         if pending and state["rpc_connected"] and self.rpc and not pending.get("turn_completed"):
             if pending["method"] != "item/tool/requestUserInput":
                 raise WorkflowError("不支持对该请求自动补充答案。")
@@ -656,10 +729,13 @@ class Workflow(CompileFlow):
             self.save()
             self.rpc.respond(pending["id"], result)
         else:
+            if controlled:
+                input_request_path(self.store, state).unlink()
             state["pending"] = None
             if state["stage"] == "等待计划确认":
                 self._new_plan_round()
-            self._start_turn("用户已补充信息：\n" + text + "\n请从上次暂停点继续；若在计划阶段，输出最终 proposed_plan，由控制器判断是否需要人工确认。")
+            self._start_turn("用户已补充信息：\n" + reply + "\n请从上次暂停点继续；若在计划阶段，输出最终 proposed_plan，由控制器判断是否需要人工确认。",
+                             FINDING_SCHEMA if state["phase"] == "review" else None)
 
     def _begin_review(self):
         state = self.state
@@ -700,7 +776,7 @@ class Workflow(CompileFlow):
         state["fix_round"] += 1
         state["phase"] = "fix"
         self._start_turn("用户选择修复以下问题，只处理选中项。不要顺手修改未选项或原有问题。"
-                         "若超出已确认计划，使用人工输入工具等待用户决定。修复完成后由控制器自动再次 Review。\n" +
+                         "若超出已确认计划，调用 workflow.ask_user 后立即结束回合，等待用户明确决定。修复完成后由控制器自动再次 Review。\n" +
                          dumps(chosen, ensure_ascii=False) + "\n用户说明：" + note)
 
     def add_round(self):
@@ -809,6 +885,10 @@ class Workflow(CompileFlow):
         if state["commits"]:
             raise WorkflowError("存在部分提交，只能先完成或处理该提交过程。")
         state["pause_requested"] = False
+        if self._capture_user_input():
+            state["pending"]["turn_completed"] = True
+            self.save()
+            return
         if state["phase"] == "compile":
             self._resume_compile()
             return
@@ -887,6 +967,8 @@ class Workflow(CompileFlow):
                 self.last_message = item["text"]
             elif item.get("type") == "plan" and item.get("text"):
                 self.completed_plan = item["text"].strip()
+            elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") == "ask_user":
+                self.submit(self._wait_for_user_input, self.state["id"], epoch, control=True)
         elif method == "turn/started":
             self.turn_running = True
             with self.lock:
@@ -895,9 +977,11 @@ class Workflow(CompileFlow):
             if self.state.get("pause_requested"):
                 self.submit(self.pause, control=True)
         elif method == "turn/completed":
-            self.turn_running = False
             turn = params.get("turn", {})
             turn_id = turn.get("id")
+            if turn_id and self.state.get("turn_id") and turn_id != self.state["turn_id"]:
+                return
+            self.turn_running = False
             key = (self.state["id"], turn_id)
             if key not in self.pending_turns:
                 self.pending_turns.add(key)
@@ -907,7 +991,9 @@ class Workflow(CompileFlow):
             with self.lock:
                 if self.state:
                     self.state["rpc_connected"] = False
-                    if self.state["stage"] in ACTIVE:
+                    if self._capture_user_input():
+                        self.state["pending"]["turn_completed"] = True
+                    elif self.state["stage"] in ACTIVE:
                         self.state["stage"] = "已暂停"
                     self.save()
             if method == "client/error":
@@ -924,6 +1010,12 @@ class Workflow(CompileFlow):
             self.save()
             return
         if state["stage"] not in ACTIVE | {"等待人工回答"}:
+            return
+        self._capture_user_input()
+        if (state.get("pending") or {}).get("method") == "workflow/ask_user":
+            state["pending"]["turn_completed"] = True
+            state["stage"] = "等待人工回答"
+            self.save()
             return
         if turn.get("status") != "completed":
             state["stage"] = "已暂停" if turn.get("status") == "interrupted" else "已停止"

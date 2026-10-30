@@ -151,7 +151,7 @@ class CompileFlow:
         self.state["phase"] = "compile_fix"
         self._start_turn("控制器授权修复本轮新增代码引起的编译错误，只修改 compile_checks 最新记录中 "
                          "repair_repository 的 repair_paths，保持需求范围。不得修改依赖、环境或原有问题，不执行命令。"
-                         "先对照 baseline_file 和 changes 核实诊断，证据不足或需要扩大范围时以 [需要澄清] 开头结束，"
+                         "先对照 baseline_file 和 changes 核实诊断，证据不足或需要扩大范围时调用 workflow.ask_user 后立即结束回合，"
                          "不得猜测修复。脱敏诊断见上下文 compile_checks，完成后由控制器重新检查。")
 
     def _compile_repaired(self):

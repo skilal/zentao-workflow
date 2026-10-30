@@ -5,6 +5,7 @@ from threading import RLock
 from workflow.engine import ACTIVE, Workflow
 from workflow.settings import WorkflowError
 from workflow.store import PreviewStore, SessionStore
+from workflow.user_input import pending_input
 from workflow.zentao import ZentaoClient
 
 
@@ -32,10 +33,20 @@ class SessionManager:
         self.connection = Workflow(settings, lambda kind, value: emit(None, kind, value),
                                    self.store, self.zentao, self.zentao_lock, self.settings_lock)
         for state in self.store.sessions():
+            question = pending_input(self.store, state)
             interrupted = state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}
             changed = interrupted or state.get("rpc_connected") or state.get("pending")
-            state.update(rpc_connected=False, pending=None, turn_id=None)
-            if interrupted:
+            state["rpc_connected"] = False
+            if question:
+                state.update(stage="等待人工回答", pause_requested=False,
+                             pending={"id": question["id"], "method": "workflow/ask_user", "turn_completed": True,
+                                      "params": {"questions": question["questions"]}})
+                if state["phase"] == "plan" and state.get("plan_round") is not None:
+                    state["plan_round"]["asked"] = True
+                changed = True
+            else:
+                state.update(pending=None, turn_id=None)
+            if interrupted and not question:
                 state.update(stage="资料读取失败" if state["stage"] == "资料读取中" else "已暂停", pause_requested=True)
             if changed:
                 self.store.save(state)

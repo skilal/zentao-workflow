@@ -2,14 +2,17 @@
 
 from fnmatch import fnmatch
 from json import dumps, loads
+from os import scandir
 from pathlib import Path
 from sys import stdin, stdout
 
-from workflow.gitops import differences, git, safe_file
 from workflow.compile_checks import compile_context
+from workflow.context import context_hash, requirement_context
 from workflow.delivery import previous_task_changes, validate_review_request
+from workflow.gitops import differences, git, safe_file
 from workflow.settings import WorkflowError
 from workflow.store import SessionStore, write_authorized
+from workflow.user_input import pending_input, register_input
 
 
 def schema(properties, required=()):
@@ -18,13 +21,26 @@ def schema(properties, required=()):
 
 STRING = {"type": "string"}
 FILE_ARGS = {"repository": STRING, "path": STRING}
+LINE_ARGS = {"start_line": {"type": "integer", "minimum": 1},
+             "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}
 TOOLS = [
-    ("task_context", "读取本次工作项资料、补充说明、确认计划和工作区清单。", schema({})),
+    ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
     ("list_files", "列出指定仓库的文件；pattern 为 glob；不访问依赖、Git 和输出目录。", schema({"repository": STRING, "pattern": STRING}, ("repository",))),
-    ("read_file", "读取 UTF-8 源文件，按行分段返回。", schema({**FILE_ARGS, "start_line": {"type": "integer", "minimum": 1}, "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}, ("repository", "path"))),
+    ("read_file", "读取当前 UTF-8 文件；默认 200 行，最多 500 行；next_line 指明续读位置。多文件优先使用 read_files。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
+    ("read_files", "一次读取多个当前或基线文件片段；最多 10 项、合计 2000 行；每项 baseline=true 表示基线。", schema({
+        "files": {"type": "array", "minItems": 1, "maxItems": 10,
+                  "items": schema({**FILE_ARGS, **LINE_ARGS, "baseline": {"type": "boolean"}}, ("repository", "path"))}
+    }, ("files",))),
     ("search_text", "在指定仓库文本中搜索字面量；最多返回 100 项并明确标记截断。", schema({"repository": STRING, "text": STRING, "pattern": STRING}, ("repository", "text"))),
-    ("baseline_file", "读取实施前基线中的指定文件，用于区分原有与新增问题。", schema(FILE_ARGS, ("repository", "path"))),
+    ("baseline_file", "按行读取实施前基线；默认 200 行，最多 500 行；返回 next_line；可用 read_files 批量核对。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
     ("changes", "读取相对初始基线的累计差异；超长时用文件工具逐项查看。", schema({"repository": STRING}, ("repository",))),
+    ("ask_user", "将问题交给控制器并立即结束回合；由网页等待明确答复，禁止 sleep、轮询或默认放行。", schema({
+        "questions": {"type": "array", "minItems": 1, "maxItems": 3, "items": schema({
+            "id": STRING, "header": STRING, "question": STRING,
+            "options": {"type": "array", "minItems": 1, "maxItems": 6,
+                        "items": schema({"label": STRING, "description": STRING}, ("label", "description"))}
+        }, ("id", "header", "question"))}
+    }, ("questions",))),
     ("request_review", "仅续聊中用户明确要求审查或重新提交时登记请求；回合结束后由控制器重新 Review，通过后本地提交。不会直接提交。", schema({
         "instruction": STRING, "commit_message": STRING,
         "include_paths": {"type": "array", "items": schema(FILE_ARGS, ("repository", "path"))}
@@ -37,8 +53,6 @@ SKIP = {".git", ".local", ".codex", ".idea", ".husky", "node_modules", "target",
 
 
 def matches(relative, pattern):
-    if not pattern:
-        raise WorkflowError("文件筛选 pattern 不能为空。")
     return fnmatch(relative, pattern) or (pattern.startswith("**/") and fnmatch(relative, pattern[3:]))
 
 
@@ -66,24 +80,59 @@ class Tools:
         self.session_id = session_id
 
     def files(self, repository, pattern="*"):
-        root = Path(repository["path"])
-        pending = [root]
+        if not isinstance(pattern, str) or not pattern:
+            raise WorkflowError("文件筛选 pattern 不能为空。")
+        pattern = pattern.replace("\\", "/")
+        parts = pattern.split("/")
+        if Path(pattern).is_absolute() or Path(pattern).drive or ".." in parts:
+            raise WorkflowError("文件筛选必须位于当前工作区内。")
+        root = Path(repository["path"]).resolve()
+        prefix = []
+        for part in parts:
+            if any(character in part for character in "*?["):
+                break
+            prefix.append(part)
+        directory = root
+        for part in prefix:
+            directory = directory / part
+            if part.casefold() in SKIP or directory.is_symlink():
+                return
+        if len(prefix) == len(parts):
+            path = safe_file(repository, pattern)
+            if path.is_file():
+                yield path.relative_to(root).as_posix(), path
+            return
+        directory = safe_file(repository, "/".join(prefix)) if prefix else root
+        if not directory.is_dir():
+            return
+        pending = [directory]
         while pending:
             directory = pending.pop()
-            for path in sorted(directory.iterdir()):
-                if path.name.casefold() in SKIP or path.is_symlink():
+            with scandir(directory) as entries:
+                children = sorted(entries, key=lambda entry: Path(entry.name))
+            for entry in children:
+                if entry.name.casefold() in SKIP or entry.is_symlink():
                     continue
-                if path.is_dir():
+                path = Path(entry.path)
+                if entry.is_dir(follow_symlinks=False):
                     pending.append(path)
-                elif path.is_file():
+                elif entry.is_file(follow_symlinks=False):
                     relative = path.relative_to(root).as_posix()
                     if matches(relative, pattern):
                         yield relative, path
 
     def call(self, name, arguments):
         state = self.store.load(self.session_id)
+        if name != "ask_user" and pending_input(self.store, state):
+            raise WorkflowError("问题已交给控制器，等待用户明确答复期间不能继续调用工具。")
         if name == "task_context":
-            return {**{key: state.get(key) for key in ("item", "items", "project", "snapshot", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage")},
+            include = arguments.get("include_materials", False)
+            if type(include) is not bool:
+                raise WorkflowError("include_materials 必须为布尔值。")
+            snapshot = requirement_context(state)
+            return {**{key: state.get(key) for key in ("item", "items", "project", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage")},
+                    "snapshot": snapshot if include else {key: snapshot[key] for key in ("blockers", "feishu_links")},
+                    "materials_revision": context_hash(snapshot), "materials_included": include,
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
@@ -91,6 +140,8 @@ class Tools:
                     "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
                     "compile_check": state.get("compile_check", {"enabled": False}),
                     "compile_checks": compile_context(state)}
+        if name == "ask_user":
+            return register_input(self.store, state, arguments.get("questions"))
         if name == "request_review":
             request = validate_review_request(state, arguments)
             path = self.store.directory(self.session_id) / f"review-request-{state['delivery_round']}.json"
@@ -99,6 +150,17 @@ class Tools:
             temporary.replace(path)
             return "审查提交请求已登记。回合结束后由控制器核对文件范围并重新 Review，无遗留问题后执行本地提交。"
         repositories = {repository["name"]: repository for repository in state["repos"]}
+        if name == "read_files":
+            requests = arguments.get("files")
+            if not isinstance(requests, list) or not 1 <= len(requests) <= 10:
+                raise WorkflowError("批量读取必须包含 1 至 10 个文件片段。")
+            prepared = [self.read_request(repositories, request) for request in requests]
+            if sum(request[4] for request in prepared) > 2000:
+                raise WorkflowError("批量读取合计最多 2000 行，请缩小读取范围。")
+            return {"files": [self.read_segment(*request) for request in prepared]}
+        if name in ("read_file", "baseline_file"):
+            request = self.read_request(repositories, {**arguments, "baseline": name == "baseline_file"})
+            return self.read_segment(*request)
         repository = repositories.get(arguments.get("repository"))
         if repository is None:
             raise WorkflowError("仓库不属于当前会话的工作区。")
@@ -138,18 +200,6 @@ class Tools:
         path = safe_file(repository, relative)
         if any(part.casefold() in SKIP for part in Path(relative).parts):
             raise WorkflowError("不允许访问依赖、Git 或工作流配置目录。")
-        if name == "baseline_file":
-            return git(repository["path"], "show", repository["baseline"] + ":" + Path(relative).as_posix())
-        if name == "read_file":
-            if path.stat().st_size > 4 * 1024 * 1024:
-                raise WorkflowError("单文件过大，第一版不自动读取。")
-            source = read_source(path)
-            lines = source.lstrip("\ufeff").splitlines()
-            start, count = arguments.get("start_line", 1), arguments.get("line_count", 200)
-            if start < 1 or not 1 <= count <= 500:
-                raise WorkflowError("行号或读取行数无效。")
-            return {"total_lines": len(lines), "start_line": start, "line_ending": "CRLF" if "\r\n" in source else "LF", "utf8_bom": source.startswith("\ufeff"),
-                    "text": "\n".join(f"{index + 1}: {lines[index]}" for index in range(start - 1, min(len(lines), start - 1 + count)))}
         if name not in ("write_file", "replace_text", "delete_file"):
             raise WorkflowError("未知 MCP 工具。")
         authorized = write_authorized(state) if state.get("approval_source") == "followup" else state.get("approved_hash")
@@ -192,6 +242,42 @@ class Tools:
         path.write_text(text, encoding="utf-8", newline="")
         return "文件已保存，仅允许静态检查。"
 
+    def read_request(self, repositories, arguments):
+        if not isinstance(arguments, dict):
+            raise WorkflowError("文件片段必须指定仓库和相对路径。")
+        repository = repositories.get(arguments.get("repository"))
+        if repository is None:
+            raise WorkflowError("仓库不属于当前会话的工作区。")
+        relative = arguments.get("path")
+        path = safe_file(repository, relative)
+        if any(part.casefold() in SKIP for part in Path(relative).parts):
+            raise WorkflowError("不允许访问依赖、Git 或工作流配置目录。")
+        start, count = arguments.get("start_line", 1), arguments.get("line_count", 200)
+        if type(start) is not int or type(count) is not int or start < 1 or not 1 <= count <= 500:
+            raise WorkflowError("start_line 必须大于等于 1，line_count 必须为 1 至 500；请按 next_line 分段读取。")
+        baseline = arguments.get("baseline", False)
+        if type(baseline) is not bool:
+            raise WorkflowError("baseline 必须为布尔值。")
+        return repository, relative, path, start, count, baseline
+
+    def read_segment(self, repository, relative, path, start, count, baseline):
+        if baseline:
+            data = git(repository["path"], "show", repository["baseline"] + ":" + Path(relative).as_posix(), binary=True)
+            if len(data) > 4 * 1024 * 1024:
+                raise WorkflowError("单文件过大，第一版不自动读取。")
+            source = data.decode("utf-8")
+        else:
+            if path.stat().st_size > 4 * 1024 * 1024:
+                raise WorkflowError("单文件过大，第一版不自动读取。")
+            source = read_source(path)
+        lines = source.lstrip("\ufeff").splitlines()
+        end = min(len(lines), start - 1 + count)
+        return {"repository": repository["name"], "path": relative, "baseline": baseline,
+                "total_lines": len(lines), "start_line": start,
+                "next_line": end + 1 if end < len(lines) else None,
+                "line_ending": "CRLF" if "\r\n" in source else "LF", "utf8_bom": source.startswith("\ufeff"),
+                "text": "\n".join(f"{index + 1}: {lines[index]}" for index in range(start - 1, end))}
+
 
 def serve(session_id):
     tools = Tools(session_id)
@@ -206,7 +292,7 @@ def serve(session_id):
                           "capabilities": {"tools": {}}, "serverInfo": {"name": "workflow", "version": "0.1.0"}}
             elif method == "tools/list":
                 result = {"tools": [{"name": name, "description": description, "inputSchema": definition,
-                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review"),
+                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user"),
                                                      "openWorldHint": False}} for name, description, definition in TOOLS]}
             elif method == "tools/call":
                 try:

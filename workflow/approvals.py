@@ -6,10 +6,11 @@ from workflow.gitops import safe_file
 from workflow.mcp_server import SKIP, TOOLS
 from workflow.settings import WorkflowError
 from workflow.store import write_authorized
+from workflow.user_input import INPUT_STAGES
 
 
-WRITE_TOOL_DESCRIPTIONS = {description: (name, definition) for name, description, definition in TOOLS
-                           if name in ("write_file", "replace_text", "delete_file", "request_review")}
+CONTROL_TOOL_DESCRIPTIONS = {description: (name, definition) for name, description, definition in TOOLS
+                            if name in ("write_file", "replace_text", "delete_file", "request_review", "ask_user")}
 
 
 def is_controlled_write(state, params):
@@ -18,13 +19,15 @@ def is_controlled_write(state, params):
     metadata = params.get("_meta") or {}
     if metadata.get("codex_approval_kind") != "mcp_tool_call":
         return False
-    tool = WRITE_TOOL_DESCRIPTIONS.get(metadata.get("tool_description"))
-    if not tool or state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中"):
-        return False
-    if not write_authorized(state):
+    tool = CONTROL_TOOL_DESCRIPTIONS.get(metadata.get("tool_description"))
+    if not tool:
         return False
     arguments = metadata.get("tool_params")
     if not isinstance(arguments, dict) or any(key not in arguments for key in tool[1]["required"]):
+        return False
+    if tool[0] == "ask_user":
+        return state["stage"] in INPUT_STAGES
+    if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not write_authorized(state):
         return False
     if tool[0] == "request_review":
         # 此工具只登记请求。范围校验由 MCP 返回具体错误，不能转成“用户拒绝”。

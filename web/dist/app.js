@@ -590,8 +590,9 @@ function WorkflowApp() {
       answers[question.id] = [text];
       pieces.push(`${question.question}\n回答：${text}`);
     }
-    const text = [pieces.join("\n\n"), draft.reply?.trim()].filter(Boolean).join("\n\n");
-    if (!text) { notice.warning({ message: "请先填写回复" }); return; }
+    const text = state.pending?.method === "workflow/ask_user" ? draft.reply.trim() :
+      [pieces.join("\n\n"), draft.reply?.trim()].filter(Boolean).join("\n\n");
+    if (!text && !questions.length) { notice.warning({ message: "请先填写回复" }); return; }
     const id = state.id;
     if (await act("answer", { text, answers: questions.length ? answers : null }) && modelRef.current.selectedSessionId === id) changeDraft({ reply: "", answers: {} });
   }
@@ -841,7 +842,8 @@ function WorkflowApp() {
     const questions = state.pending?.params?.questions || [];
     const continuing = state.phase === "complete";
     const feedbackAuthorized = state.approval_source === "followup";
-    const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy;
+    const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
+      (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
     const entries = state.history.map((entry, index) => ({ ...entry, index })).filter(entry => entry.role !== "控制器");
     return h("div", { className: "conversation-grid" },

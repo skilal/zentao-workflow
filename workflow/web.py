@@ -18,13 +18,14 @@ from uuid import uuid4
 from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
+from workflow.context import normalized_sources
 from workflow.store import session_repositories, session_title, timestamp
 from workflow.engine import ACTIVE, COMPLETE, parse_review
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
-from workflow.zentao import KINDS, ZentaoClient, identifier, parse_description
+from workflow.zentao import KINDS, ZentaoClient, identifier
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -64,20 +65,8 @@ def public_state(state):
                 review["history_index"] = index
                 cursor = index + 1
                 break
-    for source in result.get("snapshot", {}).get("sources", []):
-        raw = source.pop("raw", {})
-        # 旧会话没有资料归属字段，从已保存的原始正文恢复图片和附件的关联。
-        if "material_ids" not in source:
-            files = raw.get("files", [])
-            if isinstance(files, dict):
-                files = files.values()
-            material_ids = [identifier(file.get("id")) for file in files]
-            for field in ("spec", "verify", "desc", "steps", "bugSteps"):
-                for url in parse_description(raw.get(field)).images:
-                    query = parse_qs(urlparse(url).query)
-                    if "fileID" in query:
-                        material_ids.append(identifier(query["fileID"][0]))
-            source["material_ids"] = list(dict.fromkeys(material_ids))
+    if "snapshot" in result:
+        result["snapshot"]["sources"] = normalized_sources(result["snapshot"].get("sources", []))
     return result
 
 
