@@ -11,6 +11,7 @@ from workflow.approvals import is_controlled_write
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
 from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
+from workflow.delivery import validate_review_request
 from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.rpc import AppServer, thread_parameters
@@ -164,7 +165,8 @@ class Workflow(CompileFlow):
         archived = {key: deepcopy(state.get(key)) for key in
                     ("repos", "selections", "plan", "plan_hash", "approved_plan", "approved_hash",
                      "approval_source", "plan_round", "fix_round", "max_fix_rounds", "commits",
-                     "acceptance", "review_manifest", "review_prompt", "review_prompt_hash", "followup", "review_enabled", "stage")}
+                     "acceptance", "review_manifest", "review_prompt", "review_prompt_hash", "followup", "review_enabled", "stage",
+                     "uncommitted_manifest", "review_requested", "commit_message", "delivery_request")}
         archived.update(number=number, completed_at=state["updated_at"], reviews=deepcopy(self.current_reviews()),
                         decisions=deepcopy([entry for entry in state["decisions"] if entry.get("delivery_round", 1) == number]))
         state.setdefault("deliveries", []).append(archived)
@@ -180,6 +182,7 @@ class Workflow(CompileFlow):
                      prepare_complete=False, pause_requested=False, turn_id=None, pending=None, commits={},
                      fix_round=0, max_fix_rounds=self.settings["review"]["max_fix_rounds"], error="",
                      review_manifest={}, review_prompt="", review_prompt_hash="", acceptance=None,
+                     uncommitted_manifest={}, review_requested=False, commit_message="", delivery_request=None,
                      review_enabled=review_enabled, approval_source="followup", followup={"text": text.strip(), "images": images,
                          "request_id": request_id, "history_index": history_index,
                          "authorization_hash": sha256(dumps([text.strip(), [image["id"] for image in images]],
@@ -208,7 +211,32 @@ class Workflow(CompileFlow):
                          "获取信息、解释或查询时只读取资料并回答；用户明确要求修改时，才授权对应范围的修改。"
                          "原计划用于理解业务背景。需要澄清时等待明确回答，扩大范围时先重新计划。"
                          "本轮首次修改不占用 Review 后修复次数。Review 是否执行由控制器根据 review_enabled 和代码差异决定，"
-                         "模型不要自行审查或提交。\n本轮消息：\n" + state["followup"]["text"])
+                         "用户明确要求重新 Review、提交或重新提交时，先调用 workflow.request_review 登记请求，"
+                         "引用用户原话；需纳入的历史任务文件从 task_context.previous_task_changes 选择，"
+                         "提交标题按用户要求概括并传入 commit_message，未指定则传空字符串。"
+                         "此显式请求不受修改后自动 Review 开关限制。模型不要自行审查或提交。\n本轮消息：\n" + state["followup"]["text"])
+
+    def _apply_review_request(self):
+        state = self.state
+        path = self.store.directory(state["id"]) / f"review-request-{state['delivery_round']}.json"
+        if not path.exists():
+            return
+        request = loads(path.read_text(encoding="utf-8"))
+        if (request.get("request_id") != state["followup"]["request_id"]
+                or request.get("authorization_hash") != state["followup"]["authorization_hash"]):
+            raise WorkflowError("审查提交请求不属于本轮用户消息，已停止。")
+        if state.get("delivery_request") == request:
+            return
+        current = validate_review_request(state, request)
+        if current["included_manifest"] != request["included_manifest"]:
+            raise WorkflowError("审查提交请求登记后文件内容发生变化，请重新核对范围。")
+        for repository in state["repos"]:
+            included = {entry["path"] for entry in request["include_paths"] if entry["repository"] == repository["name"]}
+            repository["preserved_paths"] = [value for value in repository.get("preserved_paths", []) if value not in included]
+            repository["adopted_paths"] = sorted(included)
+        state.update(review_requested=True, commit_message=request["commit_message"], delivery_request=request)
+        self.save()
+        self.note("控制器", "已接收本轮明确的审查提交请求，将重新 Review，通过后本地提交。")
 
     def connect(self):
         with self.zentao_lock:
@@ -688,6 +716,7 @@ class Workflow(CompileFlow):
         if self.state["commits"]:
             raise WorkflowError("已经发生部分提交，请先处理提交状态。")
         self.state["pause_requested"] = False
+        self.state["review_requested"] = True
         self._before_review()
 
     def finalize(self, accepted_ids, acceptance_note, automatic=False):
@@ -727,6 +756,8 @@ class Workflow(CompileFlow):
             message = f"feat(zentao-tasks-{ids}): {title}"
         if state["item"]["kind"] == "bug" or state.get("delivery_round", 1) > 1:
             message = message.replace("feat(", "fix(", 1)
+        if state.get("commit_message"):
+            message = state["commit_message"]
         for repository in pending:
             if self.closed or state.get("pause_requested"):
                 state["stage"] = "部分提交" if state["commits"] else "等待修复选择"
@@ -934,6 +965,8 @@ class Workflow(CompileFlow):
                 if state["phase"] == "compile_fix":
                     self._compile_repaired()
                 else:
+                    if state["phase"] == "followup":
+                        self._apply_review_request()
                     self._before_review()
         elif state["phase"] == "review":
             if manifest(state["repos"]) != state["review_manifest"]:

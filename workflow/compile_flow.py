@@ -22,7 +22,8 @@ class CompileFlow:
         state = self.state
         if state.get("followup") and "review_enabled" in state:
             changes = manifest(state["repos"])
-            if not state["review_enabled"] or not changes:
+            if not state.get("review_requested") and (not state["review_enabled"] or not changes):
+                state["uncommitted_manifest"] = changes
                 state.update(phase="complete", stage="已完成（未审查）")
                 self.save()
                 self.note("系统", ("本轮有代码修改，已保留在工作区。" if changes else "本轮无代码修改。") +

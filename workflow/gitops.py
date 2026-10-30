@@ -294,7 +294,8 @@ def commit(repository, message, expected_manifest):
         return None
     staged_before = git(repository["path"], "diff", "--cached", "--no-renames", "--name-only", "-z", binary=True)
     preserved = {relative.casefold() for relative in repository.get("preserved_paths", [])}
-    if any(part.decode("utf-8").casefold() not in preserved for part in staged_before.split(b"\0") if part):
+    allowed_staged = preserved | {relative.casefold() for relative in repository.get("adopted_paths", [])}
+    if any(part.decode("utf-8").casefold() not in allowed_staged for part in staged_before.split(b"\0") if part):
         raise WorkflowError("暂存区存在外部改动，已停止，未重新暂存。")
     git(repository["path"], "add", "--", *paths)
     staged = git(repository["path"], "diff", "--cached", "--no-renames", "--name-only", "-z", binary=True)

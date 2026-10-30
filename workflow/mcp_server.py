@@ -7,6 +7,7 @@ from sys import stdin, stdout
 
 from workflow.gitops import differences, git, safe_file
 from workflow.compile_checks import compile_context
+from workflow.delivery import previous_task_changes, validate_review_request
 from workflow.settings import WorkflowError
 from workflow.store import SessionStore, write_authorized
 
@@ -24,6 +25,10 @@ TOOLS = [
     ("search_text", "在指定仓库文本中搜索字面量；最多返回 100 项并明确标记截断。", schema({"repository": STRING, "text": STRING, "pattern": STRING}, ("repository", "text"))),
     ("baseline_file", "读取实施前基线中的指定文件，用于区分原有与新增问题。", schema(FILE_ARGS, ("repository", "path"))),
     ("changes", "读取相对初始基线的累计差异；超长时用文件工具逐项查看。", schema({"repository": STRING}, ("repository",))),
+    ("request_review", "仅续聊中用户明确要求审查或重新提交时登记请求；回合结束后由控制器重新 Review，通过后本地提交。不会直接提交。", schema({
+        "instruction": STRING, "commit_message": STRING,
+        "include_paths": {"type": "array", "items": schema(FILE_ARGS, ("repository", "path"))}
+    }, ("instruction", "commit_message", "include_paths"))),
     ("write_file", "仅控制器授权的实施或修复阶段可用：写入一个工作区内 UTF-8 文件；编译修复限诊断文件。", schema({**FILE_ARGS, "content": STRING}, ("repository", "path", "content"))),
     ("replace_text", "仅控制器授权的实施或修复阶段可用：精确替换唯一一处文本；编译修复限诊断文件。", schema({**FILE_ARGS, "old": STRING, "new": STRING}, ("repository", "path", "old", "new"))),
     ("delete_file", "仅控制器授权的实施或修复阶段可用：删除范围内普通文件；编译修复限诊断文件。", schema(FILE_ARGS, ("repository", "path"))),
@@ -83,8 +88,16 @@ class Tools:
                     "supplement_images": state.get("supplement_images", []),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                     "review_enabled": state.get("review_enabled", True),
+                    "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
                     "compile_check": state.get("compile_check", {"enabled": False}),
                     "compile_checks": compile_context(state)}
+        if name == "request_review":
+            request = validate_review_request(state, arguments)
+            path = self.store.directory(self.session_id) / f"review-request-{state['delivery_round']}.json"
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(dumps(request, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(path)
+            return "审查提交请求已登记。回合结束后由控制器核对文件范围并重新 Review，无遗留问题后执行本地提交。"
         repositories = {repository["name"]: repository for repository in state["repos"]}
         repository = repositories.get(arguments.get("repository"))
         if repository is None:
@@ -193,7 +206,7 @@ def serve(session_id):
                           "capabilities": {"tools": {}}, "serverInfo": {"name": "workflow", "version": "0.1.0"}}
             elif method == "tools/list":
                 result = {"tools": [{"name": name, "description": description, "inputSchema": definition,
-                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file"),
+                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review"),
                                                      "openWorldHint": False}} for name, description, definition in TOOLS]}
             elif method == "tools/call":
                 try:

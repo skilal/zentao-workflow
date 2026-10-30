@@ -189,6 +189,175 @@ class FollowupChecks(TestCase):
         self.assertFalse(engine.state["review_enabled"])
         self.assertEqual(len(engine.state["deliveries"]), 1)
 
+    def test_explicit_review_commits_previous_unreviewed_changes_with_custom_title(self):
+        path = Path(self.state["repos"][0]["path"])
+        (path / "本机.txt").write_text("本机保留修改\n", encoding="utf-8")
+        git(path, "add", "本机.txt")
+        original_index = git(path, "diff", "--cached", binary=True)
+        self.send("修改保存提示", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮未提交代码\n"})
+        self.finish()
+        self.assertIn("前端/业务.txt", self.state["uncommitted_manifest"])
+        self.send("重新 Review 上轮改动并提交，标题用：完善保存提示", review_enabled=False)
+        tools = Tools(self.state["id"])
+        self.assertEqual(tools.call("task_context", {})["previous_task_changes"], [
+            {"repository": "前端", "path": "业务.txt", "unchanged": True}])
+        head = git(path, "rev-parse", "HEAD")
+        tools.call("request_review", {"instruction": "重新 Review 上轮改动并提交", "commit_message": "完善保存提示",
+            "include_paths": [{"repository": "前端", "path": "业务.txt"}]})
+        self.assertEqual(git(path, "rev-parse", "HEAD"), head)
+        self.assertIn("业务.txt", self.state["repos"][0]["preserved_paths"])
+        self.complete("已登记审查提交请求。")
+        self.assertEqual(self.state["phase"], "review")
+        self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
+        self.assertIn("本机.txt", self.state["repos"][0]["preserved_paths"])
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.assertEqual(self.state["stage"], "已完成（静态审查）")
+        self.assertEqual(git(path, "log", "-1", "--format=%s"), "完善保存提示")
+        self.assertEqual(git(path, "show", "HEAD:业务.txt"), "上轮未提交代码")
+        self.assertEqual(git(path, "diff", "--cached", binary=True), original_index)
+        self.assertEqual(git(path, "show", "HEAD:本机.txt"), "本机初始内容")
+        self.send("解释当前保存流程", review_enabled=False)
+        self.assertFalse(self.state["review_requested"])
+        self.assertEqual(self.state["commit_message"], "")
+        self.finish()
+
+    def test_rolled_back_delivery_can_be_reviewed_and_recommitted(self):
+        for mode in ("--mixed", "--soft"):
+            with self.subTest(mode=mode):
+                self.send("修改本轮业务")
+                for repo in self.state["repos"]:
+                    Tools(self.state["id"]).call("write_file", {"repository": repo["name"], "path": "业务.txt",
+                        "content": f"需要重新交付的代码 {mode}\n"})
+                self.finish()
+                for repo in self.state["repos"]:
+                    git(repo["path"], "reset", mode, "HEAD^")
+                self.send("已回退本次提交，重新 Review 并重新提交，简单概括改动", review_enabled=False)
+                candidates = Tools(self.state["id"]).call("task_context", {})["previous_task_changes"]
+                self.assertEqual(len(candidates), 2)
+                self.assertTrue(all(entry["unchanged"] for entry in candidates))
+                Tools(self.state["id"]).call("request_review", {"instruction": "重新 Review 并重新提交",
+                    "commit_message": "完善业务处理", "include_paths": [
+                        {"repository": entry["repository"], "path": entry["path"]} for entry in candidates]})
+                self.complete("已登记请求。")
+                self.assertEqual(self.state["phase"], "review")
+                self.assertEqual(len(self.state["review_manifest"]), 2)
+                self.complete(dumps({"summary": "重新审查无遗留问题", "findings": [], "resolved_previous": []}))
+                for repo in self.state["repos"]:
+                    self.assertEqual(git(repo["path"], "log", "-1", "--format=%s"), "完善业务处理")
+                    self.assertEqual(git(repo["path"], "show", "HEAD:业务.txt"), f"需要重新交付的代码 {mode}")
+                    self.assertFalse(git(repo["path"], "status", "--porcelain"))
+
+    def test_review_request_rejects_foreign_or_changed_preserved_files(self):
+        self.send("修改保存提示", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮代码\n"})
+        self.finish()
+        path = Path(self.state["repos"][0]["path"])
+        (path / "本机.txt").write_text("外部修改\n", encoding="utf-8")
+        (path / "业务.txt").write_text("任务外再次修改\n", encoding="utf-8")
+        self.send("重新 Review 并提交", review_enabled=False)
+        tools = Tools(self.state["id"])
+        self.assertEqual(tools.call("task_context", {})["previous_task_changes"], [
+            {"repository": "前端", "path": "业务.txt", "unchanged": False}])
+        for relative in ("本机.txt", "业务.txt", "../业务.txt"):
+            with self.subTest(relative=relative), self.assertRaises(WorkflowError):
+                tools.call("request_review", {"instruction": "重新 Review 并提交", "commit_message": "",
+                    "include_paths": [{"repository": "前端", "path": relative}]})
+        self.assertFalse((self.engine.store.directory(self.state["id"]) / f"review-request-{self.state['delivery_round']}.json").exists())
+
+    def test_review_request_validation_and_controlled_approval(self):
+        self.send("重新 Review 当前改动并提交", review_enabled=False)
+        args = {"instruction": "重新 Review 当前改动并提交", "commit_message": "", "include_paths": []}
+        description = next(description for name, description, _ in TOOLS if name == "request_review")
+        params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
+            "tool_description": description, "tool_params": args}}
+        self.assertTrue(is_controlled_write(self.state, params))
+        tools = Tools(self.state["id"])
+        for invalid in ({**args, "instruction": "用户未说过的话"}, {**args, "commit_message": "标题\n第二行"},
+                        {**args, "include_paths": "全部文件"}, {**args, "commit_message": None}):
+            with self.subTest(invalid=invalid), self.assertRaises(WorkflowError):
+                tools.call("request_review", invalid)
+        self.state["phase"] = "review"
+        self.engine.save()
+        with self.assertRaises(WorkflowError):
+            tools.call("request_review", args)
+        self.assertFalse(is_controlled_write(self.state, params))
+
+    def test_changed_historical_task_file_requires_explicit_answer_before_delivery(self):
+        self.send("修改提示", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮任务改动\n"})
+        self.finish()
+        path = Path(self.state["repos"][0]["path"])
+        (path / "业务.txt").write_text("人工调整后的任务改动\n", encoding="utf-8")
+        self.send("重新 Review 并提交", review_enabled=False)
+        args = {"instruction": "重新 Review 并提交", "commit_message": "完善提示",
+                "include_paths": [{"repository": "前端", "path": "业务.txt"}]}
+        with self.assertRaises(WorkflowError):
+            Tools(self.state["id"]).call("request_review", args)
+        self.complete("[需要澄清] 业务.txt 包含人工调整，是否纳入当前内容？")
+        self.assertFalse(self.state["review_requested"])
+        self.engine.answer("确认将前端业务.txt 当前内容纳入审查提交")
+        args["instruction"] = "确认将前端业务.txt 当前内容纳入审查提交"
+        Tools(self.state["id"]).call("request_review", args)
+        self.complete("已按明确答复登记请求。")
+        self.assertEqual(self.state["phase"], "review")
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.assertEqual(self.state["stage"], "已完成（静态审查）")
+        self.assertEqual(git(path, "show", "HEAD:业务.txt"), "人工调整后的任务改动")
+
+    def test_review_request_waits_for_answers_and_survives_restart(self):
+        self.send("重新 Review 并提交", review_enabled=False)
+        Tools(self.state["id"]).call("request_review", {"instruction": "重新 Review 并提交", "commit_message": "", "include_paths": []})
+        self.complete("[需要澄清] 请确认业务范围。")
+        self.assertEqual(self.state["stage"], "等待计划补充")
+        self.assertFalse(self.state["review_requested"])
+        restored = WebApplication(self.settings)
+        self.addCleanup(restored.close)
+        engine = restored.sessions.get(self.state["id"]).engine
+        engine.rpc = Mock()
+        engine.rpc.request.return_value = {"turn": {"id": "恢复回合"}}
+        with patch.object(engine, "ensure_rpc"):
+            engine.answer("范围保持原需求")
+        engine.last_message = "已明确范围，等待控制器处理请求。"
+        with patch.object(engine, "_begin_review") as review:
+            engine._completed({"status": "completed"}, engine.state["id"], engine.connection_epoch)
+        review.assert_called_once()
+        self.assertTrue(engine.state["review_requested"])
+
+    def test_explicit_rereview_bypasses_disabled_automatic_review(self):
+        self.send("修改保存提示", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "当前任务修改\n"})
+        self.state.update(stage="已停止", error="连接中断")
+        self.engine.rereview()
+        self.assertEqual(self.state["phase"], "review")
+        self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.assertEqual(self.state["stage"], "已完成（静态审查）")
+
+    def test_requested_review_findings_still_require_user_selection(self):
+        self.send("重新 Review 并提交", review_enabled=False)
+        Tools(self.state["id"]).call("request_review", {"instruction": "重新 Review 并提交", "commit_message": "", "include_paths": []})
+        self.complete("已登记请求。")
+        result = deepcopy(self.state["reviews"][0]["result"])
+        result["findings"][0].pop("id")
+        with patch("workflow.engine.commit") as committing:
+            self.complete(dumps(result))
+        committing.assert_not_called()
+        self.assertEqual(self.state["stage"], "等待修复选择")
+
+    def test_requested_review_rejects_code_changed_after_request(self):
+        self.send("修改提示", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮改动\n"})
+        self.finish()
+        self.send("重新 Review 并提交", review_enabled=False)
+        Tools(self.state["id"]).call("request_review", {"instruction": "重新 Review 并提交", "commit_message": "",
+            "include_paths": [{"repository": "前端", "path": "业务.txt"}]})
+        (Path(self.state["repos"][0]["path"]) / "业务.txt").write_text("请求后外部改动\n", encoding="utf-8")
+        with patch.object(self.engine, "_begin_review") as review, self.assertRaises(WorkflowError):
+            self.complete("已登记请求。")
+        review.assert_not_called()
+        self.assertIn("业务.txt", self.state["repos"][0]["preserved_paths"])
+
     def test_legacy_active_followup_keeps_automatic_review(self):
         self.send()
         self.state.pop("review_enabled")
