@@ -71,6 +71,20 @@ def parse_review(text):
     return result
 
 
+def skipped_review_ids(state, delivery_round):
+    reviews = {entry.get("fix_round", 0): entry for entry in state["reviews"]
+               if entry.get("delivery_round", 1) == delivery_round}
+    skipped = set()
+    for decision in state["decisions"]:
+        if decision.get("delivery_round", 1) != delivery_round:
+            continue
+        review = reviews.get(decision["round"] - 1)
+        if review:
+            skipped.update(finding["id"] for finding in review["result"]["findings"]
+                           if finding["id"] not in decision["fix_ids"])
+    return skipped
+
+
 class Workflow(CompileFlow):
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
@@ -549,6 +563,8 @@ class Workflow(CompileFlow):
                      "。previous_id 只能填写上述编号或空字符串；没有可引用编号时，所有问题的 previous_id 必须为空，resolved_previous 必须为空数组。"
                      "此前其他交付轮次的问题及接受记录仅作背景，不能沿用其编号或自动列为本轮遗留问题。"
                      "本轮重新发现的问题按当前差异独立判断，origin 为原有问题不代表可以引用历史编号。")
+            text += ("\n本轮已选择不修复的问题编号：" + dumps(sorted(skipped_review_ids(state, state.get("delivery_round", 1)))) +
+                     "。这些问题保留原编号和记录，不修改、不要求再次选择或填写原因，也不作为待修复问题；不要另建编号重复报告同一问题。")
         for repository in state["repos"]:
             ensure_baseline(repository)
         if state.get("pause_requested"):
@@ -782,7 +798,8 @@ class Workflow(CompileFlow):
         if state["fix_round"] >= state["max_fix_rounds"]:
             raise WorkflowError("已达到修复轮次上限；请明确追加一轮后再修复。")
         current = self.current_reviews()[-1]["result"]["findings"]
-        lookup = {finding["id"]: finding for finding in current}
+        skipped = skipped_review_ids(state, state.get("delivery_round", 1))
+        lookup = {finding["id"]: finding for finding in current if finding["id"] not in skipped}
         if not selected_ids or any(item not in lookup for item in selected_ids):
             raise WorkflowError("请至少选择一个有效问题。")
         if manifest(state["repos"]) != state["review_manifest"]:
@@ -819,10 +836,9 @@ class Workflow(CompileFlow):
         if not state["commits"]:
             self._guard_compile()
         findings = self.current_reviews()[-1]["result"]["findings"]
-        if set(accepted_ids) != {finding["id"] for finding in findings}:
-            raise WorkflowError("结束前必须明确接受所有仍存在的问题；否则请选择修复。")
-        if findings and not acceptance_note.strip():
-            raise WorkflowError("接受剩余问题时必须填写原因。")
+        skipped = skipped_review_ids(state, state.get("delivery_round", 1))
+        if set(accepted_ids) != {finding["id"] for finding in findings if finding["id"] not in skipped}:
+            raise WorkflowError("提交范围与当前待处理问题不一致，请刷新后重试。")
         if not automatic:
             state["pause_requested"] = False
         for repository in state["repos"]:
@@ -838,7 +854,8 @@ class Workflow(CompileFlow):
                     if any(key.startswith(repo["name"] + "/") for repo in pending)}
         if manifest(pending) != expected:
             raise WorkflowError("最后一次 Review 后代码发生改变，不能提交。")
-        state["acceptance"] = {"ids": accepted_ids, "reason": acceptance_note, "source": "auto" if automatic else "manual"}
+        state["acceptance"] = {"ids": [finding["id"] for finding in findings], "reason": acceptance_note,
+                               "source": "auto" if automatic else "manual"}
         self.save()
         title = session_title(state) if state["item"] is None else str(state["item"]["title"])
         title = title.replace("\n", " ").replace("\r", " ")[:100]
@@ -1107,8 +1124,9 @@ class Workflow(CompileFlow):
                                      "manifest": state["review_manifest"].copy()})
             state["stage"] = "等待修复选择"
             self.save()
-            if not result["findings"] and not state.get("pause_requested") and not self.closed:
-                self.note("控制器", "Review 无遗留问题，自动执行本地提交，不 push。")
+            skipped = skipped_review_ids(state, state.get("delivery_round", 1))
+            if not any(finding["id"] not in skipped for finding in result["findings"]) and not state.get("pause_requested") and not self.closed:
+                self.note("控制器", "Review 无待处理问题，已选择不修复的问题保留记录，自动执行本地提交，不 push。")
                 self.finalize([], "", automatic=True)
 
     def _close_rpc(self):

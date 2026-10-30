@@ -299,18 +299,66 @@ class AutoDeliveryChecks(TestCase):
             self.complete(text)
         finalize.assert_called_once_with([], "", automatic=True)
 
-    def test_review_with_findings_requires_explicit_acceptance_and_reason(self):
+    def test_review_with_findings_can_skip_all_without_a_reason(self):
         text = self.review([finding()])
         with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit") as operation:
             self.complete(text)
             operation.assert_not_called()
             with self.assertRaises(WorkflowError):
                 self.flow.finalize([], "")
-            with self.assertRaises(WorkflowError):
-                self.flow.finalize(["R01-01"], "")
-            self.flow.finalize(["R01-01"], "明确接受该问题")
+            self.flow.finalize(["R01-01"], "")
         self.assertEqual(self.state["acceptance"]["source"], "manual")
+        self.assertEqual(self.state["acceptance"]["reason"], "")
         self.assertEqual(self.state["phase"], "complete")
+
+    def test_unselected_issue_does_not_block_commit_after_selected_issue_is_fixed(self):
+        text = self.review([finding(), {**finding(), "title": "本轮不修复的问题"}])
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(text)
+            self.flow.fix(["R01-01"], "")
+        text = self.review(resolved=[{"id": "R01-01", "evidence": "已补齐选中的业务分支"}])
+        prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
+        self.assertIn('本轮已选择不修复的问题编号：["R01-02"]', prompt)
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(text)
+        self.assertEqual(self.state["phase"], "complete")
+        self.assertEqual(self.state["reviews"][-1]["result"]["findings"][0]["id"], "R01-02")
+        self.assertEqual(self.state["acceptance"], {"ids": ["R01-02"], "reason": "", "source": "auto"})
+        self.assertEqual(public_state(self.state)["reviews"][-1]["skipped_ids"], ["R01-02"])
+
+    def test_unresolved_selected_issue_still_waits_and_skipped_issue_cannot_be_selected(self):
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([finding(), {**finding(), "title": "未选问题"}]))
+            self.flow.fix(["R01-01"], "")
+            self.complete(self.review())
+        self.assertEqual(self.state["stage"], "等待修复选择")
+        self.assertEqual(len(self.state["reviews"][-1]["result"]["findings"]), 2)
+        with self.assertRaisesRegex(WorkflowError, "有效问题"):
+            self.flow.fix(["R01-02"], "")
+        with self.assertRaises(WorkflowError):
+            self.flow.finalize([], "", automatic=True)
+
+    def test_new_issue_after_selected_fix_still_waits_for_selection(self):
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([finding(), {**finding(), "title": "未选问题"}]))
+            self.flow.fix(["R01-01"], "")
+            self.complete(self.review([finding()], [{"id": "R01-01", "evidence": "选中问题已修复"}]))
+        self.assertEqual(self.state["stage"], "等待修复选择")
+        payload = public_state(self.state)
+        self.assertEqual(payload["reviews"][-1]["skipped_ids"], ["R01-02"])
+        self.assertEqual([entry["id"] for entry in payload["reviews"][-1]["result"]["findings"]], ["R02-01", "R01-02"])
+
+    def test_skipped_issues_survive_reload_but_do_not_cross_delivery_rounds(self):
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([finding(), {**finding(), "title": "未选问题"}]))
+            self.flow.fix(["R01-01"], "")
+        restored = self.flow.store.load(self.state["id"])
+        self.assertEqual(public_state(restored)["reviews"][-1]["skipped_ids"], ["R01-02"])
+        self.state["delivery_round"] = 2
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([finding()]))
+        self.assertEqual(self.state["stage"], "等待修复选择")
+        self.assertEqual(public_state(self.state)["reviews"][-1]["skipped_ids"], [])
 
     def test_changed_files_and_invalid_review_results_never_commit(self):
         text = self.review()

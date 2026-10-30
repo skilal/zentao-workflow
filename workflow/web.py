@@ -20,7 +20,7 @@ from webbrowser import open as open_browser
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
 from workflow.context import normalized_sources
 from workflow.store import session_repositories, session_title, timestamp
-from workflow.engine import ACTIVE, COMPLETE, parse_review
+from workflow.engine import ACTIVE, COMPLETE, parse_review, skipped_review_ids
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
@@ -45,6 +45,7 @@ def public_state(state):
     # 旧记录只在响应副本中关联原文，不修改磁盘上的会话数据。
     cursor = 0
     for review in result.get("reviews", []):
+        review["skipped_ids"] = sorted(skipped_review_ids(state, review.get("delivery_round", 1)))
         if "history_index" in review:
             cursor = review["history_index"] + 1
             continue

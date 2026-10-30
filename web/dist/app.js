@@ -973,40 +973,42 @@ function WorkflowApp() {
   function renderReview(entry, originalText, validationError = "") {
     const latest = !validationError && entry.number === review?.number && (entry.delivery_round || 1) === state.delivery_round && state.phase !== "complete";
     const findings = entry.result.findings;
-    const selected = latest ? draft.selected_findings.filter(id => findings.some(finding => finding.id === id)) : [];
+    const skipped = new Set(entry.skipped_ids || []);
+    const pending = findings.filter(finding => !skipped.has(finding.id));
+    const selected = latest ? draft.selected_findings.filter(id => pending.some(finding => finding.id === id)) : [];
     const limitReached = state.fix_round >= state.max_fix_rounds;
     const canSelect = latest && !busy && ["等待修复选择", "部分提交"].includes(stage);
     const canFix = latest && stage === "等待修复选择" && !busy;
-    const canCommit = canSelect && selected.length === findings.length && (!findings.length || draft.review_note.trim());
+    const canCommit = canSelect && !selected.length;
     return h("section", { className: "review-content", id: validationError ? undefined : `review-${entry.number}`, "aria-label": validationError ? "未通过校验的 Review" : `第 ${entry.number} 次 Review` },
       h("div", { className: "review-heading" }, h("strong", null, validationError ? "未通过校验的 Review" : `第 ${entry.number} 次 Review`),
         validationError ? h(Tag, { color: "error" }, "校验失败 · 只读") : h(React.Fragment, null,
           h(Tag, null, latest ? `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮` : `修复第 ${entry.fix_round} 轮后`), !latest && h(Tag, null, "历史记录 · 只读"))),
       validationError && h(Alert, { type: "error", showIcon: true, message: "此结果不能作为修复或提交依据", description: validationError }),
-      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, findings.length, h("span", null, validationError ? "返回问题" : "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
+      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, pending.length, h("span", null, validationError ? "返回问题" : "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
       h("div", { className: "finding-list" }, findings.length === 0 && h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: validationError ? "返回结果中没有问题，尚未通过校验" : "本轮没有发现待处理问题" }),
         findings.map((finding, index) => h("div", { className: `finding-card${selected.includes(finding.id) ? " selected" : ""}`, key: validationError ? index : finding.id },
-          h("div", { className: "finding-title" }, h(Checkbox, { checked: selected.includes(finding.id), disabled: !canSelect,
+          h("div", { className: "finding-title" }, h(Checkbox, { checked: selected.includes(finding.id), disabled: !canSelect || skipped.has(finding.id),
             onChange: event => changeDraft({ selected_findings: event.target.checked ? [...selected, finding.id] : selected.filter(id => id !== finding.id) }) },
             h(Tag, { color: ["P0", "P1"].includes(finding.severity) ? "error" : finding.severity === "P2" ? "warning" : "default" }, finding.severity),
             h("strong", null, finding.title))),
           h("div", { className: "finding-meta" }, h(Typography.Text, { code: true }, validationError ? `问题 ${index + 1}` : finding.id), h(Tag, null, finding.category),
-            h(Tag, { color: finding.origin === "本次引入" ? "volcano" : finding.origin === "证据不足" ? "gold" : "default" }, finding.origin)),
+            h(Tag, { color: finding.origin === "本次引入" ? "volcano" : finding.origin === "证据不足" ? "gold" : "default" }, finding.origin), skipped.has(finding.id) && h(Tag, null, "不修复")),
           h("div", { className: "finding-location" }, `${finding.repository}/${finding.path}:${finding.line}`),
           h(Collapse, { ghost: true, size: "small", items: [{ key: "details", label: "判断依据、处理建议与业务影响",
             children: h("div", { className: "finding-details" }, ...[["判断依据", finding.evidence], ["处理建议", finding.suggestion], ["业务影响", finding.impact]].map(([label, value]) => h("div", { key: label }, h("strong", null, label), h(Markdown, { text: value })))) }] })))),
       latest && h("div", { className: "review-actions" },
         h(Button, { onClick: openDiff, disabled: stopped }, "查看累计代码差异"),
-        limitReached && findings.length > 0 && h(Alert, { type: "warning", showIcon: true, style: { marginTop: 14 }, message: "已达到本次修复轮次上限", description: "如需继续修复，请明确追加一轮；仍有问题时不会自动结束。" }),
-        h(Field, { label: "修复说明 / 接受剩余问题的原因" }, h(Input.TextArea, { rows: 3, value: draft.review_note, disabled: !canSelect,
-          placeholder: "补充修复要求。接受剩余问题并结束时，请填写接受原因。", onChange: event => changeDraft({ review_note: event.target.value }) })),
+        limitReached && pending.length > 0 && h(Alert, { type: "warning", showIcon: true, style: { marginTop: 14 }, message: "已达到本次修复轮次上限", description: "如需继续修复，请明确追加一轮；也可选择不修复剩余问题并本地提交。" }),
+        h(Field, { label: "修复说明（可选）" }, h(Input.TextArea, { rows: 3, value: draft.review_note, disabled: !canSelect,
+          placeholder: "可补充选中问题的修复要求，无需填写不修复原因。", onChange: event => changeDraft({ review_note: event.target.value }) })),
         h("div", { className: "action-bar" },
           h(Button, { disabled: !canFix, onClick: () => act("add_round") }, "追加一轮"),
           h(Button, { disabled: busy || !["等待修复选择", "已暂停", "已停止"].includes(stage), onClick: () => act("rereview") }, "重新 Review"),
           h(Button, { type: "primary", disabled: !canFix || !selected.length || limitReached, onClick: () => act("fix", { ids: selected, note: draft.review_note }) }, `修复选中 ${selected.length} 项并复审`)),
         h(Divider), h("div", { className: "review-finalize" },
-          h("span", { className: "muted" }, findings.length ? "结束前须选中全部剩余问题，并填写接受原因" : state.phase === "complete" ? "本地提交已完成，未 push" : "无遗留问题时自动本地提交；提交失败后可手动继续"),
-          h(Button, { disabled: !canCommit, onClick: () => act("finalize", { ids: selected, note: draft.review_note }) }, findings.length ? "接受剩余问题并本地提交" : "继续本地提交"))),
+          h("span", { className: "muted" }, pending.length ? "只勾选要修复的问题；点击修复后，未选项本轮不再修复，无需填写原因" : state.phase === "complete" ? "本地提交已完成，未 push" : "无待处理问题时自动本地提交；提交失败后可手动继续"),
+          h(Button, { disabled: !canCommit, onClick: () => act("finalize", { ids: pending.map(finding => finding.id), note: "" }) }, pending.length ? "不修复剩余问题并本地提交" : "继续本地提交"))),
       h(Collapse, { ghost: true, size: "small", items: [{ key: "original", label: "输出原文", children: h("pre", { className: "review-original" }, originalText) }] }));
   }
 
