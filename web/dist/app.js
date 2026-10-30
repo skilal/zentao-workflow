@@ -861,6 +861,9 @@ function WorkflowApp() {
                     stage === "审查中" ? h("span", { className: "muted" }, "正在校验审查结果…") : h("pre", { className: "review-original" }, entry.text) :
                     entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images)))),
+            !model.stream && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
+              h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
+                stage === "准备工作区中" ? " 正在准备工作区…" : " 请求已发送，正在等待模型回复…"),
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
               model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream }))))),
         h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复" },

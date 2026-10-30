@@ -3,7 +3,6 @@
 from pathlib import Path
 
 from workflow.gitops import safe_file
-from workflow.delivery import validate_review_request
 from workflow.mcp_server import SKIP, TOOLS
 from workflow.settings import WorkflowError
 from workflow.store import write_authorized
@@ -28,11 +27,8 @@ def is_controlled_write(state, params):
     if not isinstance(arguments, dict) or any(key not in arguments for key in tool[1]["required"]):
         return False
     if tool[0] == "request_review":
-        try:
-            validate_review_request(state, arguments)
-        except WorkflowError:
-            return False
-        return True
+        # 此工具只登记请求。范围校验由 MCP 返回具体错误，不能转成“用户拒绝”。
+        return state["phase"] == "followup" and state["stage"] == "续聊处理中"
     if any(not isinstance(value, str) for value in arguments.values()):
         return False
     repository = next((repository for repository in state["repos"] if repository["name"] == arguments.get("repository")), None)
