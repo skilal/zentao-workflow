@@ -85,6 +85,17 @@ class AutoDeliveryChecks(TestCase):
         self.event("item/plan/delta", delta="尚未完成的计划")
         self.complete(plan="完整最终计划")
         self.assertEqual(self.state["approved_plan"], "完整最终计划")
+        message = next(entry for entry in self.state["history"] if entry["role"] == "Codex")
+        self.assertEqual(message["text"], "<proposed_plan>\n完整最终计划\n</proposed_plan>")
+        self.assertEqual(message["phase"], "plan")
+
+    def test_native_plan_is_recorded_when_last_message_only_contains_an_introduction(self):
+        self.start_plan()
+        self.complete("我先读取当前代码，再整理计划。", plan="重新生成的完整计划")
+        message = next(entry for entry in self.state["history"] if entry["role"] == "Codex")
+        self.assertEqual(message["text"], "<proposed_plan>\n重新生成的完整计划\n</proposed_plan>")
+        authorization = next(entry for entry in self.state["history"] if "自动授权实施" in entry["text"])
+        self.assertIn("开始实施", authorization["display_text"])
 
     def test_stream_only_and_empty_plan_cannot_authorize_implementation(self):
         for text, stream in (("", "流式计划"), ("<proposed_plan> </proposed_plan>", "")):
@@ -387,8 +398,8 @@ class AutoDeliveryChecks(TestCase):
     def test_pause_between_review_save_and_finalize_prevents_commit(self):
         text = self.review()
         original_note = self.flow.note
-        def pause_on_commit(role, message):
-            original_note(role, message)
+        def pause_on_commit(role, message, **metadata):
+            original_note(role, message, **metadata)
             if role == "控制器" and "自动执行本地提交" in message:
                 self.state["pause_requested"] = True
         with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit") as operation, patch.object(self.flow, "note", side_effect=pause_on_commit):

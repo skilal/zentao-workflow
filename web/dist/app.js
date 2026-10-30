@@ -812,14 +812,16 @@ function WorkflowApp() {
 
   function renderImplementationPlan() {
     const feedbackAuthorized = state.approval_source === "followup";
+    const approved = state.approved_hash === state.plan_hash;
+    const planStatus = feedbackAuthorized ? "原计划 · 业务背景" : approved && state.phase === "complete" ? "计划已完成" : stage;
     return h("section", { id: "implementation-plan", "aria-label": implementationPlanTitle },
       h(CardBox, { size: "small", className: "app-card sidebar-card implementation-plan-card", title: implementationPlanTitle,
         extra: h(Button, { type: "text", size: "small", "aria-label": `隐藏${implementationPlanTitle}`, onClick: () => {
           setImplementationPlanHidden(true); sessionStorage.setItem("workflow-implementation-plan-hidden", "true");
         } }, "隐藏") },
         state.plan ? h(React.Fragment, null,
-          h("div", { className: "plan-status" }, h(Tag, { color: state.approved_hash === state.plan_hash ? "success" : "gold" },
-            feedbackAuthorized ? "原计划 · 业务背景" : state.approved_hash === state.plan_hash ? (state.approval_source === "auto" ? "自动授权实施" : "人工确认实施") : "待确认")),
+          h("div", { className: "plan-status" }, stageTag(planStatus),
+            approved && !feedbackAuthorized && h(Tag, null, state.approval_source === "auto" ? "自动授权实施" : "人工确认实施")),
           h("div", { className: "plan-panel" }, h(Markdown, { text: state.plan })),
           h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`)) :
           h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "完成需求澄清后生成计划" }),
@@ -937,7 +939,7 @@ function WorkflowApp() {
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
     const entries = [...state.history.map((entry, index) => ({ ...entry, index })),
       ...(state.progress_turns || []).map(turn => ({ process: turn, index: turn.history_index }))]
-      .filter(entry => entry.role !== "控制器").sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
+      .filter(entry => entry.role !== "控制器" || entry.display_text).sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
     const processRunning = state.progress_turns?.at(-1)?.status === "running";
     return h("div", { className: "conversation-grid" },
       h("div", { className: "card-stack" },
@@ -945,13 +947,17 @@ function WorkflowApp() {
         renderCompileChecks(),
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
+          state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
+            message: `第 ${state.delivery_round} 轮已完成`, "aria-label": "本轮执行结果", style: { marginBottom: 16 },
+            description: stage === "已完成（未审查）" ? `${state.review_enabled ? "本轮无代码修改，已跳过 Review" : "本轮自动 Review 已关闭"}；未执行本地提交。` :
+              "Review 已完成，本地提交已完成，可在下方查看审查结论及本地提交记录。" }),
           h("div", { className: "conversation-feed", ref: feedRef, onScroll: event => {
             const feed = event.currentTarget;
             followBottom.current = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48;
           } }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
             entries.map(entry => entry.process ? h(ProgressTurn, { key: entry.process.id, turn: entry.process }) :
-              h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: entry.index },
-              h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time)),
+              h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : ["系统", "控制器"].includes(entry.role) ? "system" : "assistant"}`, key: entry.index },
+              h("div", { className: "chat-meta" }, h("strong", null, entry.role === "控制器" ? "系统" : entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
                 typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
               h("div", { className: `chat-body${reviewsByMessage.has(entry.index) || entry.review_output ? " review-message" : ""}` },
@@ -959,7 +965,7 @@ function WorkflowApp() {
                   entry.phase === "review" && entry.role === "Codex" ?
                     stage === "审查中" ? h("span", { className: "muted" }, "正在校验审查结果…") :
                       entry.review_output ? renderReview({ result: entry.review_output }, entry.text, entry.review_error) : h("pre", { className: "review-original" }, entry.text) :
-                    entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.text,
+                    entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.display_text || entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup")))),
             !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),

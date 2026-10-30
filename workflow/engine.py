@@ -590,7 +590,8 @@ class Workflow(CompileFlow, ProgressFlow):
         if phase == "plan" and state.get("plan_round") is not None:
             state["plan_round"]["turns"] += 1
         self.save()
-        self.note("控制器", text)
+        self.note("控制器", text, display_text=("已进入 Review，正在审查本轮代码；无待处理问题后自动本地提交。"
+                                             if phase == "review" else ""))
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
         turn_cwd = session_path if phase == "branch" else session_path / "workspace"
@@ -687,7 +688,8 @@ class Workflow(CompileFlow, ProgressFlow):
         state["approved_hash"] = state["plan_hash"]
         state["approval_source"] = source
         self.note("控制器" if source == "auto" else "用户",
-                  ("本轮计划未提问且一次完整生成，自动授权实施，计划版本：" if source == "auto" else "人工确认实施，计划版本：") + state["approved_hash"])
+                  ("本轮计划未提问且一次完整生成，自动授权实施，计划版本：" if source == "auto" else "人工确认实施，计划版本：") + state["approved_hash"],
+                  display_text="本轮计划未提问且一次成稿，已自动授权，开始实施。" if source == "auto" else "已确认当前计划，开始实施。")
         state["phase"] = "implement"
         self.save()
         self._start_turn("控制器已授权实施上下文中的计划，授权来源见 workflow.task_context。仅实现该计划的最小范围，先阅读已有代码与项目规范。"
@@ -892,7 +894,7 @@ class Workflow(CompileFlow, ProgressFlow):
         state["stage"] = "已完成（静态审查）"
         state["phase"] = "complete"
         self.save()
-        self.note("系统", "本地提交已完成。未 push，未修改禅道状态，功能运行与验收未验证。")
+        self.note("系统", "本轮已完成：Review 已完成，本地提交已完成。未 push，未修改禅道状态，功能运行与验收未验证。")
 
     def pause(self):
         state = self.state
@@ -1094,7 +1096,7 @@ class Workflow(CompileFlow, ProgressFlow):
             match = search(r"<proposed_plan>([\s\S]*?)</proposed_plan>", text)
             plan = match.group(1).strip() if match else ""
         history_index = len(state["history"])
-        self.note("Codex", text or self.plan_stream)
+        self.note("Codex", f"<proposed_plan>\n{plan}\n</proposed_plan>" if state["phase"] == "plan" and plan else text or self.plan_stream)
         if state["phase"] == "plan":
             state["plan"] = plan
             state["plan_hash"] = sha256(plan.encode("utf-8")).hexdigest() if plan else ""
@@ -1113,6 +1115,8 @@ class Workflow(CompileFlow, ProgressFlow):
                 if state["phase"] == "compile_fix":
                     self._compile_repaired()
                 else:
+                    if state["phase"] == "implement":
+                        self.note("系统", "本轮计划实施已完成，继续处理后续检查。")
                     if state["phase"] == "followup":
                         self._apply_review_request()
                     self._before_review()
@@ -1146,7 +1150,8 @@ class Workflow(CompileFlow, ProgressFlow):
             self.save()
             skipped = skipped_review_ids(state, state.get("delivery_round", 1))
             if not any(finding["id"] not in skipped for finding in result["findings"]) and not state.get("pause_requested") and not self.closed:
-                self.note("控制器", "Review 无待处理问题，已选择不修复的问题保留记录，自动执行本地提交，不 push。")
+                self.note("控制器", "Review 无待处理问题，已选择不修复的问题保留记录，自动执行本地提交，不 push。",
+                          display_text="Review 无待处理问题，正在执行本地提交。")
                 self.finalize([], "", automatic=True)
 
     def _close_rpc(self):

@@ -150,6 +150,38 @@ def run():
             assert state["stage"] == "已完成（未审查）"
             expect(page.get_by_text("Review（跳过）", exact=True)).to_be_visible()
             expect(page.get_by_text("本地提交（跳过）", exact=True)).to_be_visible()
+
+            # 独立检查重新生成原生计划后的自动实施、Review、完成提示与刷新恢复。
+            delivery_number = state["delivery_round"] + 1
+            review_number = len(state["reviews"]) + 1
+            reply.fill("重新生成计划后完成业务规则调整")
+            review_switch.click()
+            send.click()
+            expect(page.get_by_text("续聊处理中", exact=True).first).to_be_visible()
+            fixture.drain()
+            engine.pause()
+            fixture.complete("")
+            engine._new_plan_round()
+            engine.resume()
+            expect(page.get_by_text("计划中", exact=True).first).to_be_visible()
+            engine.completed_plan = "本轮完整计划：仅调整补充业务规则"
+            fixture.complete("我先核对当前代码，再整理实施计划。")
+            expect(page.get_by_text("实施中", exact=True).first).to_be_visible()
+            expect(page.locator(".conversation-feed").get_by_text("本轮完整计划：仅调整补充业务规则", exact=True)).to_be_visible()
+            expect(page.locator(".conversation-feed").get_by_text("本轮计划未提问且一次成稿，已自动授权，开始实施。", exact=True).last).to_be_visible()
+            Tools(state["id"]).call("write_file", {"repository": "前端", "path": "计划校验.txt", "content": "补充规则\n"})
+            fixture.complete("已完成业务规则修改。")
+            expect(page.get_by_text("审查中", exact=True).first).to_be_visible()
+            expect(page.locator(".conversation-feed").get_by_text("本轮计划实施已完成，继续处理后续检查。", exact=True).last).to_be_visible()
+            expect(page.locator(".conversation-feed").get_by_text("已进入 Review，正在审查本轮代码；无待处理问题后自动本地提交。", exact=True).last).to_be_visible()
+            fixture.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": []}))
+            expect(send).to_be_enabled()
+            expect(review_switch).not_to_be_checked()
+            expect(page.get_by_label("本轮执行结果")).to_contain_text("Review 已完成，本地提交已完成")
+            expect(page.locator("#implementation-plan").get_by_text("计划已完成", exact=True)).to_be_visible()
+            page.reload()
+            expect(page.get_by_label("本轮执行结果")).to_contain_text(f"第 {delivery_number} 轮已完成")
+            expect(page.locator(f"#review-{review_number}")).to_be_visible()
             for width in (1500, 720, 390):
                 page.set_viewport_size({"width": width, "height": 1050})
                 page.wait_for_function("() => !document.getAnimations().some(animation => animation.playState === 'running')")

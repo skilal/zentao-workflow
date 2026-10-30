@@ -171,6 +171,33 @@ class FollowupChecks(TestCase):
         self.assertEqual(git(path, "show", "HEAD:业务.txt"), "首轮交付")
         self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "未审查的修改\n")
 
+    def test_replanned_native_plan_keeps_review_and_reports_completion(self):
+        self.send("补充原有业务规则", review_enabled=True)
+        self.engine.pause()
+        self.complete("")
+        self.engine._new_plan_round()
+        self.engine.resume()
+        self.engine.completed_plan = "仅调整本轮业务规则"
+        self.complete("我先读取代码并整理计划。")
+        self.assertEqual((self.state["phase"], self.state["approval_source"]), ("implement", "auto"))
+        self.assertTrue(self.state["review_enabled"])
+        plan_message = next(entry for entry in reversed(self.state["history"])
+                            if entry["role"] == "Codex" and entry["phase"] == "plan")
+        self.assertIn("仅调整本轮业务规则", plan_message["text"])
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "本轮规则调整\n"})
+        self.complete("本轮修改已完成。")
+        self.assertEqual(self.state["phase"], "review")
+        self.assertTrue(any(entry["role"] == "系统" and "计划实施已完成" in entry["text"]
+                            for entry in self.state["history"]))
+        self.assertIn("已进入 Review", self.state["history"][-1]["display_text"])
+        self.complete(dumps({"summary": "本轮审查通过", "findings": [], "resolved_previous": []}))
+        self.assertEqual((self.state["phase"], self.state["stage"]), ("complete", "已完成（静态审查）"))
+        self.assertEqual(len(self.engine.current_reviews()), 1)
+        self.assertEqual(git(self.state["repos"][0]["path"], "show", "HEAD:业务.txt"), "本轮规则调整")
+        self.assertIn("Review 已完成，本地提交已完成", self.state["history"][-1]["text"])
+        saved = self.engine.store.load(self.state["id"])
+        self.assertEqual(saved["history"], self.state["history"])
+
     def test_switch_survives_clarification_replanning_and_restart(self):
         self.send("调整提示", review_enabled=False)
         self.complete("[需要澄清] 请明确提示内容。")
