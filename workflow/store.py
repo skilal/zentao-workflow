@@ -20,6 +20,8 @@ def timestamp():
 def session_title(state):
     if state.get("custom_title"):
         return state["custom_title"]
+    if state["item"] is None:
+        return state.get("conversation_title", "新会话")
     names = {"story": "需求", "task": "任务", "bug": "Bug"}
     return "；".join(f"{names[item['kind']]} #{item['id']} · {item['title']}"
                     for item in state.get("items", [state["item"]]))
@@ -39,8 +41,8 @@ def session_repositories(state):
 
 
 def initial_state(item, record_id):
-    return {
-        "id": record_id, "item": item, "items": [item], "custom_title": "", "stage": "资料已读取", "phase": "plan",
+    state = {
+        "id": record_id, "item": item, "items": [item] if item is not None else [], "custom_title": "", "stage": "资料已读取", "phase": "plan",
         "updated_at": timestamp(), "repos": [],
         "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
         "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],
@@ -49,6 +51,11 @@ def initial_state(item, record_id):
         "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
         "delivery_round": 1, "deliveries": [], "followup_images": [],
     }
+    if item is None:
+        state["project"] = {"id": 0, "name": "", "candidates": []}
+        state["snapshot"] = {"items": [], "sources": [], "materials": [], "blockers": [], "feishu_links": [],
+                             "project": dict(state["project"])}
+    return state
 
 
 class SessionStore:
@@ -58,7 +65,8 @@ class SessionStore:
         self.lock = RLock()
 
     def new(self, item, *, save=True):
-        session_id = f"{item['kind']}-{item['id']}-{uuid4().hex[:10]}"
+        prefix = f"{item['kind']}-{item['id']}" if item is not None else "conversation"
+        session_id = f"{prefix}-{uuid4().hex[:10]}"
         state = initial_state(item, session_id)
         state["created_at"] = timestamp()
         if save:

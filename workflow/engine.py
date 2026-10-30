@@ -18,7 +18,7 @@ from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_ba
 from workflow.projects import assign_project, project_locked
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
-from workflow.store import SessionStore, timestamp
+from workflow.store import SessionStore, session_title, timestamp
 from workflow.user_input import input_request_path, pending_input
 from workflow.zentao import ZentaoClient, project_context
 
@@ -481,7 +481,7 @@ class Workflow(CompileFlow):
             raise WorkflowError("不能移除已创建的工作区，请保留原选择。")
         state["prepare_complete"] = True
         self._new_plan_round()
-        self._start_turn("请以原生计划模式分析工作项。先调用 workflow.task_context，阅读选定代码。资料不足或问题影响方案时必须提问并等待。"
+        self._start_turn("请以原生计划模式分析本次需求。先调用 workflow.task_context，阅读选定代码。资料不足或问题影响方案时必须提问并等待。"
                          "只生成计划，不修改业务文件。最终使用 <proposed_plan>...</proposed_plan> 输出中文计划；没有该计划块不能进入实施。")
 
     def _new_plan_round(self):
@@ -575,6 +575,8 @@ class Workflow(CompileFlow):
         scope = ("原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
                  "获取信息时只读取并回答；明确要求修改时才处理对应修改。是否自动 Review 由控制器决定。"
                  if state.get("followup") else
+                 "本次未关联禅道工作项，以 supplement 中的首条消息和 supplement_images 为需求资料，按当前阶段和控制器授权处理。"
+                 if state["item"] is None else
                  "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。")
         previous_input = state.get("thread_input", {})
         if previous_input.get("thread_id") != state["thread_id"]:
@@ -824,15 +826,17 @@ class Workflow(CompileFlow):
             raise WorkflowError("最后一次 Review 后代码发生改变，不能提交。")
         state["acceptance"] = {"ids": accepted_ids, "reason": acceptance_note, "source": "auto" if automatic else "manual"}
         self.save()
-        title = str(state["item"]["title"]).replace("\n", " ").replace("\r", " ")[:100]
-        message = f"feat(zentao-{state['item']['kind']}-{state['item']['id']}): {title}"
+        title = session_title(state) if state["item"] is None else str(state["item"]["title"])
+        title = title.replace("\n", " ").replace("\r", " ")[:100]
+        message = (f"feat: {title}" if state["item"] is None else
+                   f"feat(zentao-{state['item']['kind']}-{state['item']['id']}): {title}")
         items = state.get("items", [state["item"]])
         if len(items) > 1:
             ids = ",".join(str(item["id"]) for item in items)
             title = "；".join(str(item["title"]).replace("\n", " ").replace("\r", " ") for item in items)[:100]
             message = f"feat(zentao-tasks-{ids}): {title}"
-        if state["item"]["kind"] == "bug" or state.get("delivery_round", 1) > 1:
-            message = message.replace("feat(", "fix(", 1)
+        if (state["item"] is not None and state["item"]["kind"] == "bug") or state.get("delivery_round", 1) > 1:
+            message = message.replace("feat", "fix", 1)
         if state.get("commit_message"):
             message = state["commit_message"]
         for repository in pending:

@@ -460,6 +460,8 @@ class WebApplication:
             raise WorkflowError("当前选择与已读取资料不一致，请完成资料读取后再开始计划。")
         if runtime.uploads:
             raise WorkflowError("补充图片尚未上传完成，请等待后再开始计划。")
+        if source["item"] is None and not supplement.strip() and not source["supplement_images"]:
+            raise WorkflowError("请填写消息或添加至少一张图片。")
         selection = validate_selection(self.codex_models(), codex.get("model"), codex.get("reasoning_effort"))
         compile_enabled = codex.get("compile_check_enabled", self.settings.get("compile_check", {}).get("enabled", False))
         if type(compile_enabled) is not bool:
@@ -477,6 +479,11 @@ class WebApplication:
                 copytree(previous / "attachments", directory / "attachments")
             for entry in [*state["snapshot"]["materials"], *state["supplement_images"]]:
                 entry["path"] = str(directory / Path(entry["path"]).relative_to(previous))
+            if state["item"] is None:
+                state["conversation_title"] = " ".join(supplement.split())[:50] or "图片需求"
+                state["history"].append({"time": timestamp(), "role": "用户", "text": state["supplement"],
+                                         "phase": "plan", "delivery_round": 1, "image_purpose": "supplement",
+                                         "images": deepcopy(state["supplement_images"])})
             self.sessions.store.save(state)
         except (OSError, ValueError):
             if directory.exists():
@@ -523,7 +530,8 @@ class WebApplication:
                 raise WorkflowError("当前查看资料尚未创建会话。")
             global_action = action in {"connect", "refresh", "settings"}
             runtime = (self.sessions.get_preview(preview_id) if preview_id else
-                       None if global_action or (action == "collect" and not session_id) else self.sessions.get(session_id))
+                       None if global_action or action == "new_conversation" or (action == "collect" and not session_id)
+                       else self.sessions.get(session_id))
             engine = runtime.engine if runtime else self.sessions.connection
             state = engine.state
             if action == "followup" and any((entry.get("followup") or {}).get("request_id") == request_id
@@ -554,6 +562,19 @@ class WebApplication:
                 operation, arguments, affects = engine.connect, (), False
             elif action == "refresh":
                 operation, arguments, affects = engine.refresh, (), False
+            elif action == "new_conversation":
+                project_id = data.get("project_id", 0)
+                if session_id or preview_id or type(project_id) is not int or project_id < 0:
+                    raise WorkflowError("新建会话只接受有效的所属项目编号。")
+                project = next((value for value in self.projects() if value["id"] == project_id), None)
+                if project_id and project is None:
+                    raise WorkflowError("目标项目分区不存在，请先添加项目分区。")
+                runtime = self.sessions.new_preview(None)
+                engine = runtime.engine
+                preview_id = engine.state["id"]
+                if project:
+                    assign_project(engine.state, project)
+                operation, arguments = engine.save, ()
             elif action == "collect":
                 choices = data.get("items")
                 if not isinstance(choices, list) or not choices:

@@ -16,14 +16,14 @@ const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停"
 const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"]);
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
-  items: ["工作项与资料", "从指派给你的需求、任务和 Bug 中，选择本次处理对象。"],
+  items: ["工作项与资料", "可从指派给你的需求、任务和 Bug 中选择处理对象，也可新建会话直接输入需求。"],
   plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
   settings: ["工作流设置", "管理禅道账号、后端编译检查、固定 Review 提示词和默认修复轮次。"]
 };
 
 function itemKey(item) { return item ? `${item.kind}:${item.id}` : ""; }
 function sessionItems(state) { return state.items || [state.item]; }
-function itemLabel(state) { return sessionItems(state).map(item => `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`).join("；"); }
+function itemLabel(state) { return sessionItems(state).map(item => `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`).join("；") || state.title || "新会话"; }
 function timeLabel(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : ""; }
 function plainDescription(value) {
   return String(value || "").replaceAll("【spec】", "【需求描述】").replaceAll("【verify】", "【验收标准】")
@@ -301,7 +301,8 @@ function WorkflowApp() {
       { ...entry, busy: payload.busy, working: payload.working, deleting: payload.busy === "delete_session" } : entry);
     applyModel({ ...previous, sessions: { ...previous.sessions, [payload.session_id]: payload }, history });
   }
-  function newSession() {
+  async function newSession() {
+    const projectId = modelRef.current.state?.project?.id || 0;
     viewEpoch.current += 1;
     discardPreview();
     lastSession.current = null;
@@ -312,7 +313,8 @@ function WorkflowApp() {
     sessionStorage.setItem("workflow-session", "");
     applyModel({ ...modelRef.current, selectedSessionId: null });
     setDiffOpen(false);
-    navigate("items");
+    navigate("plan");
+    await act("new_conversation", { project_id: projectId });
   }
   async function selectSession(id, targetPage) {
     const epoch = ++viewEpoch.current;
@@ -482,7 +484,7 @@ function WorkflowApp() {
   const busy = Boolean(stopped || sending || model?.busy || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
   const selectedKey = selectedItems.join("|");
   const loadedKey = state ? sessionItems(state).map(itemKey).join("|") : "";
-  const selectionMatches = Boolean(state?.snapshot) && selectedItems.length > 0 && selectedKey === loadedKey;
+  const selectionMatches = Boolean(state?.snapshot) && selectedKey === loadedKey;
   useEffect(() => {
     if (!state || state.id === lastSession.current) return;
     lastSession.current = state.id;
@@ -524,9 +526,9 @@ function WorkflowApp() {
 
   async function act(action, data = {}, targetId = modelRef.current.selectedSessionId) {
     const current = modelRef.current;
-    const id = ["connect", "refresh", "settings"].includes(action) ? null : targetId;
+    const id = ["connect", "refresh", "settings", "new_conversation"].includes(action) ? null : targetId;
     const previewId = !id && ["collect", "plan"].includes(action) ? current.preview?.preview_id : null;
-    const pendingKey = id || previewId || (action === "collect" ? "new" : "global");
+    const pendingKey = id || previewId || (["collect", "new_conversation"].includes(action) ? "new" : "global");
     const epoch = viewEpoch.current;
     setRequestsPending(previous => ({ ...previous, [pendingKey]: action }));
     try {
@@ -534,13 +536,13 @@ function WorkflowApp() {
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
         body: JSON.stringify({ action, data, request_id: crypto.randomUUID(), session_id: id,
           preview_id: previewId, revision: previewId ? current.preview.revision : current.sessions[id]?.revision }) }).then(readResponse);
-      if (action === "collect" && !id && epoch === viewEpoch.current) {
+      if (["collect", "new_conversation"].includes(action) && !id && epoch === viewEpoch.current) {
         if (!previewId) changeDraft({ codex: { model: current.settings.model, reasoning_effort: current.settings.reasoning_effort } });
         lastSession.current = result.preview_id;
         applyModel({ ...modelRef.current, preview: { preview_id: result.preview_id, event_cursor: -1 } });
         const payload = await fetch(`/api/preview?id=${encodeURIComponent(result.preview_id)}`, { cache: "no-store" }).then(readResponse);
         if (epoch === viewEpoch.current) receivePreview(payload);
-      } else if (action === "collect" && !id && !previewId) {
+      } else if (["collect", "new_conversation"].includes(action) && !id && !previewId) {
         releasePreview(result.preview_id);
       } else if (action === "plan" && previewId && epoch === viewEpoch.current) {
         lastSession.current = result.session_id;
@@ -660,6 +662,7 @@ function WorkflowApp() {
           h(Space, null, (sending === "collect" || model.busy === "collect") && h(Spin, { size: "small" }),
             h("span", { className: "muted" }, selectedItems.length ? `已选 ${selectedItems.length} 项 · 选中后自动读取资料` : "可多选同一项目的任务联合开发；需求和 Bug 单选")))),
       h(CardBox, { title: snapshot ? h(Space, { wrap: true }, "工作项资料", ...sessionItems(state).map(item => h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id}`))) : "工作项资料" },
+        snapshot && state.item === null && h(Typography.Paragraph, { type: "secondary" }, "尚未关联工作项，可直接输入需求并开始计划，也可勾选工作项读取资料。"),
         stage === "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "资料读取失败", description: state.error,
           action: h(Button, { disabled: busy || !model.connected, onClick: () => act("collect", { items: selectedItems.map(key => {
             const [kind, id] = key.split(":"); return { kind, id: Number(id) };
@@ -732,7 +735,7 @@ function WorkflowApp() {
                 h("div", { className: "project-info-pending" }, entry?.status === "needs_user" ? "等待人工选择" : "开始计划时自动识别"));
           })),
         (editable || waiting) && h("div", { className: "project-info-actions" },
-          editable && h(Button, { block: true, disabled: transfers.length > 0, onClick: () => act("edit_branches", { supplement: draft.supplement }) }, "更换项目常用分支"),
+          editable && !model.preview && h(Button, { block: true, disabled: transfers.length > 0, onClick: () => act("edit_branches", { supplement: draft.supplement }) }, "更换项目常用分支"),
           waiting && h(React.Fragment, null,
             h("p", { className: "project-info-note" }, "人工选择将保存为项目常用分支，后续优先复用。"),
             h(Button, { type: "primary", block: true, disabled: busy || unresolved.some(entry => !entry.catalog.some(branch => branch.name === choices[entry.role])),
@@ -782,9 +785,10 @@ function WorkflowApp() {
           workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : [])] }));
       })),
       (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&
-        h(CardBox, { title: "补充需求与验收标准" },
+        h(CardBox, { title: state.item === null ? "输入需求与验收标准" : "补充需求与验收标准" },
           h("div", { onPaste: supplementEditable ? pasteImages : undefined },
-            h(Input.TextArea, { value: draft.supplement, rows: 6, disabled: !supplementEditable, placeholder: "补充业务规则、验收标准，可在此粘贴截图或图片…", onChange: event => changeDraft({ supplement: event.target.value }) }),
+            h(Input.TextArea, { value: draft.supplement, rows: 6, disabled: !supplementEditable,
+              placeholder: state.item === null ? "直接输入需求、问题或修改要求，可粘贴截图或图片，无需关联工作项…" : "补充业务规则、验收标准，可在此粘贴截图或图片…", onChange: event => changeDraft({ supplement: event.target.value }) }),
             h("div", { className: "supplement-image-tools" },
               h("input", { type: "file", ref: imageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", onChange: event => {
                 addImages(event.target.files); event.target.value = "";
@@ -818,12 +822,13 @@ function WorkflowApp() {
               onChange: event => changeDraft({ compile_check_enabled: event.target.checked }) }, "Review 前自动检查后端编译"),
             h(Typography.Text, { type: "secondary" }, "仅检查有改动的后端模块；前端继续 Review。需要下载依赖时等待人工选择。")),
           ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "开始后固定模型与推理强度；已有改动保留且不提交"),
-            h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0 || (!state.codex && !sessionSelection), onClick: startPlan }, "开始需求分析与计划"))));
+            h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0 || (!state.codex && !sessionSelection) ||
+              (state.item === null && !draft.supplement.trim() && !state.supplement_images.length), onClick: startPlan }, state.item === null ? "发送并开始计划" : "开始需求分析与计划"))));
   }
 
-  function renderFeedbackImages(images, editable = false) {
+  function renderFeedbackImages(images, editable = false, purpose = "followup") {
     return h("div", { className: "attachment-grid" }, images.map(image => h("div", { className: "attachment", key: image.id },
-      h(Image, { src: `/api/supplement-images?${new URLSearchParams({ session_id: state.id, purpose: "followup", image_id: image.id })}`,
+      h(Image, { src: `/api/supplement-images?${new URLSearchParams({ session_id: state.id, purpose, image_id: image.id })}`,
         alt: image.name, preview: { mask: "查看图片" } }),
       h("div", { className: "attachment-name" }, image.name),
       editable && h("div", { className: "supplement-image-actions" }, h(Button, { size: "small", type: "text", danger: true,
@@ -844,7 +849,8 @@ function WorkflowApp() {
   }
 
   function renderPlan() {
-    if (!model.selectedSessionId || !state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "先选择工作项并等待读取完成，再开始需求分析与计划" }));
+    if (!state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "点击新建会话输入需求，或选择工作项并等待读取完成" }));
+    if (!model.selectedSessionId) return renderBranches();
     if (!state.codex && !["资料已读取", "资料读取失败"].includes(stage)) return h(CardBox, { title: "确认历史会话的模型配置" },
       h(Typography.Paragraph, null, "该历史会话未保存模型与推理强度。请选择一次，保存后按原阶段继续。"),
       h(CodexSelection, { key: state.id, value: draft.codex, disabled: busy, onReady: setSessionSelection, onChange: codex => changeDraft({ codex }) }),
@@ -879,7 +885,7 @@ function WorkflowApp() {
                   entry.phase === "review" && entry.role === "Codex" ?
                     stage === "审查中" ? h("span", { className: "muted" }, "正在校验审查结果…") : h("pre", { className: "review-original" }, entry.text) :
                     entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.text,
-                entry.images?.length > 0 && renderFeedbackImages(entry.images)))),
+                entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup")))),
             !model.stream && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
                 stage === "准备工作区中" ? " 正在准备工作区…" : " 请求已发送，正在等待模型回复…"),
@@ -1137,7 +1143,7 @@ function WorkflowApp() {
                 setImplementationPlanHidden(false); sessionStorage.setItem("workflow-implementation-plan-hidden", "false");
               } }, implementationPlanTitle))),
             h(Steps, { current: stepOf(state), status: stage === "已完成（未审查）" ? "finish" : undefined, size: "small", responsive: false,
-              items: ["选择工作项", "制定计划", state?.followup ? "处理消息" : "实施修改", "Review", "本地提交"].map((title, index) =>
+              items: [state?.item === null ? "输入需求" : "选择工作项", "制定计划", state?.followup ? "处理消息" : "实施修改", "Review", "本地提交"].map((title, index) =>
                 stage === "已完成（未审查）" && index > 2 ? { title: `${title}（跳过）`, status: "wait" } : { title }) })),
           h("div", { className: `session-body${showSidebar ? " with-sidebar" : ""}` },
             h("div", { className: "workspace-main" }, renderers[page]()), showSidebar &&
