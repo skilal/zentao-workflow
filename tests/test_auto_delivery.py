@@ -9,7 +9,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from workflow.approvals import is_controlled_write
-from workflow.engine import Workflow
+from workflow.engine import FINDING_SCHEMA, Workflow
 from workflow.gitops import commit, git, manifest
 from workflow.mcp_server import Tools, TOOLS
 from workflow.settings import ROOT, WorkflowError
@@ -246,6 +246,38 @@ class AutoDeliveryChecks(TestCase):
         with patch("workflow.engine.manifest", return_value={}), patch.object(self.flow, "finalize") as finalize:
             self.complete(text)
         finalize.assert_called_once_with([], "", automatic=True)
+
+    def test_new_delivery_review_schema_excludes_historical_issue_ids(self):
+        old = {**finding(), "id": "R01-01"}
+        self.state.update(phase="review", delivery_round=4, reviews=[{
+            "number": 1, "delivery_round": 1, "result": {"findings": [old]}}])
+        with patch("workflow.engine.manifest", return_value={}):
+            self.flow._begin_review()
+        params = self.flow.rpc.request.call_args.args[1]
+        schema = params["outputSchema"]["properties"]
+        self.assertEqual(schema["findings"]["items"]["properties"]["previous_id"]["enum"], [""])
+        self.assertEqual(schema["resolved_previous"]["maxItems"], 0)
+        self.assertNotIn("enum", FINDING_SCHEMA["properties"]["findings"]["items"]["properties"]["previous_id"])
+        self.assertIn("上轮审查：null", params["input"][0]["text"])
+        self.assertIn("允许引用的旧问题编号：[]", params["input"][0]["text"])
+
+    def test_review_schema_allows_only_current_delivery_issue_ids(self):
+        self.state.update(phase="review", delivery_round=4, reviews=[
+            {"number": 1, "delivery_round": 1, "result": {"findings": [{**finding(), "id": "R01-01"}]}},
+            {"number": 3, "delivery_round": 4, "result": {"findings": [{**finding(), "id": "R03-01"}]}}])
+        with patch("workflow.engine.manifest", return_value={}):
+            self.flow._begin_review()
+        schema = self.flow.rpc.request.call_args.args[1]["outputSchema"]["properties"]
+        self.assertEqual(schema["findings"]["items"]["properties"]["previous_id"]["enum"], ["", "R03-01"])
+        self.assertEqual(schema["resolved_previous"]["items"]["properties"]["id"]["enum"], ["R03-01"])
+        self.assertNotIn("maxItems", schema["resolved_previous"])
+
+    def test_resume_review_without_current_results_restarts_full_review(self):
+        self.state.update(phase="review", stage="已停止", delivery_round=4, reviews=[{
+            "number": 1, "delivery_round": 1, "result": {"findings": [{**finding(), "id": "R01-01"}]}}])
+        with patch.object(self.flow, "_begin_review") as review:
+            self.flow.resume()
+        review.assert_called_once()
 
     def test_omitted_old_finding_prevents_automatic_commit(self):
         old = finding()

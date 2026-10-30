@@ -201,6 +201,25 @@ def run():
                 expect(page.locator("#review-3 .review-actions")).to_have_count(0)
                 expect(page.locator("#review-3 input[type=checkbox]").first).to_be_disabled()
                 expect(page.get_by_role("button", name="定位最新 Review", exact=True)).to_be_disabled()
+                # 跨交付引用旧编号的失败结果复用问题卡片，但不能触发修复或提交。
+                first.engine.state.update(phase="review", stage="已停止", error="Review 引用了本轮交付中不存在的旧问题 R01-01，请重新 Review。")
+                failed = review_result()
+                failed["findings"][0]["previous_id"] = "R01-01"
+                first.engine.note("Codex", dumps(failed, ensure_ascii=False))
+                invalid = page.get_by_role("region", name="未通过校验的 Review", exact=True)
+                expect(invalid).to_be_visible()
+                expect(invalid.locator(".finding-card")).to_have_count(1)
+                expect(invalid.locator(".ant-alert")).to_contain_text("本轮交付中不存在的旧问题 R01-01")
+                expect(invalid.locator("input[type=checkbox]")).to_be_disabled()
+                expect(invalid.locator(".review-actions")).to_have_count(0)
+                expect(invalid.locator(".review-original")).to_have_count(0)
+                invalid.get_by_text("输出原文", exact=True).click()
+                expect(invalid.locator(".review-original")).to_contain_text('"previous_id": "R01-01"')
+                page.reload()
+                expect(page.get_by_role("region", name="未通过校验的 Review", exact=True)).to_be_visible()
+                page.get_by_role("region", name="未通过校验的 Review", exact=True).screenshot(path=str(output / "invalid-review.png"))
+                page.set_viewport_size({"width": 390, "height": 1050})
+                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
                 assert not errors, errors
                 browser.close()
                 (output / "result.json").write_text(dumps({"结果": "通过", "页面错误": errors,

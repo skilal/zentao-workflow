@@ -535,6 +535,20 @@ class Workflow(CompileFlow):
         if pending_input(self.store, state):
             raise WorkflowError("仍有问题等待明确答复，不能启动新的模型回合。")
         phase = state["phase"]
+        if phase == "review":
+            reviews = self.current_reviews()
+            previous_ids = [finding["id"] for finding in reviews[-1]["result"]["findings"]] if reviews else []
+            output_schema = deepcopy(FINDING_SCHEMA)
+            output_schema["properties"]["findings"]["items"]["properties"]["previous_id"]["enum"] = ["", *previous_ids]
+            resolved_schema = output_schema["properties"]["resolved_previous"]
+            if previous_ids:
+                resolved_schema["items"]["properties"]["id"]["enum"] = previous_ids
+            else:
+                resolved_schema["maxItems"] = 0
+            text += (f"\n本次是第 {state.get('delivery_round', 1)} 轮交付，允许引用的旧问题编号：" + dumps(previous_ids, ensure_ascii=False) +
+                     "。previous_id 只能填写上述编号或空字符串；没有可引用编号时，所有问题的 previous_id 必须为空，resolved_previous 必须为空数组。"
+                     "此前其他交付轮次的问题及接受记录仅作背景，不能沿用其编号或自动列为本轮遗留问题。"
+                     "本轮重新发现的问题按当前差异独立判断，origin 为原有问题不代表可以引用历史编号。")
         for repository in state["repos"]:
             ensure_baseline(repository)
         if state.get("pause_requested"):
@@ -906,7 +920,7 @@ class Workflow(CompileFlow):
         if state.get("followup") and not state.get("prepare_complete"):
             self._prepare_followup()
             return
-        if self.current_reviews() and state["phase"] == "review":
+        if state["phase"] == "review":
             # 恢复动作只重新审查；上次结果不能在重启后直接触发提交。
             self._begin_review()
             return
@@ -1079,7 +1093,7 @@ class Workflow(CompileFlow):
             for number, finding in enumerate(result["findings"], 1):
                 old_id = finding["previous_id"]
                 if old_id and old_id not in previous:
-                    raise WorkflowError("Review 引用了不存在的旧问题。")
+                    raise WorkflowError(f"Review 引用了本轮交付中不存在的旧问题 {old_id}，请重新 Review。")
                 finding["id"] = old_id or f"R{review_number:02d}-{number:02d}"
                 if finding["id"] in seen or finding["id"] in resolved:
                     raise WorkflowError("Review 对同一问题给出了冲突状态。")

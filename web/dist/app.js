@@ -880,10 +880,11 @@ function WorkflowApp() {
               h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
                 typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
-              h("div", { className: `chat-body${reviewsByMessage.has(entry.index) ? " review-message" : ""}` },
+              h("div", { className: `chat-body${reviewsByMessage.has(entry.index) || entry.review_output ? " review-message" : ""}` },
                 reviewsByMessage.has(entry.index) ? renderReview(reviewsByMessage.get(entry.index), entry.text) :
                   entry.phase === "review" && entry.role === "Codex" ?
-                    stage === "审查中" ? h("span", { className: "muted" }, "正在校验审查结果…") : h("pre", { className: "review-original" }, entry.text) :
+                    stage === "审查中" ? h("span", { className: "muted" }, "正在校验审查结果…") :
+                      entry.review_output ? renderReview({ result: entry.review_output }, entry.text, entry.review_error) : h("pre", { className: "review-original" }, entry.text) :
                     entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup")))),
             !model.stream && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
@@ -969,25 +970,27 @@ function WorkflowApp() {
         })) }));
   }
 
-  function renderReview(entry, originalText) {
-    const latest = entry.number === review?.number && (entry.delivery_round || 1) === state.delivery_round && state.phase !== "complete";
+  function renderReview(entry, originalText, validationError = "") {
+    const latest = !validationError && entry.number === review?.number && (entry.delivery_round || 1) === state.delivery_round && state.phase !== "complete";
     const findings = entry.result.findings;
     const selected = latest ? draft.selected_findings.filter(id => findings.some(finding => finding.id === id)) : [];
     const limitReached = state.fix_round >= state.max_fix_rounds;
     const canSelect = latest && !busy && ["等待修复选择", "部分提交"].includes(stage);
     const canFix = latest && stage === "等待修复选择" && !busy;
     const canCommit = canSelect && selected.length === findings.length && (!findings.length || draft.review_note.trim());
-    return h("section", { className: "review-content", id: `review-${entry.number}`, "aria-label": `第 ${entry.number} 次 Review` },
-      h("div", { className: "review-heading" }, h("strong", null, `第 ${entry.number} 次 Review`),
-        h(Tag, null, latest ? `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮` : `修复第 ${entry.fix_round} 轮后`), !latest && h(Tag, null, "历史记录 · 只读")),
-      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, findings.length, h("span", null, "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
-      h("div", { className: "finding-list" }, findings.length === 0 && h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "本轮没有发现待处理问题" }),
-        findings.map(finding => h("div", { className: `finding-card${selected.includes(finding.id) ? " selected" : ""}`, key: finding.id },
+    return h("section", { className: "review-content", id: validationError ? undefined : `review-${entry.number}`, "aria-label": validationError ? "未通过校验的 Review" : `第 ${entry.number} 次 Review` },
+      h("div", { className: "review-heading" }, h("strong", null, validationError ? "未通过校验的 Review" : `第 ${entry.number} 次 Review`),
+        validationError ? h(Tag, { color: "error" }, "校验失败 · 只读") : h(React.Fragment, null,
+          h(Tag, null, latest ? `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮` : `修复第 ${entry.fix_round} 轮后`), !latest && h(Tag, null, "历史记录 · 只读"))),
+      validationError && h(Alert, { type: "error", showIcon: true, message: "此结果不能作为修复或提交依据", description: validationError }),
+      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, findings.length, h("span", null, validationError ? "返回问题" : "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
+      h("div", { className: "finding-list" }, findings.length === 0 && h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: validationError ? "返回结果中没有问题，尚未通过校验" : "本轮没有发现待处理问题" }),
+        findings.map((finding, index) => h("div", { className: `finding-card${selected.includes(finding.id) ? " selected" : ""}`, key: validationError ? index : finding.id },
           h("div", { className: "finding-title" }, h(Checkbox, { checked: selected.includes(finding.id), disabled: !canSelect,
             onChange: event => changeDraft({ selected_findings: event.target.checked ? [...selected, finding.id] : selected.filter(id => id !== finding.id) }) },
             h(Tag, { color: ["P0", "P1"].includes(finding.severity) ? "error" : finding.severity === "P2" ? "warning" : "default" }, finding.severity),
             h("strong", null, finding.title))),
-          h("div", { className: "finding-meta" }, h(Typography.Text, { code: true }, finding.id), h(Tag, null, finding.category),
+          h("div", { className: "finding-meta" }, h(Typography.Text, { code: true }, validationError ? `问题 ${index + 1}` : finding.id), h(Tag, null, finding.category),
             h(Tag, { color: finding.origin === "本次引入" ? "volcano" : finding.origin === "证据不足" ? "gold" : "default" }, finding.origin)),
           h("div", { className: "finding-location" }, `${finding.repository}/${finding.path}:${finding.line}`),
           h(Collapse, { ghost: true, size: "small", items: [{ key: "details", label: "判断依据、处理建议与业务影响",

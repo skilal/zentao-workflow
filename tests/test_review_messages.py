@@ -82,6 +82,42 @@ class ReviewMessageChecks(TestCase):
             self.complete("```json\n{}\n```")
         self.assertEqual(self.state["reviews"], [])
         self.assertEqual(len(self.state["history"]), 1)
+        self.assertNotIn("review_output", public_state(self.state)["history"][0])
+
+    def test_cross_delivery_reference_stops_but_displays_readonly_result(self):
+        old = review_result()
+        old["findings"][0]["id"] = "R01-01"
+        self.state.update(delivery_round=4, reviews=[{"number": 1, "delivery_round": 1, "result": old}])
+        source = review_result()
+        source["findings"][0]["previous_id"] = "R01-01"
+        with self.assertRaisesRegex(WorkflowError, "本轮交付中不存在的旧问题 R01-01") as raised:
+            self.complete(dumps(source, ensure_ascii=False))
+        self.state.update(stage="已停止", error=str(raised.exception))
+        original = deepcopy(self.state)
+        payload = public_state(self.state)
+        self.assertEqual(len(payload["reviews"]), 1)
+        self.assertEqual(self.flow.current_reviews(), [])
+        self.assertEqual(payload["history"][-1]["review_output"], source)
+        self.assertEqual(payload["history"][-1]["review_error"], self.state["error"])
+        self.assertNotIn("id", payload["history"][-1]["review_output"]["findings"][0])
+        self.assertEqual(self.state, original)
+
+    def test_valid_review_is_not_duplicated_as_an_unvalidated_output(self):
+        self.complete(dumps(review_result()))
+        payload = public_state(self.state)
+        self.assertEqual(payload["reviews"][0]["history_index"], 0)
+        self.assertNotIn("review_output", payload["history"][0])
+
+    def test_failed_fenced_review_is_preserved_when_later_reviews_succeed(self):
+        invalid = review_result()
+        invalid["findings"][0]["previous_id"] = "R99-01"
+        with self.assertRaises(WorkflowError):
+            self.complete("```json\n" + dumps(invalid) + "\n```")
+        self.complete(dumps(review_result()))
+        payload = public_state(self.state)
+        self.assertEqual(payload["history"][0]["review_output"], invalid)
+        self.assertIn("不能用于修复或提交", payload["history"][0]["review_error"])
+        self.assertNotIn("review_output", payload["history"][1])
 
     def test_empty_review_still_uses_existing_auto_finalize(self):
         source = review_result()

@@ -65,6 +65,15 @@ def public_state(state):
                 review["history_index"] = index
                 cursor = index + 1
                 break
+    reviewed_indices = {review["history_index"] for review in result.get("reviews", []) if "history_index" in review}
+    for index, entry in enumerate(result.get("history", [])):
+        if index in reviewed_indices or entry.get("phase") != "review" or entry["role"] != "Codex":
+            continue
+        try:
+            entry["review_output"] = parse_review(entry["text"])
+        except WorkflowError:
+            continue
+        entry["review_error"] = (result.get("error") if index == len(result["history"]) - 1 and result["phase"] == "review" else "") or "此结果未通过控制器校验，仅供查看，不能用于修复或提交。"
     if "snapshot" in result:
         result["snapshot"]["sources"] = normalized_sources(result["snapshot"].get("sources", []))
     return result
