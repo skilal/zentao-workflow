@@ -19,7 +19,7 @@ from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
-from workflow.store import SessionStore, session_title, timestamp
+from workflow.store import SessionStore, followup_available, session_title, timestamp
 from workflow.user_input import input_request_path, pending_input
 from workflow.zentao import ZentaoClient, project_context
 
@@ -158,13 +158,16 @@ class Workflow(CompileFlow, ProgressFlow):
         self.emit("message", {"role": role, "text": text})
 
     def current_reviews(self):
-        return [entry for entry in self.state["reviews"]
-                if entry.get("delivery_round", 1) == self.state.get("delivery_round", 1)]
+        return [entry for index, entry in enumerate(self.state["reviews"])
+                if entry.get("delivery_round", 1) == self.state.get("delivery_round", 1)
+                and index >= self.state.get("review_start", 0)]
 
     def validate_followup(self, text, image_ids):
-        state = self.require_state(*COMPLETE)
-        if state["phase"] != "complete" or not state.get("thread_id"):
-            raise WorkflowError("原 Codex 线程不存在，不能继续此会话。")
+        state = self.state
+        if state.get("pending") or pending_input(self.store, state):
+            raise WorkflowError("仍有问题等待明确答复，请先从暂停点继续并回答。")
+        if not followup_available(state) or self.turn_running:
+            raise WorkflowError("请等待本轮完成，或先暂停并等待当前操作结束；必须保留原线程及已准备的工作区，且没有部分提交。")
         if (not isinstance(text, str) or not isinstance(image_ids, list)
                 or any(not isinstance(value, str) for value in image_ids)
                 or len(set(image_ids)) != len(image_ids)):
@@ -174,12 +177,11 @@ class Workflow(CompileFlow, ProgressFlow):
             raise WorkflowError("截图不属于当前待发送反馈，不能使用其他会话或已发送图片。")
         if not text.strip() and not image_ids:
             raise WorkflowError("请填写消息或添加至少一张图片。")
-        if not state["repos"]:
-            raise WorkflowError("原会话没有已确定的工作区，不能继续对话。")
         return [deepcopy(available[value]) for value in image_ids]
 
-    def followup(self, text, images, request_id, review_enabled):
+    def followup(self, text, images, request_id, review_enabled, plan_mode=False):
         state = self.state
+        in_progress = state["phase"] != "complete"
         number = state.get("delivery_round", 1)
         archived = {key: deepcopy(state.get(key)) for key in
                     ("repos", "selections", "plan", "plan_hash", "approved_plan", "approved_hash",
@@ -188,7 +190,14 @@ class Workflow(CompileFlow, ProgressFlow):
                      "uncommitted_manifest", "review_requested", "commit_message", "delivery_request")}
         archived.update(number=number, completed_at=state["updated_at"], reviews=deepcopy(self.current_reviews()),
                         decisions=deepcopy([entry for entry in state["decisions"] if entry.get("delivery_round", 1) == number]))
-        state.setdefault("deliveries", []).append(archived)
+        if in_progress:
+            state["continuation_context"] = {
+                "plan": state.get("approved_plan") or state.get("plan", ""),
+                "messages": [entry["text"] for entry in state["history"]
+                             if entry["role"] == "用户" and entry.get("delivery_round", 1) == number]}
+        else:
+            state.setdefault("deliveries", []).append(archived)
+            state["continuation_context"] = None
         targets = [{"name": repo["name"], "role": repo["role"], "path": repo["source"],
                     "branch": repo["branch"], "base": "refs/heads/" + repo["branch"], "create": False}
                    for repo in state["repos"]]
@@ -197,16 +206,26 @@ class Workflow(CompileFlow, ProgressFlow):
         for image in state.get("followup_images", []):
             if image["id"] in image_ids:
                 image["history_index"] = history_index
-        state.update(delivery_round=number + 1, repos=[], selections=targets, phase="followup", stage="准备工作区中",
-                     prepare_complete=False, pause_requested=False, turn_id=None, pending=None, commits={},
-                     fix_round=0, max_fix_rounds=self.settings["review"]["max_fix_rounds"], error="",
+        # 关闭旧连接后再替换回合，旧连接迟到事件不能推进新消息。
+        self._close_rpc()
+        if plan_mode:
+            self._new_plan_round()
+        state.update(delivery_round=number if in_progress else number + 1,
+                     repos=state["repos"] if in_progress else [], selections=state.get("selections", []) if in_progress else targets,
+                     phase="plan" if plan_mode else "followup", stage="准备工作区中",
+                     prepare_complete=in_progress, pause_requested=False, turn_id=None, pending=None, commits={},
+                     fix_round=state["fix_round"] if in_progress else 0,
+                     max_fix_rounds=state["max_fix_rounds"] if in_progress else self.settings["review"]["max_fix_rounds"], error="",
                      review_manifest={}, review_prompt="", review_prompt_hash="", acceptance=None,
+                     review_start=len(state["reviews"]),
                      uncommitted_manifest={}, review_requested=False, commit_message="", delivery_request=None,
-                     review_enabled=review_enabled, approval_source="followup", followup={"text": text.strip(), "images": images,
-                         "request_id": request_id, "history_index": history_index,
+                     review_enabled=review_enabled, approval_source="" if plan_mode else "followup", followup={"text": text.strip(), "images": images,
+                         "request_id": request_id, "history_index": history_index, "plan_mode": plan_mode, "in_progress": in_progress,
                          "authorization_hash": sha256(dumps([text.strip(), [image["id"] for image in images]],
                                                             ensure_ascii=False).encode("utf-8")).hexdigest()})
-        self.note("用户", text.strip(), images=images, request_id=request_id, review_enabled=review_enabled)
+        request_path = self.store.directory(state["id"]) / f"review-request-{state['delivery_round']}.json"
+        request_path.unlink(missing_ok=True)
+        self.note("用户", text.strip(), images=images, request_id=request_id, review_enabled=review_enabled, plan_mode=plan_mode)
         self._prepare_followup()
 
     def _prepare_followup(self):
@@ -226,9 +245,16 @@ class Workflow(CompileFlow, ProgressFlow):
                 acquire_workspace(selection, workspace / f"repo-{index + 1}-delivery-{state['delivery_round']}", self.store, state)
         state["prepare_complete"] = True
         self.save()
+        if state["followup"].get("plan_mode") and state["phase"] == "plan":
+            self._start_turn("请以原生计划模式分析 followup 中本次补充需求。先读取 workflow.task_context 和当前代码。"
+                             "未完成会话须结合 continuation_context，保留原需求目标，将剩余工作与本次补充合并规划，已有代码保留。"
+                             "已完成会话以历史交付为背景，只规划本次补充需求。资料不足或影响方案时必须提问并等待。"
+                             "只生成计划，不修改业务文件；最终使用 <proposed_plan>...</proposed_plan> 输出中文计划。")
+            return
         self._start_turn("先读取 workflow.task_context 和当前代码，按 followup 中本轮消息的实际意图处理。"
                          "获取信息、解释或查询时只读取资料并回答；用户明确要求修改时，才授权对应范围的修改。"
-                         "原计划用于理解业务背景。需要澄清时等待明确回答，扩大范围时先重新计划。"
+                         "未完成会话须结合 continuation_context，继续完成原目标及本次补充，保留已有代码。"
+                         "本次计划模式已关闭，不自行切换计划模式；范围不明确或需要重新计划时提问等待用户决定。"
                          "本轮首次修改不占用 Review 后修复次数。Review 是否执行由控制器根据 review_enabled 和代码差异决定，"
                          "用户明确要求重新 Review、提交或重新提交时，先调用 workflow.request_review 登记请求，"
                          "引用用户原话；需纳入的历史任务文件从 task_context.previous_task_changes 选择，"
@@ -503,6 +529,11 @@ class Workflow(CompileFlow, ProgressFlow):
     def _new_plan_round(self):
         state = self.state
         previous = state.get("plan_round") or {}
+        if state.get("plan") or state.get("approved_plan") or state.get("plan_round"):
+            state.setdefault("plan_history", []).append({
+                **{key: deepcopy(state.get(key)) for key in
+                   ("plan", "plan_hash", "approved_plan", "approved_hash", "approval_source", "plan_round", "followup")},
+                "delivery_round": state.get("delivery_round", 1), "time": timestamp()})
         state.update(phase="plan", plan="", plan_hash="", approved_plan="", approved_hash="", approval_source="",
                      plan_round={"number": previous.get("number", 0) + 1, "turns": 0, "asked": False})
 
@@ -601,11 +632,14 @@ class Workflow(CompileFlow, ProgressFlow):
                    "feishu_links": state["snapshot"]["feishu_links"],
                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
+                   "continuation_context": state.get("continuation_context"),
                    "review_enabled": state.get("review_enabled", True),
                    "compile_check": state.get("compile_check", {"enabled": False}),
                    "compile_checks": compile_context(state),
                    "materials_revision": context_hash(requirement_context(state))}
-        scope = ("原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
+        scope = ("本次续接未完成任务，结合 continuation_context、原需求和 followup 消息完成本轮剩余工作；已有代码保留。"
+                 if (state.get("followup") or {}).get("in_progress") else
+                 "原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
                  "获取信息时只读取并回答；明确要求修改时才处理对应修改。是否自动 Review 由控制器决定。"
                  if state.get("followup") else
                  "本次未关联禅道工作项，以 supplement 中的首条消息和 supplement_images 为需求资料，按当前阶段和控制器授权处理。"
@@ -676,7 +710,9 @@ class Workflow(CompileFlow, ProgressFlow):
         state = self.require_state("等待计划确认")
         if not state["plan"] or sha256(state["plan"].encode("utf-8")).hexdigest() != state["plan_hash"]:
             raise WorkflowError("计划内容与待确认版本不一致。")
-        if state["snapshot"]["blockers"] and not state["supplement"].strip() and not state.get("supplement_images"):
+        feedback = state.get("followup") or {}
+        if (state["snapshot"]["blockers"] and not state["supplement"].strip() and not state.get("supplement_images")
+                and not feedback.get("text") and not feedback.get("images")):
             if source == "auto":
                 return
             raise WorkflowError("存在明确的资料缺失，请先补充必要内容，再确认更新后的计划。")
@@ -828,6 +864,8 @@ class Workflow(CompileFlow, ProgressFlow):
 
     def rereview(self):
         self.require_state("等待修复选择", "已停止", "已暂停")
+        if self.state["phase"] == "plan":
+            raise WorkflowError("当前仍在计划阶段，请先完成计划及授权，再进行审查。")
         if self.state.get("followup") and not self.state.get("prepare_complete"):
             raise WorkflowError("请先从暂停点继续准备本轮工作区，再进行审查。")
         if self.state["commits"]:
@@ -900,6 +938,7 @@ class Workflow(CompileFlow, ProgressFlow):
         state = self.state
         if not state:
             return
+        self._capture_user_input()
         was_active = state["stage"] in ACTIVE | {"等待人工回答"}
         state["pause_requested"] = True
         if self.compile_runner:
@@ -910,7 +949,6 @@ class Workflow(CompileFlow, ProgressFlow):
         self.save()
         if self.rpc and state.get("turn_id") and was_active and state["phase"] != "compile":
             self.rpc.request("turn/interrupt", {"threadId": state["thread_id"], "turnId": state["turn_id"]})
-        state["pending"] = None
         self.save()
 
     def restore(self, session_id):
@@ -932,6 +970,12 @@ class Workflow(CompileFlow, ProgressFlow):
         state["pause_requested"] = False
         if self._capture_user_input():
             state["pending"]["turn_completed"] = True
+            state["stage"] = "等待人工回答"
+            self.save()
+            return
+        if state.get("pending"):
+            state["pending"]["turn_completed"] = True
+            state["stage"] = "等待人工回答"
             self.save()
             return
         if state["phase"] == "compile":
@@ -1107,7 +1151,7 @@ class Workflow(CompileFlow, ProgressFlow):
                 self._implement_plan("auto")
         elif state["phase"] in ("implement", "fix", "followup", "compile_fix"):
             if "[需要澄清]" in text or "[需要重做计划]" in text:
-                if "[需要重做计划]" in text:
+                if "[需要重做计划]" in text and (not state.get("followup") or state["followup"].get("plan_mode")):
                     self._new_plan_round()
                 state["stage"] = "等待计划补充"
                 self.save()
@@ -1178,6 +1222,5 @@ class Workflow(CompileFlow, ProgressFlow):
                 self.state["rpc_connected"] = False
                 if self.state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}:
                     self.state["stage"] = "已暂停"
-                    self.state["pending"] = None
                     self.state["pause_requested"] = True
                 self.store.save(self.state)

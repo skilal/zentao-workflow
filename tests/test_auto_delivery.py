@@ -177,6 +177,8 @@ class AutoDeliveryChecks(TestCase):
         self.flow.rpc = Mock(model="模拟模型")
         self.flow.rpc.request.return_value = {"turn": {"id": "恢复回合"}}
         self.flow.resume()
+        self.assertEqual(self.state["stage"], "等待人工回答")
+        self.flow.answer("明确回答原问题")
         self.complete("<proposed_plan>恢复后的计划</proposed_plan>")
         self.assertEqual(self.state["plan_round"]["turns"], 2)
         self.assertTrue(self.state["plan_round"]["asked"])

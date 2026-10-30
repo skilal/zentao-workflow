@@ -87,9 +87,13 @@ class FollowupChecks(TestCase):
         self.calls.append((method, params))
         return {"turn": {"id": f"回合-{next(self.turns)}"}}
 
-    def send(self, text="修复测试反馈", image_ids=None, request_id=None, review_enabled=True):
+    def send(self, text="修复测试反馈", image_ids=None, request_id=None, review_enabled=True, plan_mode=False):
         images = self.engine.validate_followup(text, image_ids or [])
-        self.engine.followup(text, images, request_id or uuid4().hex, review_enabled)
+        self.engine.followup(text, images, request_id or uuid4().hex, review_enabled, plan_mode)
+
+    def pause_current(self):
+        self.engine.pause()
+        self.complete("")
 
     def complete(self, text):
         self.engine.last_message = text
@@ -205,8 +209,11 @@ class FollowupChecks(TestCase):
         self.assertFalse(self.state["review_enabled"])
         self.complete("[需要重做计划] 需要补充方案。")
         self.assertFalse(self.state["review_enabled"])
+        self.assertEqual(self.state["phase"], "followup")
+        self.pause_current()
+        self.send("先规划新的提示方案", review_enabled=False, plan_mode=True)
         self.assertEqual(self.state["phase"], "plan")
-        self.engine.pause()
+        self.pause_current()
         restored = WebApplication(self.settings)
         self.addCleanup(restored.close)
         engine = restored.sessions.get(self.state["id"]).engine
@@ -215,6 +222,152 @@ class FollowupChecks(TestCase):
         start.assert_called_once()
         self.assertFalse(engine.state["review_enabled"])
         self.assertEqual(len(engine.state["deliveries"]), 1)
+
+    def test_completed_message_enters_native_plan_and_revokes_old_authorization(self):
+        old_hash = self.state["approved_hash"]
+        self.send("增加新的业务规则", review_enabled=False, plan_mode=True)
+        self.assertEqual((self.state["delivery_round"], self.state["phase"], self.state["stage"]), (2, "plan", "计划中"))
+        self.assertEqual(self.state["thread_id"], "原需求线程")
+        self.assertEqual(self.calls[-1][1]["collaborationMode"]["mode"], "plan")
+        self.assertFalse(write_authorized(self.state))
+        self.assertEqual(self.state["plan_history"][-1]["approved_hash"], old_hash)
+        self.assertEqual(self.state["plan_history"][-1]["approval_source"], "manual")
+        self.assertEqual(self.state["deliveries"][0]["approved_hash"], old_hash)
+        with self.assertRaises(WorkflowError):
+            Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "未授权"})
+        self.complete("<proposed_plan>仅增加本次规则</proposed_plan>")
+        self.assertEqual((self.state["phase"], self.state["approval_source"]), ("implement", "auto"))
+        self.assertFalse(self.state["review_enabled"])
+        self.finish()
+        self.assertEqual(self.state["stage"], "已完成（未审查）")
+
+    def test_paused_replan_keeps_workspaces_changes_limits_and_invalidates_reviews(self):
+        local_path = Path(self.state["repos"][0]["path"]) / "本机.txt"
+        local_path.write_text("其他任务的本机修改\n", encoding="utf-8")
+        self.send("完成原功能")
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "原任务已有代码\n"})
+        repos = deepcopy(self.state["repos"])
+        self.state.update(fix_round=2, max_fix_rounds=4)
+        self.state["reviews"].append({**deepcopy(self.state["reviews"][0]), "number": 2, "delivery_round": 2})
+        self.state["decisions"].append({"delivery_round": 2, "round": 2, "fix_ids": [], "note": "保留选择"})
+        self.state.update(phase="review", stage="审查中")
+        old_epoch, old_turn = self.engine.connection_epoch, self.state["turn_id"]
+        self.pause_current()
+        image = self.upload()
+        self.send("", [image["id"]], plan_mode=True)
+        self.assertEqual(self.state["repos"], repos)
+        self.assertEqual((self.state["delivery_round"], len(self.state["deliveries"])), (2, 1))
+        self.assertEqual((self.state["fix_round"], self.state["max_fix_rounds"]), (2, 4))
+        self.assertEqual(self.state["continuation_context"]["plan"], "原需求计划")
+        self.assertIn("完成原功能", self.state["continuation_context"]["messages"])
+        self.assertEqual(self.engine.current_reviews(), [])
+        self.assertEqual(self.state["decisions"][-1]["note"], "保留选择")
+        self.engine._completed({"id": old_turn, "status": "completed"}, self.state["id"], old_epoch)
+        self.assertEqual(self.state["stage"], "计划中")
+        self.complete("<proposed_plan>合并原目标与补充规则</proposed_plan>")
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "补充.txt", "content": "新增代码\n"})
+        self.complete("已完成合并修改")
+        self.assertEqual(self.state["phase"], "review")
+        self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt", "前端/补充.txt"})
+        self.complete(dumps({"summary": "合并审查通过", "findings": [], "resolved_previous": []}))
+        self.assertEqual(self.state["stage"], "已完成（静态审查）")
+        path = repos[0]["path"]
+        self.assertEqual(git(path, "show", "HEAD:业务.txt"), "原任务已有代码")
+        self.assertEqual(git(path, "show", "HEAD:补充.txt"), "新增代码")
+        self.assertEqual(git(path, "show", "HEAD:本机.txt"), "本机初始内容")
+        self.assertEqual(local_path.read_text(encoding="utf-8"), "其他任务的本机修改\n")
+
+    def test_paused_implementation_and_fix_can_continue_without_planning(self):
+        self.send("原目标", review_enabled=False)
+        for phase in ("implement", "fix", "followup", "plan", "compile", "compile_fix"):
+            with self.subTest(phase=phase):
+                self.state.update(phase=phase, stage="实施中", fix_round=2)
+                self.pause_current()
+                self.send("补充业务说明", review_enabled=False)
+                self.assertEqual(self.state["phase"], "followup")
+                self.assertEqual(self.calls[-1][1]["collaborationMode"]["mode"], "default")
+                self.assertEqual((self.state["fix_round"], self.state["delivery_round"]), (2, 2))
+                self.assertTrue(write_authorized(self.state))
+
+    def test_paused_messages_and_images_cannot_bypass_unanswered_questions(self):
+        self.send("先规划", plan_mode=True)
+        self.engine._event({"id": 17, "method": "item/tool/requestUserInput", "params": {
+            "threadId": self.state["thread_id"], "turnId": self.state["turn_id"],
+            "questions": [{"id": "rule", "header": "规则", "question": "请选择业务规则"}]}}, self.engine.connection_epoch)
+        self.pause_current()
+        restored = WebApplication(self.settings)
+        self.addCleanup(restored.close)
+        restored_state = restored.sessions.get(self.state["id"]).engine.state
+        self.assertEqual(restored_state["stage"], "等待人工回答")
+        self.assertEqual(restored_state["pending"]["params"]["questions"][0]["id"], "rule")
+        with self.assertRaisesRegex(WorkflowError, "明确答复"):
+            self.engine.validate_followup("绕过问题", [])
+        with self.assertRaises(WorkflowError):
+            self.upload()
+        self.engine.resume()
+        self.assertEqual(self.state["stage"], "等待人工回答")
+        self.engine.answer("明确规则")
+        self.complete("<proposed_plan>回答后完成计划</proposed_plan>")
+        self.assertEqual(self.state["stage"], "等待计划确认")
+        self.assertFalse(write_authorized(self.state))
+
+    def test_controlled_question_survives_pause_and_returns_to_answer_stage(self):
+        self.send("先规划", plan_mode=True)
+        Tools(self.state["id"]).call("ask_user", {"questions": [{"id": "rule", "header": "规则", "question": "请明确规则"}]})
+        self.pause_current()
+        self.assertFalse(public_state(self.state)["can_followup"])
+        self.engine.resume()
+        self.assertEqual(self.state["stage"], "等待人工回答")
+        self.engine.answer("明确的业务规则")
+        self.complete("<proposed_plan>明确回答后的计划</proposed_plan>")
+        self.assertEqual(self.state["stage"], "等待计划确认")
+        self.assertFalse(write_authorized(self.state))
+
+    def test_paused_plan_cannot_be_bypassed_by_rereview(self):
+        self.send("先规划", plan_mode=True)
+        self.pause_current()
+        with self.assertRaisesRegex(WorkflowError, "计划阶段"):
+            self.engine.rereview()
+        self.assertFalse(write_authorized(self.state))
+
+    def test_invalid_plan_switch_and_paused_boundaries_do_not_change_state(self):
+        for value in (None, 0, 1, "false", [], {}):
+            with self.subTest(value=value), self.assertRaisesRegex(WorkflowError, "计划模式"):
+                self.application.dispatch(self.request(data={"text": "新需求", "review_enabled": False, "plan_mode": value}))
+        self.assertEqual(self.state["delivery_round"], 1)
+        self.send("原目标")
+        self.engine.pause()
+        with self.assertRaises(WorkflowError):
+            self.engine.validate_followup("中断尚未结束", [])
+        self.complete("")
+        self.state["commits"] = {"前端": "部分提交"}
+        with self.assertRaises(WorkflowError):
+            self.engine.validate_followup("部分提交", [])
+        self.state["commits"] = {}
+        self.state["prepare_complete"] = False
+        with self.assertRaises(WorkflowError):
+            self.engine.validate_followup("工作区未就绪", [])
+
+    def test_paused_message_deduplication_survives_restart(self):
+        self.send("原目标")
+        self.pause_current()
+        request = self.request(data={"text": "新计划", "review_enabled": False, "plan_mode": True})
+        self.application.dispatch(request)
+        self.drain()
+        self.assertEqual(self.state["phase"], "plan")
+        self.pause_current()
+        second = self.request(data={"text": "再补充", "review_enabled": False, "plan_mode": True})
+        self.application.dispatch(second)
+        self.drain()
+        self.pause_current()
+        restored = WebApplication(self.settings)
+        self.addCleanup(restored.close)
+        result = restored.dispatch(request)
+        self.assertTrue(result["duplicate"])
+        saved = restored.sessions.get(self.state["id"]).engine.state
+        self.assertEqual(saved["delivery_round"], 2)
+        self.assertTrue(saved["followup"]["plan_mode"])
+        self.assertEqual(sum(entry.get("request_id") == request["request_id"] for entry in saved["history"]), 1)
 
     def test_explicit_review_commits_previous_unreviewed_changes_with_custom_title(self):
         path = Path(self.state["repos"][0]["path"])

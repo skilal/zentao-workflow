@@ -35,6 +35,7 @@ class SessionManager:
                                    self.store, self.zentao, self.zentao_lock, self.settings_lock)
         for state in self.store.sessions():
             question = pending_input(self.store, state)
+            native_question = (state.get("pending") or {}).get("method") == "item/tool/requestUserInput"
             interrupted = state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}
             changed = interrupted or state.get("rpc_connected") or state.get("pending")
             changed = settle_progress(state, "waiting" if question else "interrupted") or changed
@@ -46,9 +47,13 @@ class SessionManager:
                 if state["phase"] == "plan" and state.get("plan_round") is not None:
                     state["plan_round"]["asked"] = True
                 changed = True
+            elif native_question:
+                state.update(stage="等待人工回答", pause_requested=False)
+                state["pending"]["turn_completed"] = True
+                changed = True
             else:
                 state.update(pending=None, turn_id=None)
-            if interrupted and not question:
+            if interrupted and not question and not native_question:
                 state.update(stage="资料读取失败" if state["stage"] == "资料读取中" else "已暂停", pause_requested=True)
             if changed:
                 self.store.save(state)

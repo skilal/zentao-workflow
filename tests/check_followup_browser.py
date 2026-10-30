@@ -48,6 +48,8 @@ def run():
             send = page.get_by_role("button", name=compile(r"^发\s*送$"))
             reply = page.get_by_placeholder("输入问题、需要获取的信息或修改要求，可粘贴图片…")
             review_switch = page.get_by_role("switch", name="修改后自动 Review", exact=True)
+            plan_switch = page.get_by_role("switch", name="计划模式", exact=True)
+            expect(plan_switch).not_to_be_checked()
             expect(review_switch).not_to_be_checked()
             review_switch.click()
             expect(send).to_be_enabled()
@@ -151,6 +153,69 @@ def run():
             expect(page.get_by_text("Review（跳过）", exact=True)).to_be_visible()
             expect(page.get_by_text("本地提交（跳过）", exact=True)).to_be_visible()
 
+            # 后续计划开关独立于 Review；刷新和失败保留草稿，成功后恢复关闭。
+            plan_switch.click()
+            reply.fill("在原功能基础上增加校验，先给出计划")
+            page.reload()
+            expect(plan_switch).to_be_checked()
+            expect(review_switch).not_to_be_checked()
+            page.locator(".session-entry").filter(has_text="另一会话").click()
+            expect(plan_switch).not_to_be_checked()
+            expect(reply).to_have_value("")
+            page.locator(".session-entry").filter(has_text="测试反馈续聊").click()
+            expect(plan_switch).to_be_checked()
+            expect(reply).to_have_value("在原功能基础上增加校验，先给出计划")
+            page.route("**/api/actions", lambda route: route.fulfill(status=400, json={"error": "计划消息发送失败"}), times=1)
+            send.click()
+            expect(page.get_by_text("计划消息发送失败", exact=True)).to_be_visible()
+            expect(plan_switch).to_be_checked()
+            expect(reply).to_have_value("在原功能基础上增加校验，先给出计划")
+            send.click()
+            expect(page.get_by_text("计划中", exact=True).first).to_be_visible()
+            fixture.drain()
+            assert state["phase"] == "plan" and state["followup"]["plan_mode"] is True
+            assert state["delivery_round"] == 5
+            fixture.complete("<proposed_plan>增加业务校验</proposed_plan>")
+            expect(page.get_by_text("实施中", exact=True).first).to_be_visible()
+
+            # 未完成时先暂停，再合并补充需求，保持同一交付轮次和工作区。
+            engine.turn_running = True
+            page.get_by_role("button", name="暂停当前阶段", exact=True).click()
+            expect(page.get_by_text("已暂停", exact=True).first).to_be_visible()
+            fixture.drain()
+            expect(send).to_be_disabled()
+            fixture.complete("")
+            expect(send).to_be_enabled()
+            expect(plan_switch).not_to_be_checked()
+            plan_switch.click()
+            review_switch.click()
+            page.locator("input[type=file]").set_input_files({"name": "暂停补充.png", "mimeType": "image/png", "buffer": PNG})
+            expect(page.get_by_alt_text("暂停补充.png")).to_be_visible()
+            reply.fill("补充边界条件，与原功能一起完成")
+            repos = deepcopy(state["repos"])
+            send.click()
+            expect(page.get_by_text("计划中", exact=True).first).to_be_visible()
+            fixture.drain()
+            assert state["delivery_round"] == 5 and state["repos"] == repos
+            expect(page.locator("#review-1 .review-actions, #review-2 .review-actions")).to_have_count(0)
+            fixture.complete("请补充具体的边界条件")
+            supplement = page.get_by_placeholder("输入回复、需要调整的计划内容或补充业务规则…")
+            supplement.fill("边界条件为不能为空")
+            page.get_by_role("button", name="提交补充说明", exact=True).click()
+            expect(page.get_by_text("计划中", exact=True).first).to_be_visible()
+            fixture.drain()
+            fixture.complete("<proposed_plan>合并原功能和非空校验</proposed_plan>")
+            expect(page.get_by_text("等待计划确认", exact=True).first).to_be_visible()
+            expect(page.get_by_role("button", name="暂停当前阶段", exact=True)).to_be_enabled()
+            page.get_by_role("button", name="确认当前计划并实施", exact=True).click()
+            expect(page.get_by_text("实施中", exact=True).first).to_be_visible()
+            fixture.drain()
+            Tools(state["id"]).call("write_file", {"repository": "前端", "path": "校验.txt", "content": "不能为空\n"})
+            fixture.finish()
+            expect(send).to_be_enabled()
+            expect(plan_switch).not_to_be_checked()
+            expect(review_switch).not_to_be_checked()
+
             # 独立检查重新生成原生计划后的自动实施、Review、完成提示与刷新恢复。
             delivery_number = state["delivery_round"] + 1
             review_number = len(state["reviews"]) + 1
@@ -192,7 +257,8 @@ def run():
             (output / "result.json").write_text(dumps({"结果": "通过", "页面错误": errors,
                 "覆盖": ["已完成会话发送", "失败图片移除", "上传预览移除", "文字与图片粘贴", "刷新草稿与截图", "跨会话图片隔离",
                          "原线程多轮续聊", "纯图片反馈", "历史 Review 只读", "历史提交保留", "发送中禁用", "宽窄屏布局",
-                         "Review 默认关闭", "开关草稿恢复", "发送失败保留选择", "发送成功重置", "开启后修改审查提交", "关闭后修改保留", "纯问答跳过审查"]},
+                         "Review 默认关闭", "开关草稿恢复", "发送失败保留选择", "发送成功重置", "开启后修改审查提交", "关闭后修改保留", "纯问答跳过审查",
+                         "手动计划开关", "计划开关刷新与失败保留", "暂停后文字图片补充", "未完成轮次不增加", "补充计划人工确认", "计划与审查开关独立"]},
                 ensure_ascii=False, indent=2), encoding="utf-8")
             browser.close()
     finally:

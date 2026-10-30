@@ -19,13 +19,14 @@ from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
 from workflow.context import normalized_sources
-from workflow.store import session_repositories, session_title, timestamp
+from workflow.store import followup_available, session_repositories, session_title, timestamp
 from workflow.engine import ACTIVE, COMPLETE, parse_review, skipped_review_ids
 from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
 from workflow.zentao import KINDS, ZentaoClient, identifier
+from workflow.user_input import pending_input
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -42,6 +43,7 @@ def public_state(state):
     result.setdefault("deliveries", [])
     result.setdefault("compile_checks", [])
     result.setdefault("compile_check", {"enabled": False})
+    result["can_followup"] = followup_available(state)
     # 旧记录只在响应副本中关联原文，不修改磁盘上的会话数据。
     cursor = 0
     for review in result.get("reviews", []):
@@ -364,7 +366,7 @@ class WebApplication:
         state = runtime.engine.state
         if self.closed or self.busy == "settings" or runtime.busy or runtime.engine.working():
             raise WorkflowError("该会话正在执行操作，请等待完成后修改图片。")
-        allowed = (state["stage"] in COMPLETE and state["phase"] == "complete") if purpose == "followup" else state["stage"] in {"资料已读取", "准备工作区失败"}
+        allowed = (followup_available(state) and not pending_input(runtime.engine.store, state)) if purpose == "followup" else state["stage"] in {"资料已读取", "准备工作区失败"}
         if (runtime.engine.closed or not allowed
                 or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
             raise WorkflowError("当前阶段不能修改补充图片。")
@@ -546,8 +548,9 @@ class WebApplication:
                        else self.sessions.get(session_id))
             engine = runtime.engine if runtime else self.sessions.connection
             state = engine.state
-            if action == "followup" and any((entry.get("followup") or {}).get("request_id") == request_id
-                    for entry in [state, *state.get("deliveries", [])]):
+            if action == "followup" and (any((entry.get("followup") or {}).get("request_id") == request_id
+                    for entry in [state, *state.get("deliveries", [])])
+                    or any(entry.get("request_id") == request_id for entry in state["history"] if entry["role"] == "用户")):
                 return {"accepted": True, "duplicate": True, "session_id": session_id, "request_id": request_id}
             if self.busy == "settings" or (global_action and self.busy):
                 raise WorkflowError("全局操作尚未完成，请等待。")
@@ -647,12 +650,15 @@ class WebApplication:
                     raise WorkflowError("请明确选择待确定仓库的分支。")
                 operation, arguments = engine.choose_branches, (choices,)
             elif action == "followup":
+                plan_mode = data.get("plan_mode", False)
+                if not isinstance(plan_mode, bool):
+                    raise WorkflowError("计划模式开关必须为布尔值。")
                 review_enabled = data.get("review_enabled")
                 if not isinstance(review_enabled, bool):
                     raise WorkflowError("请明确设置修改后自动 Review 开关。")
                 text = data.get("text", "")
                 images = engine.validate_followup(text, data.get("image_ids", []))
-                operation, arguments = engine.followup, (text, images, request_id, review_enabled)
+                operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode)
             elif action == "answer":
                 text, answers = str(data.get("text", "")).strip(), data.get("answers")
                 pending = state.get("pending")

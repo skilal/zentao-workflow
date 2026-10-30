@@ -136,6 +136,7 @@ class Tools:
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
+                    "continuation_context": state.get("continuation_context"),
                     "review_enabled": state.get("review_enabled", True),
                     "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
                     "compile_check": state.get("compile_check", {"enabled": False}),

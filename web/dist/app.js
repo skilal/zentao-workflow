@@ -37,8 +37,9 @@ function stageTag(stage) {
 function stepOf(state) {
   if (!state) return 0;
   if (state.phase === "complete") return state.stage === "已完成（未审查）" ? 2 : 4;
+  if (state.phase === "plan") return state.repos?.length ? 1 : 0;
   if (["followup", "compile", "compile_fix"].includes(state.phase)) return 2;
-  if (state.reviews?.length || state.phase === "review" || state.phase === "fix") return 3;
+  if (state.phase === "review" || state.phase === "fix") return 3;
   if (state.phase === "implement") return 2;
   if (state.repos?.length) return 1;
   return 0;
@@ -100,7 +101,7 @@ function mergeHistory(history, state) {
   const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
-function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
+function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", plan_mode: false, review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
   compile_check_enabled: state?.plan_started_at ? Boolean(state.compile_check?.enabled) : Boolean(settings?.compile_check_enabled),
   codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
 const EFFORT_NAMES = { none: "无", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最大", ultra: "超高" };
@@ -238,7 +239,7 @@ function WorkflowApp() {
     const turn = selected?.state?.progress_turns?.at(-1);
     const reply = turn?.status === "running" && turn.items.findLast(item => ["agentMessage", "plan"].includes(item.type));
     const projected = { ...value, state: selected?.state || null, revision: selected?.revision,
-      stream: reply && reply.phase !== "commentary" ? reply.text : selected?.stream || "", busy: selected?.busy || value.global_busy };
+      stream: reply && reply.phase !== "commentary" ? reply.text : selected?.stream || "", busy: selected?.busy || value.global_busy, working: selected?.working };
     modelRef.current = projected;
     if (render) {
       clearTimeout(renderTimer.current);
@@ -540,14 +541,15 @@ function WorkflowApp() {
 
   const state = model?.state;
   const stage = state?.stage || "";
-  const review = state?.reviews?.filter(entry => (entry.delivery_round || 1) === (state.delivery_round || 1)).at(-1);
+  const review = state?.reviews?.filter((entry, index) => (entry.delivery_round || 1) === (state.delivery_round || 1) && index >= (state.review_start || 0)).at(-1);
   const transfers = imageTransfers[state?.id] || [];
   const imagesUploading = transfers.some(entry => entry.status !== "error");
   const supplementEditable = Boolean(state && ["资料已读取", "准备工作区失败"].includes(stage) &&
     !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
-  const followupEditable = Boolean(state?.phase === "complete" && COMPLETE.has(stage) &&
-    !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
-  const busy = Boolean(stopped || sending || model?.busy || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
+  const followupEditable = Boolean(state?.can_followup &&
+    !stopped && !sending && !model?.busy && !model?.working && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
+  const busy = Boolean(stopped || sending || model?.busy || (stage === "已暂停" && model?.working) || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
+  const canPause = ACTIVE.has(stage) || ["等待人工回答", "等待计划补充", "等待计划确认", "等待修复选择", "等待编译选择"].includes(stage);
   const selectedKey = selectedItems.join("|");
   const loadedKey = state ? sessionItems(state).map(itemKey).join("|") : "";
   const selectionMatches = Boolean(state?.snapshot) && selectedKey === loadedKey;
@@ -635,17 +637,17 @@ function WorkflowApp() {
     if (result && epoch === viewEpoch.current && modelRef.current.selectedSessionId === result.session_id) navigate("plan");
   }
   async function answer() {
-    if (state.phase === "complete") {
+    if (state.can_followup) {
       const images = state.followup_images.filter(image => image.history_index === undefined);
       if (busy || transfers.length) return;
       if (!draft.reply.trim() && !images.length) { notice.warning({ message: "请填写消息或添加图片" }); return; }
       const id = state.id;
-      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), review_enabled: draft.review_enabled });
+      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), plan_mode: draft.plan_mode, review_enabled: draft.review_enabled });
       if (result) {
-        if (modelRef.current.selectedSessionId === id) changeDraft({ reply: "", answers: {}, review_enabled: false });
+        if (modelRef.current.selectedSessionId === id) changeDraft({ reply: "", answers: {}, plan_mode: false, review_enabled: false });
         else {
           const saved = JSON.parse(sessionStorage.getItem(`workflow-draft:${id}`) || "{}");
-          sessionStorage.setItem(`workflow-draft:${id}`, JSON.stringify({ ...saved, reply: "", answers: {}, review_enabled: false }));
+          sessionStorage.setItem(`workflow-draft:${id}`, JSON.stringify({ ...saved, reply: "", answers: {}, plan_mode: false, review_enabled: false }));
         }
       }
       return;
@@ -933,7 +935,7 @@ function WorkflowApp() {
         h(Button, { disabled: stopped || !ACTIVE.has(stage), onClick: () => act("pause") }, "暂停当前阶段"),
         h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"))));
     const questions = state.pending?.params?.questions || [];
-    const continuing = state.phase === "complete";
+    const continuing = Boolean(state.can_followup);
     const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
@@ -959,6 +961,7 @@ function WorkflowApp() {
               h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : ["系统", "控制器"].includes(entry.role) ? "system" : "assistant"}`, key: entry.index },
               h("div", { className: "chat-meta" }, h("strong", null, entry.role === "控制器" ? "系统" : entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
+                typeof entry.plan_mode === "boolean" && h(Tag, null, `计划模式：${entry.plan_mode ? "开启" : "关闭"}`),
                 typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
               h("div", { className: `chat-body${reviewsByMessage.has(entry.index) || entry.review_output ? " review-message" : ""}` },
                 reviewsByMessage.has(entry.index) ? renderReview(reviewsByMessage.get(entry.index), entry.text) :
@@ -987,6 +990,10 @@ function WorkflowApp() {
             placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
           continuing && h(React.Fragment, null,
             h("div", { className: "action-bar" },
+              h(Switch, { checked: draft.plan_mode, disabled: !followupEditable, "aria-label": "计划模式", onChange: checked => changeDraft({ plan_mode: checked }) }),
+              h(Typography.Text, null, "计划模式"),
+              h(Typography.Text, { type: "secondary" }, draft.plan_mode ? "先生成计划，再按计划授权规则实施" : "直接处理本次消息，需要计划时请手动开启")),
+            h("div", { className: "action-bar" },
               h(Switch, { checked: draft.review_enabled, disabled: !followupEditable, "aria-label": "修改后自动 Review", onChange: checked => changeDraft({ review_enabled: checked }) }),
               h(Typography.Text, null, "修改后自动 Review"),
               h(Typography.Text, { type: "secondary" }, draft.review_enabled ? "本轮有代码修改时审查，通过后自动本地提交" : "本轮不自动审查或提交，修改保留在工作区")),
@@ -1002,11 +1009,11 @@ function WorkflowApp() {
           h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明")))),
       h("div", { className: "card-stack" },
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
-          h(Button, { block: true, disabled: stopped || (!ACTIVE.has(stage) && stage !== "等待人工回答"), onClick: () => act("pause") }, "暂停当前阶段"),
+          h(Button, { block: true, disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
           h(Button, { block: true, disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
-            "后续对话支持提问、获取信息和提出修改要求。每条消息的 Review 开关默认关闭；开启且有代码修改时审查，无遗留问题后自动本地 commit，不 push。需要澄清时等待回答，扩大范围时先重新计划。" :
+            "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。需要澄清时等待明确回答；审查通过后仅本地 commit，不 push。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
         Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
         state.deliveries.length > 0 && h(CardBox, { title: "历史交付记录" }, h(Collapse, { ghost: true, items: state.deliveries.map(delivery => ({
