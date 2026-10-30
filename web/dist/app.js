@@ -44,7 +44,7 @@ function stepOf(state) {
   return 0;
 }
 function CardBox(props) { return h(Card, { className: "app-card", ...props }, props.children); }
-function Markdown({ text }) {
+const Markdown = React.memo(function Markdown({ text }) {
   const source = String(text || "").replace(/<\/?proposed_plan>/g, "");
   const html = DOMPurify.sanitize(marked.parse(source, { gfm: true, breaks: false }), {
     ALLOWED_TAGS: ["h1", "h2", "h3", "h4", "h5", "h6", "p", "br", "hr", "strong", "em", "del", "ul", "ol", "li", "blockquote", "a", "pre", "code", "table", "thead", "tbody", "tr", "th", "td", "input"],
@@ -52,6 +52,47 @@ function Markdown({ text }) {
     ALLOW_DATA_ATTR: false
   });
   return h("div", { className: "markdown-body", dangerouslySetInnerHTML: { __html: html } });
+});
+const PROCESS_STATUS = { running: "进行中", completed: "已完成", failed: "失败", interrupted: "已暂停", disconnected: "连接已断开", waiting: "等待你的回答" };
+function updateProgress(turns, value) {
+  if (value.op === "turn") return turns.some(turn => turn.id === value.turn.id) ? turns : [...turns, value.turn];
+  return turns.map(turn => {
+    if (turn.id !== value.turn_id) return turn;
+    if (value.op === "status") return { ...turn, status: value.status, items: turn.items.map(item => ["running", "waiting"].includes(item.status) ?
+      { ...item, status: ["running", "waiting", "completed"].includes(value.status) ? value.status : "interrupted" } : item) };
+    if (value.op === "item") return { ...turn, items: turn.items.some(item => item.id === value.item.id) ?
+      turn.items.map(item => item.id === value.item.id ? value.item : item) : [...turn.items, value.item] };
+    return { ...turn, items: turn.items.map(item => {
+      if (item.id !== value.item_id) return item;
+      if (value.summary_index === null) return { ...item, text: item.text + value.delta };
+      const summary = [...item.summary];
+      while (summary.length <= value.summary_index) summary.push("");
+      summary[value.summary_index] += value.delta;
+      return { ...item, summary };
+    }) };
+  });
+}
+function ProgressTurn({ turn }) {
+  const [expanded, setExpanded] = useState(null);
+  const active = turn.status === "running";
+  const messages = turn.items.filter(item => item.type === "agentMessage");
+  const unfinished = !["running", "completed"].includes(turn.status);
+  const visible = turn.items.filter(item => item.type !== "plan" && (item.type !== "agentMessage" ||
+    (turn.phase !== "review" && (unfinished || (item.phase !== "final_answer" && (item.phase === "commentary" || item.id !== messages.at(-1)?.id))))));
+  const activities = [...new Set(turn.items.filter(item => item.status === "running").map(item => item.label))];
+  const label = active ? activities.join("、") || "模型正在处理中" : PROCESS_STATUS[turn.status];
+  return h("div", { className: "process-turn", "data-turn-id": turn.id }, h(Collapse, {
+    size: "small", activeKey: expanded ?? (active ? ["process"] : []), onChange: setExpanded,
+    items: [{ key: "process", label: h(Space, { size: "small", wrap: true }, "处理过程",
+      active && h(Spin, { size: "small" }), h("span", { role: "status" }, label)),
+      children: visible.length ? visible.map(item => h("div", { className: "process-item", key: item.id, "data-item-id": item.id },
+        h(Space, { size: "small", wrap: true }, h(Typography.Text, { strong: true }, item.label),
+          h(Tag, { color: item.status === "failed" ? "error" : item.status === "running" ? "processing" : "default" }, PROCESS_STATUS[item.status])),
+        item.paths.map(path => h("div", { className: "repo-path", key: path }, path)),
+        item.type === "reasoning" ? item.summary.map((text, index) => text && h(Markdown, { key: index, text })) :
+          item.type === "agentMessage" && item.text && h(Markdown, { text: item.text }))) :
+        h(Typography.Text, { type: "secondary" }, active ? "模型正在处理中，等待可展示的过程内容。" : "本回合没有返回可展示的过程内容。") }]
+  }));
 }
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
@@ -185,17 +226,32 @@ function WorkflowApp() {
   const [settingsSelection, setSettingsSelection] = useState(null);
   const [sessionSelection, setSessionSelection] = useState(null);
   const feedRef = useRef(null);
+  const followBottom = useRef(true);
+  const renderTimer = useRef(null);
   const lastSession = useRef(null);
   const lastSettings = useRef("");
   const [notice, noticeHolder] = notification.useNotification();
   const [modal, modalHolder] = Modal.useModal();
 
-  function applyModel(value) {
+  function applyModel(value, render = true) {
     const selected = value.selectedSessionId ? value.sessions?.[value.selectedSessionId] : value.preview;
+    const turn = selected?.state?.progress_turns?.at(-1);
+    const reply = turn?.status === "running" && turn.items.findLast(item => ["agentMessage", "plan"].includes(item.type));
     const projected = { ...value, state: selected?.state || null, revision: selected?.revision,
-      stream: selected?.stream || "", busy: selected?.busy || value.global_busy };
+      stream: reply && reply.phase !== "commentary" ? reply.text : selected?.stream || "", busy: selected?.busy || value.global_busy };
     modelRef.current = projected;
-    setModel(projected);
+    if (render) {
+      clearTimeout(renderTimer.current);
+      renderTimer.current = null;
+      setModel(projected);
+    }
+  }
+  function queueModel(value) {
+    applyModel(value, false);
+    if (renderTimer.current === null) renderTimer.current = setTimeout(() => {
+      renderTimer.current = null;
+      setModel(modelRef.current);
+    }, 100);
   }
   function navigate(key) { setPage(key); sessionStorage.setItem("workflow-page", key); window.scrollTo(0, 0); }
   function changeDraft(change) {
@@ -411,7 +467,7 @@ function WorkflowApp() {
       eventSource.current = events;
       events.onopen = () => setOnline(true);
       events.onerror = () => setOnline(false);
-      for (const kind of ["state", "preview", "items", "connected", "connection", "conversation", "delta", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
+      for (const kind of ["state", "preview", "items", "connected", "connection", "conversation", "delta", "progress", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
         events.addEventListener(kind, event => {
           if (disposed) return;
           const value = JSON.parse(event.data);
@@ -444,8 +500,18 @@ function WorkflowApp() {
           else if (kind === "conversation") receiveState(value);
           else if (kind === "delta") {
             const cached = current.sessions[value.session_id];
-            if (cached && cached.event_cursor < value.event_cursor) applyModel({ ...current, sessions: { ...current.sessions,
+            if (cached && cached.event_cursor < value.event_cursor) queueModel({ ...current, sessions: { ...current.sessions,
               [value.session_id]: { ...cached, stream: cached.stream + value.delta, event_cursor: value.event_cursor } } });
+          }
+          else if (kind === "progress") {
+            const cached = current.sessions[value.session_id];
+            if (cached && cached.event_cursor < value.event_cursor) {
+              const payload = { ...cached, event_cursor: value.event_cursor,
+                state: { ...cached.state, progress_turns: updateProgress(cached.state.progress_turns || [], value) } };
+              const next = { ...current, sessions: { ...current.sessions, [value.session_id]: payload } };
+              if (value.op === "delta") queueModel(next);
+              else applyModel(next);
+            }
           }
           else if (kind === "questions" && current.selectedSessionId === value.session_id) navigate("plan");
           else if (kind === "session_deleted") {
@@ -465,7 +531,7 @@ function WorkflowApp() {
         });
       }
     }).catch(error => { if (!disposed) setFatal(error.message); });
-    return () => { disposed = true; if (events) events.close(); };
+    return () => { disposed = true; clearTimeout(renderTimer.current); if (events) events.close(); };
   }, []);
   useEffect(() => {
     window.addEventListener("pagehide", discardPreview);
@@ -512,9 +578,10 @@ function WorkflowApp() {
     if (!state || !review) return;
     if (draftRef.current.review_number !== review.number) changeDraft({ selected_findings: [], review_note: "", review_number: review.number });
   }, [state?.id, review?.number]);
+  useLayoutEffect(() => { followBottom.current = true; }, [page, state?.id]);
   useLayoutEffect(() => {
-    if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [page, state?.id, selectionMatches, state?.phase, model?.stream, state?.history?.length, review?.number]);
+    if (feedRef.current && followBottom.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
+  }, [page, state?.id, selectionMatches, state?.phase, model?.stream, state?.history?.length, state?.progress_turns, review?.number]);
   useEffect(() => {
     if (!model?.settings) return;
     const serialized = JSON.stringify(model.settings);
@@ -868,15 +935,22 @@ function WorkflowApp() {
     const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
-    const entries = state.history.map((entry, index) => ({ ...entry, index })).filter(entry => entry.role !== "控制器");
+    const entries = [...state.history.map((entry, index) => ({ ...entry, index })),
+      ...(state.progress_turns || []).map(turn => ({ process: turn, index: turn.history_index }))]
+      .filter(entry => entry.role !== "控制器").sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
+    const processRunning = state.progress_turns?.at(-1)?.status === "running";
     return h("div", { className: "conversation-grid" },
       h("div", { className: "card-stack" },
         renderBranches(),
         renderCompileChecks(),
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
-          h("div", { className: "conversation-feed", ref: feedRef }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
-            entries.map(entry => h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: entry.index },
+          h("div", { className: "conversation-feed", ref: feedRef, onScroll: event => {
+            const feed = event.currentTarget;
+            followBottom.current = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48;
+          } }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
+            entries.map(entry => entry.process ? h(ProgressTurn, { key: entry.process.id, turn: entry.process }) :
+              h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : entry.role === "系统" ? "system" : "assistant"}`, key: entry.index },
               h("div", { className: "chat-meta" }, h("strong", null, entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
                 typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
@@ -887,9 +961,9 @@ function WorkflowApp() {
                       entry.review_output ? renderReview({ result: entry.review_output }, entry.text, entry.review_error) : h("pre", { className: "review-original" }, entry.text) :
                     entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup")))),
-            !model.stream && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
+            !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
-                stage === "准备工作区中" ? " 正在准备工作区…" : " 请求已发送，正在等待模型回复…"),
+                stage === "准备工作区中" ? " 正在准备工作区…" : " 模型正在处理中…"),
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
               model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream }))))),
         h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复" },

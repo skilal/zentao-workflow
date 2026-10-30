@@ -3,6 +3,7 @@
 from threading import RLock
 
 from workflow.engine import ACTIVE, Workflow
+from workflow.progress import settle_progress
 from workflow.settings import WorkflowError
 from workflow.store import PreviewStore, SessionStore
 from workflow.user_input import pending_input
@@ -36,6 +37,7 @@ class SessionManager:
             question = pending_input(self.store, state)
             interrupted = state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}
             changed = interrupted or state.get("rpc_connected") or state.get("pending")
+            changed = settle_progress(state, "waiting" if question else "interrupted") or changed
             state["rpc_connected"] = False
             if question:
                 state.update(stage="等待人工回答", pause_requested=False,

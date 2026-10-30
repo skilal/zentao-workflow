@@ -207,6 +207,8 @@ class WebApplication:
             elif kind == "delta":
                 runtime.stream += value
                 self._publish("delta", {"session_id": session_id, "delta": value})
+            elif kind == "progress":
+                self._publish("progress", {"session_id": session_id, **value})
             elif kind in ("message", "history"):
                 if kind == "message" and value["role"] in ("控制器", "Codex"):
                     runtime.stream = ""

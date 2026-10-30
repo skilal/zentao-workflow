@@ -89,6 +89,10 @@ button, input, textarea { font: inherit; }
 .chat-entry.user .chat-body { background: #eef7ff; border-color: #dfedfc; }
 .chat-entry.system .chat-body { background: white; color: #8791a1; border-style: dashed; }
 .stream-indicator { color: #1b8fff; font-size: 11px; margin-bottom: 8px; }
+.process-turn { margin-bottom: 16px; }
+.process-item + .process-item { margin-top: 12px; }
+.process-item .repo-path { margin-top: 4px; }
+.process-item .markdown-body { margin-top: 8px; }
 .question { padding: 14px 16px; background: #f7fbff; border: 1px solid #dceeff; border-radius: 6px; margin-bottom: 13px; }
 .question-title { color: #31425b; font-weight: 500; margin-bottom: 12px; line-height: 1.7; }
 .question-options { display: flex; flex-direction: column; gap: 11px; margin-bottom: 12px; }

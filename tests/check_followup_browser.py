@@ -101,7 +101,7 @@ def run():
             page.screenshot(path=str(output / "完成后可继续发送.png"), full_page=True)
             send.click()
             expect(page.get_by_text("续聊处理中", exact=True).first).to_be_visible()
-            expect(page.get_by_role("status").filter(has_text="正在等待模型回复")).to_be_visible()
+            expect(page.get_by_role("status").filter(has_text="模型正在处理中")).to_be_visible()
             fixture.drain()
             expect(page.get_by_placeholder("输入回复、需要调整的计划内容或补充业务规则…")).to_be_disabled()
             expect(page.locator(".conversation-feed").get_by_alt_text("粘贴截图.png")).to_be_visible()

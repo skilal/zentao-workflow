@@ -16,6 +16,7 @@ from workflow.context import context_hash, requirement_context
 from workflow.delivery import validate_review_request
 from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
+from workflow.progress import ProgressFlow, settle_progress
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.store import SessionStore, session_title, timestamp
@@ -85,7 +86,7 @@ def skipped_review_ids(state, delivery_round):
     return skipped
 
 
-class Workflow(CompileFlow):
+class Workflow(CompileFlow, ProgressFlow):
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
         self.emit = emit
@@ -128,6 +129,7 @@ class Workflow(CompileFlow):
             except Exception as error:
                 with self.lock:
                     if self.state and affects_session:
+                        self.set_progress_status("failed")
                         self.state["error"] = str(error)
                         if self.state["stage"] in ACTIVE and (not was_active or getattr(action, "__name__", "") == "_completed"):
                             self.state["stage"] = "已停止"
@@ -660,6 +662,7 @@ class Workflow(CompileFlow):
             raise
         with self.lock:
             state["turn_id"] = response["turn"]["id"]
+            self.start_progress(state["turn_id"])
             if phase != "branch":
                 state["thread_input"] = {"thread_id": state["thread_id"], "context_hashes": hashes,
                                          "images": sorted(image_hashes)}
@@ -703,6 +706,7 @@ class Workflow(CompileFlow):
                                   "params": {"questions": request["questions"]}, "turn_completed": False})
                 if self.state["phase"] == "plan" and self.state.get("plan_round") is not None:
                     self.state["plan_round"]["asked"] = True
+                self.set_progress_status("waiting")
                 self.note("Codex", "需要你的明确答复：\n" + "\n".join(question["question"] for question in request["questions"]))
                 self.save()
                 self.emit("questions", request["questions"])
@@ -759,6 +763,7 @@ class Workflow(CompileFlow):
                 result["answers"] = {questions[0]["id"]: {"answers": [text]}}
             state["pending"] = None
             state["stage"] = PHASE_STAGE[state["phase"]]
+            self.set_progress_status("running")
             self.save()
             self.rpc.respond(pending["id"], result)
         else:
@@ -898,6 +903,7 @@ class Workflow(CompileFlow):
         if self.compile_runner:
             self.compile_runner.stop()
         state["stage"] = "部分提交" if state["commits"] else "已暂停"
+        self.set_progress_status("interrupted")
         state["last_output"] = self.last_message or "\n\n".join(self.output.values())
         self.save()
         if self.rpc and state.get("turn_id") and was_active and state["phase"] != "compile":
@@ -910,6 +916,7 @@ class Workflow(CompileFlow):
             raise WorkflowError("请先暂停当前会话。")
         self._close_rpc()
         self.state = self.store.load(session_id)
+        settle_progress(self.state, "interrupted")
         self.state["rpc_connected"] = False
         if self.state["stage"] in ACTIVE:
             self.state["stage"] = "已暂停"
@@ -972,6 +979,7 @@ class Workflow(CompileFlow):
                     self.state["plan_round"]["asked"] = True
                 self.state["pending"] = {"id": message["id"], "method": method, "params": params}
                 self.state["stage"] = "等待人工回答"
+                self.set_progress_status("waiting")
                 self.save()
             self.emit("questions", params.get("questions", []))
             return
@@ -989,13 +997,16 @@ class Workflow(CompileFlow):
             else:
                 self.rpc._write({"id": message["id"], "error": {"code": -32601, "message": "当前工作流不支持该请求。"}})
             return
+        self.progress_event(method, params)
         if method == "item/agentMessage/delta":
             key = params.get("itemId", "agent")
             self.output[key] = self.output.get(key, "") + params.get("delta", "")
-            self.emit("delta", params.get("delta", ""))
+            if not params.get("itemId"):
+                self.emit("delta", params.get("delta", ""))
         elif method == "item/plan/delta":
             self.plan_stream += params.get("delta", "")
-            self.emit("delta", params.get("delta", ""))
+            if not params.get("itemId"):
+                self.emit("delta", params.get("delta", ""))
         elif method == "item/completed":
             item = params.get("item", {})
             if item.get("type") == "agentMessage" and item.get("text"):
@@ -1006,9 +1017,13 @@ class Workflow(CompileFlow):
             elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") == "ask_user":
                 self.submit(self._wait_for_user_input, self.state["id"], epoch, control=True)
         elif method == "turn/started":
+            if any(turn["id"] == params["turn"]["id"] and turn["status"] != "running"
+                   for turn in self.state.get("progress_turns", [])):
+                return
             self.turn_running = True
             with self.lock:
                 self.state["turn_id"] = params["turn"]["id"]
+                self.start_progress(self.state["turn_id"])
                 self.save()
             if self.state.get("pause_requested"):
                 self.submit(self.pause, control=True)
@@ -1018,12 +1033,15 @@ class Workflow(CompileFlow):
             if turn_id and self.state.get("turn_id") and turn_id != self.state["turn_id"]:
                 return
             self.turn_running = False
+            self.set_progress_status("waiting" if self.state.get("pending") else
+                                 {"completed": "completed", "interrupted": "interrupted"}.get(turn.get("status"), "failed"))
             key = (self.state["id"], turn_id)
             if key not in self.pending_turns:
                 self.pending_turns.add(key)
                 self.submit(self._completed, turn, self.state["id"], epoch)
         elif method in ("client/error", "client/disconnected"):
             self.turn_running = False
+            self.set_progress_status("disconnected")
             with self.lock:
                 if self.state:
                     self.state["rpc_connected"] = False
@@ -1041,6 +1059,8 @@ class Workflow(CompileFlow):
             return
         if turn.get("id") and state.get("turn_id") and turn["id"] != state["turn_id"]:
             return
+        self.set_progress_status("waiting" if state.get("pending") else
+                             {"completed": "completed", "interrupted": "interrupted"}.get(turn.get("status"), "failed"))
         if state.get("pause_requested"):
             state["stage"] = "已暂停"
             self.save()
@@ -1130,6 +1150,8 @@ class Workflow(CompileFlow):
                 self.finalize([], "", automatic=True)
 
     def _close_rpc(self):
+        if self.state:
+            self.set_progress_status("interrupted")
         self.connection_epoch += 1
         if self.rpc:
             self.rpc.close()
