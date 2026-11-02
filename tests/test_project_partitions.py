@@ -145,6 +145,65 @@ class ProjectPartitionChecks(TestCase):
         resolve.assert_called_once()
         self.assertEqual(runtime.engine.state["project"]["id"], 42)
 
+    def test_bug_project_replaces_inherited_conversation_project_before_planning(self):
+        bug = {"kind": "bug", "id": 9476, "title": "案卷起止日期问题", "project_id": 57,
+               "project_name": ""}
+        self.application.items.append(bug)
+        result = self.application.dispatch({"action": "new_conversation", "request_id": uuid4().hex,
+                                            "data": {"project_id": 41}})
+        runtime = self.application.sessions.get_preview(result["preview_id"])
+        self.drain(runtime)
+        self.assertEqual(runtime.engine.state["project_override"]["id"], 41)
+        snapshot = {"items": [bug], "project": {"id": 57, "name": "传化集团（售后）", "candidates": []},
+                    "sources": [{"title": bug["title"], "content": "起止日期汇总异常",
+                                 "raw": {"project": 57, "projectName": "传化集团（售后）"}}],
+                    "materials": [], "blockers": [], "feishu_links": []}
+        with patch.object(runtime.engine.zentao, "collect_many", return_value=snapshot):
+            self.application.dispatch({"action": "collect", "preview_id": result["preview_id"],
+                "revision": runtime.revision, "request_id": uuid4().hex,
+                "data": {"items": [{"kind": "bug", "id": 9476}]}})
+            self.drain(runtime)
+        self.assertNotIn("project_override", runtime.engine.state)
+        self.assertEqual(runtime.engine.state["snapshot"]["project"]["id"], 57)
+        with patch("workflow.engine.Workflow._resolve_branches") as resolve:
+            result = self.application.dispatch({"action": "plan", "preview_id": result["preview_id"],
+                "revision": runtime.revision, "request_id": uuid4().hex,
+                "data": {"model": "示例模型", "reasoning_effort": "high",
+                         "items": [{"kind": "bug", "id": 9476}]}})
+            formal = self.application.sessions.get(result["session_id"])
+            self.drain(formal)
+        resolve.assert_called_once()
+        self.assertEqual(formal.engine.state["project"]["id"], 57)
+        self.assertEqual(formal.engine.state["project"]["name"], "传化集团（售后）")
+        self.assertNotIn("project_override", formal.engine.state)
+
+    def test_changed_work_item_identity_clears_previous_project_choice(self):
+        first, second = self.application.items
+        for previous, selected in (([first], [second]),
+                                   ([first], [{**first, "kind": "bug"}]),
+                                   ([first], [first, second]), ([first, second], [first])):
+            with self.subTest(previous=previous, selected=selected):
+                runtime = self.add_session()
+                runtime.engine.state["items"] = deepcopy(previous)
+                self.application.move_project(self.move_request(runtime))
+                snapshot = {"project": {"id": 41, "name": "工作项项目"}, "sources": [], "materials": []}
+                with patch.object(runtime.engine.zentao, "collect_many", return_value=snapshot):
+                    runtime.engine.collect(selected)
+                self.assertNotIn("project_override", runtime.engine.state)
+                self.assertEqual(runtime.engine.state["project"]["id"], 41)
+                self.assertEqual(runtime.engine.state["snapshot"]["project"]["id"], 41)
+
+    def test_reordering_same_work_items_keeps_explicit_project_choice(self):
+        runtime = self.add_session()
+        runtime.engine.state["items"] = deepcopy(self.application.items)
+        self.application.move_project(self.move_request(runtime))
+        snapshot = {"project": {"id": 41, "name": "工作项项目"}, "sources": [], "materials": []}
+        with patch.object(runtime.engine.zentao, "collect_many", return_value=snapshot):
+            runtime.engine.collect(list(reversed(self.application.items)))
+        self.assertEqual(runtime.engine.state["project_override"]["id"], 42)
+        self.assertEqual(runtime.engine.state["project"]["id"], 42)
+        self.assertEqual(runtime.engine.state["snapshot"]["project"]["id"], 42)
+
     def test_started_work_artifacts_and_busy_sessions_reject_moves(self):
         runtime = self.add_session()
         original = deepcopy(runtime.engine.state)

@@ -302,6 +302,10 @@ class Workflow(CompileFlow, ProgressFlow):
             raise WorkflowError("开始计划后不能改变工作项，请新建会话。")
         if not self.state:
             self.state = self.store.new(items[0])
+        previous = {(item["kind"], item["id"]) for item in self.state.get("items", [self.state["item"]])
+                    if item is not None}
+        if previous != {(item["kind"], item["id"]) for item in items}:
+            self.state.pop("project_override", None)
         self.state.update(item=items[0], items=items, stage="资料读取中", error="")
         self.state.pop("snapshot", None)
         self.save()
