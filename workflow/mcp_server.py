@@ -7,6 +7,7 @@ from pathlib import Path
 from sys import stdin, stdout
 
 from workflow.compile_checks import compile_context
+from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, safe_file
@@ -24,6 +25,7 @@ FILE_ARGS = {"repository": STRING, "path": STRING}
 LINE_ARGS = {"start_line": {"type": "integer", "minimum": 1},
              "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}
 TOOLS = [
+    ("read_answer_attachment", "按编号只读已提交的问题附件；图片返回图片内容，文本按行分页，无法解析时明确返回限制。", schema({"attachment_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
     ("list_files", "列出指定仓库的文件；pattern 为 glob；不访问依赖、Git 和输出目录。", schema({"repository": STRING, "pattern": STRING}, ("repository",))),
     ("read_file", "读取当前 UTF-8 文件；默认 200 行，最多 500 行；next_line 指明续读位置。多文件优先使用 read_files。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
@@ -135,6 +137,7 @@ class Tools:
                     "materials_revision": context_hash(snapshot), "materials_included": include,
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
+                    "answer_attachments": submitted_attachments(state),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                     "continuation_context": state.get("continuation_context"),
                     "review_enabled": state.get("review_enabled", True),
@@ -143,6 +146,8 @@ class Tools:
                     "compile_checks": compile_context(state)}
         if name == "ask_user":
             return register_input(self.store, state, arguments.get("questions"))
+        if name == "read_answer_attachment":
+            return read_answer_attachment(self.store, state, arguments)
         if name == "request_review":
             request = validate_review_request(state, arguments)
             path = self.store.directory(self.session_id) / f"review-request-{state['delivery_round']}.json"
@@ -298,7 +303,8 @@ def serve(session_id):
             elif method == "tools/call":
                 try:
                     value = tools.call(request["params"]["name"], request["params"].get("arguments", {}))
-                    result = {"content": [{"type": "text", "text": value if isinstance(value, str) else dumps(value, ensure_ascii=False)}]}
+                    result = {"content": value["content"]} if request["params"]["name"] == "read_answer_attachment" and "content" in value else {
+                        "content": [{"type": "text", "text": value if isinstance(value, str) else dumps(value, ensure_ascii=False)}]}
                 except (WorkflowError, OSError, ValueError, KeyError) as error:
                     result = {"isError": True, "content": [{"type": "text", "text": str(error)}]}
             elif method == "ping":

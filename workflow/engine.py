@@ -9,6 +9,7 @@ from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
 
 from workflow.approvals import is_controlled_write
+from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
 from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
@@ -683,6 +684,7 @@ class Workflow(CompileFlow, ProgressFlow):
         turn_cwd = session_path if phase == "branch" else session_path / "workspace"
         context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                    "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
+                   "answer_attachments": submitted_attachments(state),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
                    "feishu_links": state["snapshot"]["feishu_links"],
                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
@@ -711,6 +713,7 @@ class Workflow(CompileFlow, ProgressFlow):
                        for entry in material.get("archive_entries", []) if entry.get("image")]
             images += state.get("supplement_images", [])
             images += (state.get("followup") or {}).get("images", [])
+            images += [entry for entry in submitted_attachments(state) if entry.get("image")]
             references = []
             for image in images:
                 digest = sha256(Path(image["path"]).read_bytes()).hexdigest()
@@ -822,30 +825,24 @@ class Workflow(CompileFlow, ProgressFlow):
         if interrupt:
             self.rpc.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
-    def answer(self, text, answers=None):
+    def answer(self, text, answers=None, attachments=None):
         state = self.require_state("等待人工回答", "等待计划补充", "等待计划确认")
-        if not text.strip() and not answers:
-            raise WorkflowError("请明确回答，不能以空内容继续。")
+        if attachments is None:
+            answers, attachments = prepare_answer(state, text, answers)
         pending = state.get("pending")
         controlled = pending and pending["method"] == "workflow/ask_user"
-        if controlled:
-            if not pending.get("turn_completed"):
-                raise WorkflowError("控制器正在结束当前回合，请稍后提交回答。")
-            questions = pending["params"]["questions"]
-            if answers is not None:
-                if (not isinstance(answers, dict) or set(answers) != {question["id"] for question in questions}
-                        or any(not isinstance(values, list) or not values
-                               or any(not isinstance(value, str) or not value.strip() for value in values)
-                               for values in answers.values())):
-                    raise WorkflowError("请逐项明确回答所有问题，不能使用空答案。")
-            elif len(questions) != 1:
-                raise WorkflowError("多个问题必须逐项明确回答。")
+        for entry in attachments:
+            attachment_file(self.store, state, entry)
         reply = text.strip() or dumps(answers, ensure_ascii=False)
-        if controlled and answers is not None:
+        if pending and answers is not None:
+            questions = pending["params"]["questions"]
             response = "\n\n".join(question["question"] + "\n回答：" + "\n".join(answers[question["id"]])
                                    for question in questions)
             reply = "\n\n".join(part for part in (response, text.strip()) if part)
-        self.note("用户", reply)
+        history_index = len(state["history"])
+        for entry in attachments:
+            entry["history_index"] = history_index
+        self.note("用户", reply, attachments=deepcopy(attachments))
         state["supplement"] += "\n\n人工补充：" + reply
         if pending and state["rpc_connected"] and self.rpc and not pending.get("turn_completed"):
             if pending["method"] != "item/tool/requestUserInput":

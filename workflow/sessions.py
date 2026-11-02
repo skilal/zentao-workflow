@@ -18,6 +18,7 @@ class SessionRuntime:
         self.busy = None
         self.deleting = False
         self.event_cursor = 0
+        self.uploads = 0
 
 
 class SessionManager:

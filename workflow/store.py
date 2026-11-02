@@ -87,7 +87,7 @@ def initial_state(item, record_id):
         "plan_round": None, "approval_source": "",
         "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [],
         "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
-        "delivery_round": 1, "deliveries": [], "followup_images": [],
+        "delivery_round": 1, "deliveries": [], "followup_images": [], "answer_attachments": [],
     }
     if item is None:
         state["project"] = {"id": 0, "name": "", "candidates": []}

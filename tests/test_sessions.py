@@ -101,7 +101,7 @@ class SessionChecks(SessionFixture):
         self.first.engine.answer = Mock()
         self.application.dispatch(self.request(self.first, "answer", {"text": "明确答复"}))
         self.drain(self.first)
-        self.first.engine.answer.assert_called_once_with("明确答复", None)
+        self.first.engine.answer.assert_called_once_with("明确答复", None, [])
         self.second.engine.pause = Mock()
         self.first.engine.pause = Mock()
         self.application.dispatch(self.request(self.first, "pause"))

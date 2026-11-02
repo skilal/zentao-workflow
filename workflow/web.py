@@ -10,6 +10,7 @@ from json import dumps, loads
 from mimetypes import guess_type
 from os import getpid
 from pathlib import Path
+from re import fullmatch
 from secrets import compare_digest, token_urlsafe
 from shutil import copytree, rmtree
 from threading import Condition, RLock, Thread, Timer
@@ -27,6 +28,7 @@ from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
 from workflow.zentao import KINDS, ZentaoClient, identifier
 from workflow.user_input import pending_input
+from workflow.answer_attachments import answer_request_id, attachment_file, prepare_answer
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -39,6 +41,9 @@ def public_state(state):
     result = deepcopy(state)
     result.setdefault("supplement_images", [])
     result.setdefault("followup_images", [])
+    result.setdefault("answer_attachments", [])
+    if result.get("pending"):
+        result["pending"]["attachment_request_id"] = answer_request_id(state)
     result.setdefault("delivery_round", 1)
     result.setdefault("deliveries", [])
     result.setdefault("compile_checks", [])
@@ -417,6 +422,60 @@ class WebApplication:
             runtime.engine.save()
             return self.preview_payload(runtime) if preview_id else self.session_payload(runtime)
 
+    def _answer_runtime(self, session_id, revision, request_id, question_id):
+        runtime = self.sessions.get(session_id)
+        state, engine = runtime.engine.state, runtime.engine
+        pending = state.get("pending")
+        if (self.closed or self.busy == "settings" or runtime.busy or engine.closed or engine.jobs
+                or state["stage"] != "等待人工回答" or not pending
+                or (pending["method"] == "workflow/ask_user" and not pending.get("turn_completed"))
+                or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
+            raise WorkflowError("当前阶段不能修改问题附件，请等待当前操作完成。")
+        if type(revision) is not int or revision != runtime.revision:
+            raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再操作。")
+        if request_id != answer_request_id(state):
+            raise WorkflowError("当前问题已经变化，请查看最新问题后再上传。")
+        question = next((question for question in pending["params"].get("questions", []) if question["id"] == question_id), None)
+        if question is None:
+            raise WorkflowError("附件必须归属当前提问中的一个问题。")
+        return runtime, question
+
+    def upload_answer_attachment(self, session_id, revision, request_id, question_id, name, data):
+        with self.condition:
+            runtime, question = self._answer_runtime(session_id, revision, request_id, question_id)
+            if not isinstance(name, str) or not name.strip() or not 0 < len(data) <= self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024:
+                raise WorkflowError("文件名称不能为空，单个文件大小不能超过配置的附件上限。")
+            suffix = Path(name).suffix.lower()
+            extension = suffix.lstrip(".")
+            identifier = uuid4().hex
+            filename = identifier + (suffix if fullmatch(r"\.[a-z0-9]{1,16}", suffix) else "")
+            path = runtime.engine.store.directory(session_id) / "attachments" / "answers" / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            signatures = {"png": data.startswith(b"\x89PNG\r\n\x1a\n"), "jpg": data.startswith(b"\xff\xd8\xff"),
+                          "jpeg": data.startswith(b"\xff\xd8\xff"), "gif": data.startswith((b"GIF87a", b"GIF89a")),
+                          "webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP", "bmp": data.startswith(b"BM")}
+            entry = {"id": identifier, "name": name, "size": len(data), "path": str(path), "extension": extension,
+                     "content_type": guess_type(path.name)[0] or "application/octet-stream", "image": signatures.get(extension, False),
+                     "request_id": request_id, "question_id": question_id, "question": question["question"],
+                     "delivery_round": runtime.engine.state.get("delivery_round", 1)}
+            runtime.engine.state.setdefault("answer_attachments", []).append(entry)
+            runtime.engine.save()
+            return self.session_payload(runtime)
+
+    def remove_answer_attachment(self, session_id, revision, request_id, question_id, attachment_id):
+        with self.condition:
+            runtime, _ = self._answer_runtime(session_id, revision, request_id, question_id)
+            entries = runtime.engine.state.get("answer_attachments", [])
+            entry = next((entry for entry in entries if entry["id"] == attachment_id and entry["request_id"] == request_id
+                          and entry["question_id"] == question_id and "history_index" not in entry), None)
+            if entry is None:
+                raise WorkflowError("附件不在当前问题的待提交列表中。")
+            attachment_file(runtime.engine.store, runtime.engine.state, entry).unlink()
+            entries.remove(entry)
+            runtime.engine.save()
+            return self.session_payload(runtime)
+
     def update_settings(self, data):
         if any(runtime.engine.working() or runtime.uploads for runtime in self.sessions.previews.values()):
             raise WorkflowError("工作项资料正在读取或上传，请等待完成后修改设置。")
@@ -557,13 +616,15 @@ class WebApplication:
             if self.busy == "settings" or (global_action and self.busy):
                 raise WorkflowError("全局操作尚未完成，请等待。")
             if runtime:
+                if runtime.uploads and action != "pause":
+                    raise WorkflowError("该会话正在上传附件，请等待上传完成后再操作。")
                 if runtime.busy and action != "pause":
                     raise WorkflowError("该会话上一个操作尚未完成，请等待。")
                 if action not in {"pause", "delete_session", "answer"} and engine.working():
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
@@ -672,17 +733,9 @@ class WebApplication:
                 images = engine.validate_followup(text, data.get("image_ids", []))
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode)
             elif action == "answer":
-                text, answers = str(data.get("text", "")).strip(), data.get("answers")
-                pending = state.get("pending")
-                if pending:
-                    questions = pending["params"].get("questions", [])
-                    if not isinstance(answers, dict) or set(answers) != {question["id"] for question in questions}:
-                        raise WorkflowError("请逐项明确回答当前所有问题。")
-                    if any(not isinstance(values, list) or not values or any(not isinstance(value, str) or not value.strip() for value in values) for values in answers.values()):
-                        raise WorkflowError("每个问题都需要明确回答，不能自动选择或留空。")
-                elif answers is not None and not isinstance(answers, dict):
-                    raise WorkflowError("回答参数无效。")
-                operation, arguments = engine.answer, (text, answers)
+                text = data.get("text", "")
+                answers, attachments = prepare_answer(state, text, data.get("answers"), data.get("attachment_ids"), data.get("answer_request_id"))
+                operation, arguments = engine.answer, (text, answers, attachments)
             elif action == "approve_plan":
                 if data.get("plan_hash") != state.get("plan_hash"):
                     raise WorkflowError("你确认的计划版本已经变化，请重新查看。")
@@ -907,6 +960,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._material(query)
             elif path == "/api/supplement-images":
                 self._supplement_image(query)
+            elif path == "/api/answer-attachments":
+                self._answer_attachment(query)
             elif path.startswith("/api/"):
                 self._json(404, {"error": "接口不存在。"})
             else:
@@ -928,33 +983,42 @@ class WebHandler(BaseHTTPRequestHandler):
             application = self.server.application
             parsed = urlparse(self.path)
             image_upload = parsed.path == "/api/supplement-images"
+            answer_upload = parsed.path == "/api/answer-attachments"
+            file_upload = image_upload or answer_upload
             length = int(self.headers.get("Content-Length", "0"))
-            maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024 if image_upload else 1024 * 1024
+            maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024 if file_upload else 1024 * 1024
             if not 0 < length <= maximum:
                 self.close_connection = True
-                raise WorkflowError("图片为空或超过配置的附件大小上限。" if image_upload else "请求内容为空或超过大小限制。")
+                raise WorkflowError("附件为空或超过配置的附件大小上限。" if file_upload else "请求内容为空或超过大小限制。")
             unread_length = length
             self._check(authenticated=True)
             if not compare_digest(self.headers.get("X-Workflow-Token", ""), application.csrf_token):
                 raise WorkflowError("操作凭据无效，请刷新页面后重试。")
-            if image_upload:
+            if file_upload:
                 query = parse_qs(parsed.query)
                 preview_id = query.get("preview_id", [None])[0]
                 session_id = query.get("session_id", [None])[0]
                 revision = int(query.get("revision", ["-1"])[0])
                 with application.condition:
-                    if preview_id:
+                    if answer_upload:
+                        runtime = application.sessions.get(session_id)
+                        runtime.uploads += 1
+                    elif preview_id:
                         runtime = application.sessions.get_preview(preview_id)
                         runtime.uploads += 1
                 try:
                     unread_length = 0
                     data = self.rfile.read(length)
                     if len(data) != length:
-                        raise WorkflowError("图片传输不完整，请重新上传。")
-                    self._json(200, application.upload_supplement_image(session_id, revision,
-                        query.get("name", [""])[0], data, preview_id, query.get("purpose", ["supplement"])[0]))
+                        raise WorkflowError("附件传输不完整，请重新上传。")
+                    if answer_upload:
+                        self._json(200, application.upload_answer_attachment(session_id, revision, query.get("answer_request_id", [None])[0],
+                            query.get("question_id", [None])[0], query.get("name", [""])[0], data))
+                    else:
+                        self._json(200, application.upload_supplement_image(session_id, revision,
+                            query.get("name", [""])[0], data, preview_id, query.get("purpose", ["supplement"])[0]))
                 finally:
-                    if preview_id:
+                    if answer_upload or preview_id:
                         with application.condition:
                             runtime.uploads -= 1
                 return
@@ -969,6 +1033,9 @@ class WebHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/supplement-images/remove":
                 self._json(200, application.remove_supplement_image(data.get("session_id"), data.get("revision"),
                     data.get("image_id"), data.get("preview_id"), data.get("purpose", "supplement")))
+            elif self.path == "/api/answer-attachments/remove":
+                self._json(200, application.remove_answer_attachment(data.get("session_id"), data.get("revision"),
+                    data.get("answer_request_id"), data.get("question_id"), data.get("attachment_id")))
             elif self.path == "/api/projects":
                 self._json(200, application.add_project(data))
             elif self.path == "/api/sessions/title":
@@ -1021,6 +1088,26 @@ class WebHandler(BaseHTTPRequestHandler):
             if not title.lower().endswith(path.suffix.lower()):
                 title += path.suffix
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(title))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _answer_attachment(self, query):
+        application = self.server.application
+        runtime = application.sessions.get(query.get("session_id", [None])[0])
+        state = runtime.engine.state
+        entry = next((entry for entry in state.get("answer_attachments", [])
+                      if entry["id"] == query.get("attachment_id", [None])[0]), None)
+        if entry is None:
+            raise WorkflowError("附件不在当前会话中。")
+        path = attachment_file(runtime.engine.store, state, entry)
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", entry["content_type"] if entry.get("image") else "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        if not entry.get("image"):
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(entry["name"]))
         self.end_headers()
         self.wfile.write(data)
 
