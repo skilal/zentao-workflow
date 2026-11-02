@@ -129,6 +129,14 @@ class FileReadChecks(PerformanceFixture):
 
 
 class ContextDeliveryChecks(PerformanceFixture):
+    def test_archive_images_reach_model_and_share_existing_deduplication(self):
+        image = self.image("包内图片.png", b"archive image")
+        self.state["snapshot"]["materials"] = [{"file_id": 99, "archive_entries": [image]}]
+        inputs = self.start()
+        self.assertEqual([value["path"] for value in inputs if value["type"] == "localImage"], [image["path"]])
+        inputs = self.start()
+        self.assertFalse(any(value["type"] == "localImage" for value in inputs))
+
     def image(self, name, content):
         path = self.root / name
         path.write_bytes(content)

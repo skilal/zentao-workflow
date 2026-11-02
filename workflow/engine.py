@@ -707,6 +707,8 @@ class Workflow(CompileFlow, ProgressFlow):
         image_inputs = []
         if phase != "branch":
             images = [material for material in state["snapshot"]["materials"] if material.get("image")]
+            images += [entry for material in state["snapshot"]["materials"]
+                       for entry in material.get("archive_entries", []) if entry.get("image")]
             images += state.get("supplement_images", [])
             images += (state.get("followup") or {}).get("images", [])
             references = []

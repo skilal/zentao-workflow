@@ -107,6 +107,12 @@ class PreviewChecks(TestCase):
     def test_start_plan_transfers_all_inputs_and_deduplicates_different_requests(self):
         runtime = self.collect(items=self.items)
         preview_id = runtime.engine.state["id"]
+        archive_image = runtime.engine.store.directory(preview_id) / "attachments" / "99.zip.contents" / "0.png"
+        archive_image.parent.mkdir()
+        archive_image.write_bytes(PNG)
+        runtime.engine.state["snapshot"]["materials"][0]["archive_entries"] = [
+            {"title": "包内截图.png", "path": str(archive_image), "image": True},
+            {"title": "加密.txt", "issue": "文件已加密"}]
         self.application.upload_supplement_image(None, runtime.revision, "截图.png", PNG, preview_id)
         request = self.plan_request(runtime)
         preview_root = runtime.engine.store.root
@@ -125,6 +131,9 @@ class PreviewChecks(TestCase):
         self.assertEqual(state["supplement"], "补充验收要求")
         self.assertIn("created_at", state)
         directory = self.application.sessions.store.directory(state["id"])
+        transferred = state["snapshot"]["materials"][0]["archive_entries"][0]
+        self.assertTrue(Path(transferred["path"]).is_relative_to(directory))
+        self.assertEqual(Path(transferred["path"]).read_bytes(), PNG)
         for entry in [*state["snapshot"]["materials"], *state["supplement_images"]]:
             self.assertTrue(Path(entry["path"]).is_relative_to(directory))
             self.assertEqual(Path(entry["path"]).read_bytes(), PNG)
@@ -227,6 +236,14 @@ class PreviewChecks(TestCase):
         other = self.collect(items=[self.items[1]])
         self.assertEqual(request("GET", url.replace(preview_id, other.engine.state["id"]))[0], 400)
         self.assertEqual(request("GET", f"/api/material?preview_id={preview_id}&file_id=42"), (200, PNG))
+        material = runtime.engine.state["snapshot"]["materials"][0]
+        material["archive_entries"] = [{"title": "包内图片.png", "path": material["path"], "image": True},
+                                       {"title": "加密.txt", "issue": "文件已加密"}]
+        entry_url = f"/api/material?preview_id={preview_id}&file_id=42&entry=0"
+        self.assertEqual(request("GET", entry_url), (200, PNG))
+        for index in (-1, 1, 2):
+            self.assertEqual(request("GET", entry_url[:-1] + str(index))[0], 400)
+        self.assertEqual(request("GET", entry_url.replace(preview_id, other.engine.state["id"]))[0], 400)
         self.assertEqual(request("GET", f"/api/session?id={preview_id}")[0], 400)
         self.assertEqual(request("GET", f"/api/preview?id={preview_id}")[0], 200)
         self.assert_no_sessions()

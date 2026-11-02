@@ -491,7 +491,9 @@ class WebApplication:
         try:
             if (previous / "attachments").exists():
                 copytree(previous / "attachments", directory / "attachments")
-            for entry in [*state["snapshot"]["materials"], *state["supplement_images"]]:
+            materials = state["snapshot"]["materials"]
+            archive_files = [entry for material in materials for entry in material.get("archive_entries", []) if entry.get("path")]
+            for entry in [*materials, *archive_files, *state["supplement_images"]]:
                 entry["path"] = str(directory / Path(entry["path"]).relative_to(previous))
             if state["item"] is None:
                 state["conversation_title"] = " ".join(supplement.split())[:50] or "图片需求"
@@ -997,6 +999,12 @@ class WebHandler(BaseHTTPRequestHandler):
         material = next((item for item in state.get("snapshot", {}).get("materials", []) if item["file_id"] == file_id), None)
         if not material:
             raise WorkflowError("附件不在该工作项的资料清单中。")
+        if "entry" in query:
+            index = int(query["entry"][0])
+            entries = material.get("archive_entries", [])
+            if index < 0 or index >= len(entries) or not entries[index].get("path"):
+                raise WorkflowError("ZIP 内文件当前不可读取。")
+            material = entries[index]
         path = Path(material["path"]).resolve()
         allowed = (runtime.engine.store.directory(state["id"]) / "attachments").resolve()
         if not path.is_relative_to(allowed) or not path.is_file():
@@ -1009,7 +1017,10 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
         if not preview:
-            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(str(material["title"]) + path.suffix))
+            title = str(material["title"])
+            if not title.lower().endswith(path.suffix.lower()):
+                title += path.suffix
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(title))
         self.end_headers()
         self.wfile.write(data)
 

@@ -361,10 +361,64 @@ class ZentaoClient:
             material["image"] = True
             return material
         try:
-            material["text"] = extract_text(path)
-        except (ValueError, OSError, KeyError, BadZipFile, ParseError):
-            material["issue"] = f"附件 {title} 无法完整提取，请人工补充必要内容。"
+            if extension == "zip":
+                read_zip(material)
+            else:
+                material["text"] = extract_text(path)
+        except (ValueError, OSError, KeyError, BadZipFile, ParseError) as error:
+            reason = "压缩包已损坏或不是有效的 ZIP 文件" if isinstance(error, BadZipFile) else str(error)
+            material["issue"] = (f"ZIP 附件 {title} 无法读取：{reason}。请人工补充必要内容。" if extension == "zip" else
+                                 f"附件 {title} 无法完整提取，请人工补充必要内容。")
         return material
+
+
+def read_zip(material):
+    path = Path(material["path"])
+    entries = []
+    material["archive_entries"] = entries
+    text_length = 0
+    with ZipFile(path) as archive:
+        members = [entry for entry in archive.infolist() if not entry.is_dir()]
+        if not members or len(members) > 200 or sum(entry.file_size for entry in members) > 16 * 1024 * 1024:
+            raise ValueError("包内文件为空、超过 200 个或解压后总大小超过 16 MB")
+        for index, member in enumerate(members):
+            # 未标记 UTF-8 的中文禅道附件使用 GBK 文件名；不尝试其他编码。
+            name = member.filename if member.flag_bits & 0x800 else member.filename.encode("cp437").decode("gbk")
+            extension = Path(name.replace("\\", "/")).suffix.lower().lstrip(".")
+            entry = {"title": name, "extension": extension, "size": member.file_size, "text": "", "issue": ""}
+            entries.append(entry)
+            if member.flag_bits & 1:
+                entry["issue"] = "文件已加密，需人工提供未加密内容"
+                continue
+            # 使用控制器生成的文件名，绝不按包内路径写入磁盘。
+            target = path.parent / (path.name + ".contents") / f"{index}.{sub(r'[^a-z0-9]', '', extension)[:12] or 'bin'}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                data = archive.read(member)
+            except (BadZipFile, RuntimeError) as error:
+                entry["issue"] = ("文件读取失败：数据损坏或校验失败" if isinstance(error, BadZipFile) else
+                                  "文件读取失败：压缩方式不支持或无法解压")
+                continue
+            target.write_bytes(data)
+            entry["path"] = str(target)
+            if extension in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+                entry["image"] = True
+                continue
+            if extension == "zip":
+                entry["issue"] = "嵌套 ZIP 未展开，需人工提供必要内容"
+                continue
+            try:
+                text = extract_text(target)
+                if text_length + len(text) > 250000:
+                    raise ValueError("ZIP 文本总量超过 250000 字符")
+                entry["text"] = text
+                text_length += len(text)
+            except (ValueError, OSError, KeyError, BadZipFile, ParseError) as error:
+                entry["issue"] = f"内容未完整读取：{error}"
+    material["text"] = "ZIP 文件清单：\n" + "\n".join(entry["title"] for entry in entries)
+    issues = [f"{entry['title']}：{entry['issue']}" for entry in entries if entry["issue"]]
+    if issues:
+        material["issue"] = f"ZIP 附件 {material['title']} 中部分文件需人工补充；已读取的内容仍可使用：\n" + "\n".join(issues)
 
 
 def extract_text(path):
@@ -377,7 +431,7 @@ def extract_text(path):
     patterns = {".docx": ("word/document.xml",), ".xlsx": ("xl/sharedStrings.xml", "xl/worksheets/"),
                 ".pptx": ("ppt/slides/slide",)}
     if extension not in patterns:
-        raise ValueError("未支持的格式；不自动替换解析器")
+        raise ValueError(f"暂不支持读取 {extension or '无扩展名'} 文件内容")
     parts = []
     with ZipFile(path) as archive:
         selected = [name for name in archive.namelist() if name.endswith(".xml") and

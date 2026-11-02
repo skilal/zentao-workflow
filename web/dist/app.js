@@ -746,9 +746,17 @@ function WorkflowApp() {
               h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")),
               h("div", { className: "attachment-grid" }, snapshot.materials.filter(material => source.material_ids.includes(material.file_id)).map(material => {
               const url = `/api/material?${new URLSearchParams({ ...(model.preview ? { preview_id: state.id } : { session: state.id }), file_id: material.file_id })}`;
+               const fileName = material.title.toLowerCase().endsWith(`.${material.extension}`) ? material.title : `${material.title}.${material.extension}`;
               return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),
-                h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, `${material.title}.${material.extension}`)),
-                material.issue && h(Typography.Text, { type: "warning" }, material.issue));
+                h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, fileName)),
+                material.issue && h(Typography.Text, { type: "warning" }, material.issue),
+                material.archive_entries?.map((entry, index) => {
+                  const entryUrl = `${url}&entry=${index}`;
+                  return h("div", { className: "attachment", key: index },
+                    entry.image && h(Image, { src: entryUrl, alt: entry.title, preview: { mask: "查看图片" } }),
+                    h("div", { className: "attachment-name" }, entry.path ? h("a", { href: entryUrl }, entry.title) : entry.title),
+                    entry.issue && h(Typography.Text, { type: "warning" }, entry.issue));
+                }));
             })))),
             snapshot.feishu_links?.length > 0 && h(Alert, { type: "info", showIcon: true, message: "飞书文档暂未接入", style: { marginTop: 18 },
               description: h("div", null, h("p", null, "如果文档中有必要业务规则，请在计划前补充相关内容。"), snapshot.feishu_links.map(url => h("div", { key: url }, h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, url)))) }))),
