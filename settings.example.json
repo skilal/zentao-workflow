@@ -25,6 +25,9 @@
   "compile_check": {
     "enabled": false
   },
+  "pdf": {
+    "renderer": "pdftoppm"
+  },
   "feishu_enabled": false,
   "web": {
     "host": "127.0.0.1",

@@ -1,6 +1,7 @@
 """用隔离目录和模拟渲染器检查 PDF 页图及 Codex 输入，不访问业务服务。"""
 
 from pathlib import Path
+from json import dumps, loads
 from subprocess import CompletedProcess, TimeoutExpired
 from tempfile import TemporaryDirectory
 from unittest import TestCase
@@ -10,6 +11,7 @@ from test_supplement_images import SupplementImageFixture, PNG
 from test_zip_materials import zip_bytes
 from workflow.pdf_materials import read_pdf
 from workflow.zentao import ZentaoClient
+from workflow.settings import ROOT, WorkflowError, load_settings
 
 
 class PdfRendererChecks(TestCase):
@@ -51,6 +53,14 @@ class PdfRendererChecks(TestCase):
                 read_pdf(self.material)
         self.assertNotIn("pdf_pages", self.material)
 
+    def test_explicit_tool_path_is_the_only_resolution_attempt(self):
+        command = str(self.directory / "Poppler 工具" / "pdftoppm.exe")
+        with patch("workflow.pdf_materials.which", return_value=None) as resolve, patch("workflow.pdf_materials.run") as render:
+            with self.assertRaisesRegex(ValueError, "pdf.renderer"):
+                read_pdf(self.material, command)
+        resolve.assert_called_once_with(command)
+        render.assert_not_called()
+
 
 class PdfMaterialChecks(SupplementImageFixture):
     def render(self, command, **options):
@@ -58,12 +68,16 @@ class PdfMaterialChecks(SupplementImageFixture):
         return CompletedProcess(command, 0)
 
     def test_direct_and_zip_pdf_retain_page_images_and_no_blocker(self):
+        command = str(self.root / "Poppler 工具" / "pdftoppm.exe")
+        self.settings["pdf"] = {"renderer": command}
         client = ZentaoClient(self.settings)
         documents = (("pdf", b"%PDF-scan"), ("zip", zip_bytes([("扫描件.pdf", b"%PDF-scan"), ("元数据.xml", "有效字段")])))
         for extension, data in documents:
             with self.subTest(extension=extension), patch.object(client, "_fetch", return_value=(data, "application/octet-stream")), \
-                    patch("workflow.pdf_materials.which", return_value="pdftoppm.exe"), patch("workflow.pdf_materials.run", side_effect=self.render):
+                    patch("workflow.pdf_materials.which", return_value=command) as resolve, patch("workflow.pdf_materials.run", side_effect=self.render) as render:
                 material = client._download(99, extension, "示例资料", self.root)
+            resolve.assert_called_once_with(command)
+            self.assertEqual(render.call_args.args[0][0], command)
             pdf = material if extension == "pdf" else material["archive_entries"][0]
             self.assertEqual(material["issue"], "")
             self.assertEqual(pdf["issue"], "")
@@ -99,3 +113,31 @@ class PdfMaterialChecks(SupplementImageFixture):
             material = client._download(99, "pdf", "扫描件", self.root)
         self.assertIn("pdftoppm", material["issue"])
         self.assertNotIn("pdf_pages", material)
+
+
+class PdfConfigurationChecks(TestCase):
+    def setUp(self):
+        temporary = TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+
+    def load(self):
+        (self.root / "settings.json").write_text(dumps(self.settings), encoding="utf-8")
+        with patch("workflow.settings.ROOT", self.root):
+            return load_settings()
+
+    def test_legacy_settings_keep_the_default_command(self):
+        self.settings.pop("pdf")
+        self.assertEqual(self.load()["pdf"], {"renderer": "pdftoppm"})
+
+    def test_absolute_renderer_path_is_preserved(self):
+        command = str(self.root / "Poppler 工具" / "pdftoppm.exe")
+        self.settings["pdf"] = {"renderer": command}
+        self.assertEqual(self.load()["pdf"]["renderer"], command)
+
+    def test_invalid_explicit_configuration_is_rejected(self):
+        for value in (None, [], {}, {"renderer": ""}, {"renderer": " "}, {"renderer": 1}):
+            self.settings["pdf"] = value
+            with self.subTest(configuration=value), self.assertRaisesRegex(WorkflowError, "pdf.renderer"):
+                self.load()

@@ -6,10 +6,10 @@ from subprocess import CREATE_NO_WINDOW, DEVNULL, PIPE, TimeoutExpired, run
 from tempfile import mkdtemp
 
 
-def read_pdf(material):
-    renderer = which("pdftoppm")
+def read_pdf(material, renderer_command="pdftoppm"):
+    renderer = which(renderer_command)
     if renderer is None:
-        raise ValueError("读取 PDF 需要 Poppler 的 pdftoppm，请将其加入 PATH 后重启工作流")
+        raise ValueError("找不到 PDF 渲染工具，请在 settings.json 的 pdf.renderer 配置 pdftoppm.exe 的完整路径")
     path = Path(material["path"])
     directory = Path(mkdtemp(prefix=path.name + ".pages-", dir=path.parent))
     try:

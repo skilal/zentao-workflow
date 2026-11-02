@@ -25,6 +25,10 @@ def load_settings():
     if not isinstance(compile_check, dict) or type(compile_check.get("enabled")) is not bool:
         raise WorkflowError("compile_check.enabled 必须是布尔值。")
     settings["compile_check"] = compile_check
+    pdf = settings.get("pdf", {"renderer": "pdftoppm"})
+    if not isinstance(pdf, dict) or not isinstance(pdf.get("renderer"), str) or not pdf["renderer"].strip():
+        raise WorkflowError("pdf.renderer 必须是明确的 pdftoppm 命令名或可执行文件完整路径。")
+    settings["pdf"] = pdf
     return settings
 
 

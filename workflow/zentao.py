@@ -114,6 +114,7 @@ def project_context(*records):
 class ZentaoClient:
     def __init__(self, settings):
         self.settings = settings["zentao"]
+        self.pdf_renderer = settings.get("pdf", {"renderer": "pdftoppm"})["renderer"]
         self.base = self.settings["base_url"].rstrip("/") + "/"
         self.opener = build_opener(NoRedirect(), HTTPCookieProcessor(CookieJar()))
         self.token = None
@@ -363,9 +364,9 @@ class ZentaoClient:
             return material
         try:
             if extension == "zip":
-                read_zip(material)
+                read_zip(material, self.pdf_renderer)
             elif extension == "pdf":
-                read_pdf(material)
+                read_pdf(material, self.pdf_renderer)
             else:
                 material["text"] = extract_text(path)
         except (ValueError, OSError, KeyError, BadZipFile, ParseError) as error:
@@ -375,7 +376,7 @@ class ZentaoClient:
         return material
 
 
-def read_zip(material):
+def read_zip(material, pdf_renderer="pdftoppm"):
     path = Path(material["path"])
     entries = []
     material["archive_entries"] = entries
@@ -414,7 +415,7 @@ def read_zip(material):
                 continue
             try:
                 if extension == "pdf":
-                    read_pdf(entry)
+                    read_pdf(entry, pdf_renderer)
                     text = entry["text"]
                 else:
                     text = extract_text(target)
