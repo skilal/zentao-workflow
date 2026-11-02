@@ -225,10 +225,16 @@ def confirm_checkout(repository, store, state):
     request = state["checkout_request"]
     if request["status"] not in {"stashed", "switched", "restore_failed", "switch_failed"}:
         raise WorkflowError("当前没有需要手工确认的智能切换。")
-    if (git(repository, "branch", "--show-current") != request["selection"]["branch"]
-            or git(repository, "rev-parse", "HEAD") != request["baseline"]
-            or git(repository, "ls-files", "--unmerged", "-z", binary=True)):
-        raise WorkflowError("请先切换到目标分支并解决合并冲突，再确认改动已恢复。")
+    branch = git(repository, "branch", "--show-current")
+    if branch != request["selection"]["branch"]:
+        raise WorkflowError(f"当前分支为 {branch or '分离 HEAD'}，目标分支为 {request['selection']['branch']}。"
+                            "请先切换到目标分支，再确认改动已恢复。")
+    if git(repository, "ls-files", "--unmerged", "-z", binary=True):
+        raise WorkflowError("仓库仍有未解决的合并冲突，请先解决合并冲突，再确认改动已恢复。")
+    head = git(repository, "rev-parse", "HEAD")
+    if head != request["baseline"]:
+        raise WorkflowError(f"目标分支提交已变化：原基准 {request['baseline'][:12]}，当前提交 {head[:12]}。"
+                            "当前会话尚未确认新基准，请先核对提交变化。")
     request["status"] = "restored"
     store.save(state)
 

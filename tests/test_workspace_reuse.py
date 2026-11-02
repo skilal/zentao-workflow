@@ -272,6 +272,28 @@ class WorkspaceReuseChecks(TestCase):
         self.assertFalse(git(self.source, "stash", "list"))
         self.assertEqual(git(self.source, "branch", "--show-current"), "主分支")
 
+    def test_checkout_confirmation_distinguishes_branch_conflict_and_changed_baseline(self):
+        local, _ = self.checkout_request(overlap=True)
+        request = self.state["checkout_request"]
+        request["status"] = "switch_failed"
+        with self.assertRaisesRegex(WorkflowError, "当前分支为 主分支，目标分支为 项目分支"):
+            confirm_checkout(self.source, self.store, self.state)
+        request["status"] = "waiting"
+        with self.assertRaisesRegex(WorkflowError, "备份保留"):
+            carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        with self.assertRaisesRegex(WorkflowError, "仓库仍有未解决的合并冲突"):
+            confirm_checkout(self.source, self.store, self.state)
+        (self.source / "本机配置.txt").write_text(local, encoding="utf-8")
+        git(self.source, "add", "本机配置.txt")
+        (self.source / "任务.txt").write_text("目标分支新提交\n", encoding="utf-8")
+        git(self.source, "add", "任务.txt")
+        git(self.source, "commit", "--only", "-m", "目标分支更新", "--", "任务.txt")
+        baseline, head = request["baseline"], git(self.source, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(WorkflowError, f"原基准 {baseline[:12]}，当前提交 {head[:12]}"):
+            confirm_checkout(self.source, self.store, self.state)
+        self.assertEqual(request["baseline"], baseline)
+        self.assertEqual(request["status"], "restore_failed")
+
     def test_smart_checkout_does_not_shelve_unselected_blocking_changes(self):
         self.checkout_request()
         git(self.source, "switch", "--discard-changes", "项目分支")
