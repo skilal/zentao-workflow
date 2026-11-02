@@ -1,6 +1,9 @@
 """每个工作项的持久状态，原子写入且不保存登录 Token。"""
 
 from datetime import datetime, timezone
+from contextlib import contextmanager
+from ctypes import WinDLL, WinError, c_void_p, get_last_error
+from ctypes.wintypes import BOOL, DWORD, HANDLE, LPCWSTR
 from hashlib import sha256
 from json import dumps, loads
 from pathlib import Path
@@ -11,6 +14,33 @@ from threading import RLock
 from uuid import uuid4
 
 from workflow.settings import LOCAL, WorkflowError
+
+
+KERNEL32 = WinDLL("kernel32", use_last_error=True)
+KERNEL32.CreateMutexW.argtypes, KERNEL32.CreateMutexW.restype = (c_void_p, BOOL, LPCWSTR), HANDLE
+KERNEL32.WaitForSingleObject.argtypes, KERNEL32.WaitForSingleObject.restype = (HANDLE, DWORD), DWORD
+KERNEL32.ReleaseMutex.argtypes, KERNEL32.ReleaseMutex.restype = (HANDLE,), BOOL
+KERNEL32.CloseHandle.argtypes, KERNEL32.CloseHandle.restype = (HANDLE,), BOOL
+
+
+@contextmanager
+def session_lock(root):
+    name = "Local\\ZentaoWorkflowState-" + sha256(str(root.resolve()).casefold().encode("utf-8")).hexdigest()
+    handle = KERNEL32.CreateMutexW(None, False, name)
+    if not handle:
+        raise WinError(get_last_error())
+    try:
+        result = KERNEL32.WaitForSingleObject(handle, 10000)
+        if result == 0x102:
+            raise WorkflowError("等待会话状态读写锁超时，已停止本次操作，请检查其他工作流进程是否仍在占用。")
+        if result not in (0, 0x80):
+            raise WinError(get_last_error())
+        try:
+            yield
+        finally:
+            KERNEL32.ReleaseMutex(handle)
+    finally:
+        KERNEL32.CloseHandle(handle)
 
 
 def timestamp():
@@ -93,7 +123,7 @@ class SessionStore:
         return path
 
     def save(self, state):
-        with self.lock:
+        with self.lock, session_lock(self.root):
             state["updated_at"] = timestamp()
             directory = self.directory(state["id"])
             directory.mkdir(parents=True, exist_ok=True)
@@ -103,16 +133,16 @@ class SessionStore:
             temporary.replace(path)
 
     def load(self, session_id):
-        with self.lock:
+        with self.lock, session_lock(self.root):
             return loads((self.directory(session_id) / "state.json").read_text(encoding="utf-8"))
 
     def sessions(self):
-        with self.lock:
+        with self.lock, session_lock(self.root):
             paths = sorted(self.root.glob("*/state.json"), key=lambda path: path.stat().st_mtime, reverse=True)
             return [self.load(path.parent.name) for path in paths]
 
     def remove(self, session_id):
-        with self.lock:
+        with self.lock, session_lock(self.root):
             directory = self.directory(session_id)
             for current, directories, files in walk(directory, followlinks=False):
                 for name in directories + files:
@@ -122,7 +152,7 @@ class SessionStore:
             rmtree(directory)
 
     def append(self, state, role, text, **metadata):
-        with self.lock:
+        with self.lock, session_lock(self.root):
             state["history"].append({"time": timestamp(), "role": role, "text": text, "phase": state["phase"],
                                      "delivery_round": state.get("delivery_round", 1), **metadata})
             self.save(state)

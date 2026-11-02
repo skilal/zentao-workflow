@@ -141,7 +141,9 @@ class AppServer:
                         waiter = self.waiters.get(message.get("id"))
                     if waiter:
                         waiter.put(message)
-        except (OSError, ValueError, UnicodeError) as error:
+        except (OSError, WorkflowError) as error:
+            self.callback({"method": "client/error", "params": {"message": "Codex 通道读取或事件处理失败：" + str(error)}})
+        except (ValueError, UnicodeError) as error:
             self.callback({"method": "client/error", "params": {"message": "Codex 通道解析中断：" + str(error)}})
         finally:
             self.stderr_ready.wait(timeout=1)

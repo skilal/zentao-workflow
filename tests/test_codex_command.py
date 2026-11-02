@@ -48,3 +48,20 @@ class CodexCommandChecks(TestCase):
         with patch("workflow.rpc.which", return_value="C:/Codex/codex.exe"):
             command = self.connect()
         self.assertEqual(command.count("app-server"), 1)
+
+    def test_state_write_error_is_distinguished_from_malformed_channel_json(self):
+        for output, failure, expected in (
+            ('{"method":"item/started"}\n', PermissionError("state.json 替换被拒绝"), "事件处理失败"),
+            ('{"method":"item/started"}\n', WorkflowError("等待会话状态读写锁超时"), "事件处理失败"),
+            ('不是 JSON\n', None, "通道解析中断"),
+        ):
+            with self.subTest(expected=expected):
+                callback = Mock(side_effect=[failure, None] if failure else None)
+                rpc = AppServer(self.settings, callback)
+                rpc.process = Mock(stdout=iter([output]))
+                rpc.stderr_ready.set()
+                rpc.closing = True
+                rpc._read()
+                event = callback.call_args.args[0]
+                self.assertEqual(event["method"], "client/error")
+                self.assertIn(expected, event["params"]["message"])
