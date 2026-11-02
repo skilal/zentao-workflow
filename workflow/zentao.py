@@ -14,6 +14,7 @@ from xml.etree.ElementTree import ParseError, fromstring
 from zipfile import BadZipFile, ZipFile
 
 from workflow.settings import WorkflowError, load_password
+from workflow.pdf_materials import read_pdf
 
 
 KINDS = {"story": ("需求", "stories"), "task": ("任务", "tasks"), "bug": ("Bug", "bugs")}
@@ -363,11 +364,13 @@ class ZentaoClient:
         try:
             if extension == "zip":
                 read_zip(material)
+            elif extension == "pdf":
+                read_pdf(material)
             else:
                 material["text"] = extract_text(path)
         except (ValueError, OSError, KeyError, BadZipFile, ParseError) as error:
             reason = "压缩包已损坏或不是有效的 ZIP 文件" if isinstance(error, BadZipFile) else str(error)
-            material["issue"] = (f"ZIP 附件 {title} 无法读取：{reason}。请人工补充必要内容。" if extension == "zip" else
+            material["issue"] = (f"{extension.upper()} 附件 {title} 无法读取：{reason}。请人工补充必要内容。" if extension in {"zip", "pdf"} else
                                  f"附件 {title} 无法完整提取，请人工补充必要内容。")
         return material
 
@@ -410,7 +413,11 @@ def read_zip(material):
                 entry["issue"] = "嵌套 ZIP 未展开，需人工提供必要内容"
                 continue
             try:
-                text = extract_text(target)
+                if extension == "pdf":
+                    read_pdf(entry)
+                    text = entry["text"]
+                else:
+                    text = extract_text(target)
                 if text_length + len(text) > 250000:
                     raise ValueError("ZIP 文本总量超过 250000 字符")
                 entry["text"] = text

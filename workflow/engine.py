@@ -18,6 +18,7 @@ from workflow.delivery import validate_review_request
 from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
+from workflow.pdf_materials import material_files
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.store import SessionStore, followup_available, session_title, timestamp
@@ -708,9 +709,7 @@ class Workflow(CompileFlow, ProgressFlow):
         image_hashes = set(previous_input.get("images", []))
         image_inputs = []
         if phase != "branch":
-            images = [material for material in state["snapshot"]["materials"] if material.get("image")]
-            images += [entry for material in state["snapshot"]["materials"]
-                       for entry in material.get("archive_entries", []) if entry.get("image")]
+            images = [entry for entry in material_files(state["snapshot"]["materials"]) if entry.get("image")]
             images += state.get("supplement_images", [])
             images += (state.get("followup") or {}).get("images", [])
             images += [entry for entry in submitted_attachments(state) if entry.get("image")]

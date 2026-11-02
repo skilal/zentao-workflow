@@ -107,12 +107,13 @@ class ZipMaterialChecks(TestCase):
     def test_partial_failure_keeps_xml_and_original_binary_files(self):
         data = zip_bytes([("元数据.xml", "有效字段"), ("原文.pdf", b"%PDF-1.4"),
                           ("说明.txt", b"\xff"), ("嵌套.zip", zip_bytes([("a.txt", "a")]))])
-        material = self.download(data)
+        with patch("workflow.zentao.read_pdf", side_effect=ValueError("PDF 无法转换为页图")):
+            material = self.download(data)
         xml, pdf, text, nested = material["archive_entries"]
         self.assertEqual(xml["text"], "有效字段")
         self.assertEqual(xml["issue"], "")
         self.assertIn("原文.pdf", material["issue"])
-        self.assertIn("暂不支持读取 .pdf", pdf["issue"])
+        self.assertIn("PDF 无法转换为页图", pdf["issue"])
         self.assertEqual(Path(pdf["path"]).read_bytes(), b"%PDF-1.4")
         self.assertTrue(text["issue"])
         self.assertIn("嵌套 ZIP", nested["issue"])

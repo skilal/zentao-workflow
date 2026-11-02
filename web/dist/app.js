@@ -799,12 +799,13 @@ function WorkflowApp() {
               return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),
                 h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, fileName)),
                 material.issue && h(Typography.Text, { type: "warning" }, material.issue),
+                renderPdfPages(material, url),
                 material.archive_entries?.map((entry, index) => {
                   const entryUrl = `${url}&entry=${index}`;
                   return h("div", { className: "attachment", key: index },
                     entry.image && h(Image, { src: entryUrl, alt: entry.title, preview: { mask: "查看图片" } }),
                     h("div", { className: "attachment-name" }, entry.path ? h("a", { href: entryUrl }, entry.title) : entry.title),
-                    entry.issue && h(Typography.Text, { type: "warning" }, entry.issue));
+                    entry.issue && h(Typography.Text, { type: "warning" }, entry.issue), renderPdfPages(entry, entryUrl));
                 }));
             })))),
             snapshot.feishu_links?.length > 0 && h(Alert, { type: "info", showIcon: true, message: "飞书文档暂未接入", style: { marginTop: 18 },
@@ -993,6 +994,12 @@ function WorkflowApp() {
       h("div", { className: "attachment-name" }, image.name),
       editable && h("div", { className: "supplement-image-actions" }, h(Button, { size: "small", type: "text", danger: true,
         onClick: () => removeImage(image, "followup") }, "移除")))));
+  }
+
+  function renderPdfPages(material, url) {
+    return material.pdf_pages?.map((page, index) => h("div", { className: "attachment", key: index },
+      h(Image, { src: `${url}&page=${index}`, alt: page.title, preview: { mask: "查看 PDF 页面" } }),
+      h("div", { className: "attachment-name" }, `第 ${page.page} 页 · 已准备供 Codex 读取`)));
   }
 
   function renderAnswerFiles(entries, editable = false, showQuestion = false) {

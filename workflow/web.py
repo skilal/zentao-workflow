@@ -28,6 +28,7 @@ from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
 from workflow.zentao import KINDS, ZentaoClient, identifier
 from workflow.user_input import pending_input
+from workflow.pdf_materials import material_files
 from workflow.answer_attachments import answer_request_id, attachment_file, prepare_answer
 
 
@@ -551,8 +552,7 @@ class WebApplication:
             if (previous / "attachments").exists():
                 copytree(previous / "attachments", directory / "attachments")
             materials = state["snapshot"]["materials"]
-            archive_files = [entry for material in materials for entry in material.get("archive_entries", []) if entry.get("path")]
-            for entry in [*materials, *archive_files, *state["supplement_images"]]:
+            for entry in [*material_files(materials), *state["supplement_images"]]:
                 entry["path"] = str(directory / Path(entry["path"]).relative_to(previous))
             if state["item"] is None:
                 state["conversation_title"] = " ".join(supplement.split())[:50] or "图片需求"
@@ -1072,6 +1072,12 @@ class WebHandler(BaseHTTPRequestHandler):
             if index < 0 or index >= len(entries) or not entries[index].get("path"):
                 raise WorkflowError("ZIP 内文件当前不可读取。")
             material = entries[index]
+        if "page" in query:
+            index = int(query["page"][0])
+            pages = material.get("pdf_pages", [])
+            if index < 0 or index >= len(pages):
+                raise WorkflowError("PDF 页码不在当前附件的页面清单中。")
+            material = pages[index]
         path = Path(material["path"]).resolve()
         allowed = (runtime.engine.store.directory(state["id"]) / "attachments").resolve()
         if not path.is_relative_to(allowed) or not path.is_file():

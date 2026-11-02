@@ -156,6 +156,28 @@ class PreviewChecks(TestCase):
         runtime.uploads = 0
         self.assert_no_sessions()
 
+    def test_pdf_pages_follow_preview_promotion(self):
+        runtime = self.collect()
+        material = runtime.engine.state["snapshot"]["materials"][0]
+        directory = Path(material["path"]).parent
+        direct_page, archive_page = directory / "direct-page.png", directory / "archive-page.png"
+        for path in (direct_page, archive_page):
+            path.write_bytes(PNG)
+        pdf = directory / "scan.pdf"
+        pdf.write_bytes(b"%PDF-reference")
+        material["pdf_pages"] = [{"path": str(direct_page), "page": 1, "image": True, "title": "直接 PDF"}]
+        material["archive_entries"] = [{"title": "包内 PDF", "path": str(pdf),
+            "pdf_pages": [{"path": str(archive_page), "page": 1, "image": True, "title": "包内 PDF"}]}]
+        with patch("workflow.engine.Workflow.start_plan"):
+            result = self.application.dispatch(self.plan_request(runtime))
+            created = self.application.sessions.get(result["session_id"])
+            self.drain(created)
+        material = created.engine.state["snapshot"]["materials"][0]
+        target = self.application.sessions.store.directory(created.engine.state["id"])
+        for page in [*material["pdf_pages"], *material["archive_entries"][0]["pdf_pages"]]:
+            self.assertTrue(Path(page["path"]).is_relative_to(target))
+            self.assertEqual(Path(page["path"]).read_bytes(), PNG)
+
     def test_collecting_blocks_plan_creation(self):
         entered, release = Event(), Event()
         def fetch(*_):
@@ -244,6 +266,12 @@ class PreviewChecks(TestCase):
         for index in (-1, 1, 2):
             self.assertEqual(request("GET", entry_url[:-1] + str(index))[0], 400)
         self.assertEqual(request("GET", entry_url.replace(preview_id, other.engine.state["id"]))[0], 400)
+        material["pdf_pages"] = [{"page": 1, "path": material["path"], "image": True}]
+        material["archive_entries"][0]["pdf_pages"] = [{"page": 1, "path": material["path"], "image": True}]
+        self.assertEqual(request("GET", f"/api/material?preview_id={preview_id}&file_id=42&page=0"), (200, PNG))
+        self.assertEqual(request("GET", entry_url + "&page=0"), (200, PNG))
+        for index in (-1, 1):
+            self.assertEqual(request("GET", entry_url + f"&page={index}")[0], 400)
         self.assertEqual(request("GET", f"/api/session?id={preview_id}")[0], 400)
         self.assertEqual(request("GET", f"/api/preview?id={preview_id}")[0], 200)
         self.assert_no_sessions()
