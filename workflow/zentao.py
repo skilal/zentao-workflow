@@ -382,8 +382,10 @@ def read_zip(material):
         if not members or len(members) > 200 or sum(entry.file_size for entry in members) > 16 * 1024 * 1024:
             raise ValueError("包内文件为空、超过 200 个或解压后总大小超过 16 MB")
         for index, member in enumerate(members):
-            # 未标记 UTF-8 的中文禅道附件使用 GBK 文件名；不尝试其他编码。
-            name = member.filename if member.flag_bits & 0x800 else member.filename.encode("cp437").decode("gbk")
+            # 保留标准库按 Unicode 扩展还原的名称；尚未还原的传统中文文件名按 GBK 解码。
+            name = member.filename
+            if not (member.flag_bits & 0x800) and name == member.orig_filename:
+                name = member.orig_filename.encode("cp437").decode("gbk")
             extension = Path(name.replace("\\", "/")).suffix.lower().lstrip(".")
             entry = {"title": name, "extension": extension, "size": member.file_size, "text": "", "issue": ""}
             entries.append(entry)

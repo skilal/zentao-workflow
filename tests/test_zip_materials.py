@@ -3,10 +3,12 @@
 from io import BytesIO
 from json import loads
 from pathlib import Path
+from struct import pack
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+from zlib import crc32
 
 from workflow.context import requirement_context
 from workflow.zentao import ZentaoClient
@@ -65,6 +67,39 @@ class ZipMaterialChecks(TestCase):
         placeholder = b"a" * (len(encoded) - 4) + b".xml"
         data = zip_bytes([(placeholder.decode(), "归档元数据")]).replace(placeholder, encoded)
         material = self.download(data)
+        self.assertEqual(material["issue"], "")
+        self.assertEqual(material["archive_entries"][0]["title"], name)
+        self.assertEqual(material["archive_entries"][0]["text"], "归档元数据")
+
+    def test_preserves_unicode_path_extra_without_utf8_flag(self):
+        name = "元数据描述信息.xml"
+        encoded = name.encode("gbk")
+        placeholder = b"a" * (len(encoded) - 4) + b".xml"
+        info = ZipInfo(placeholder.decode())
+        unicode_path = pack("<BL", 1, crc32(encoded)) + name.encode("utf-8")
+        info.extra = pack("<HH", 0x7075, len(unicode_path)) + unicode_path
+        stream = BytesIO()
+        with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
+            archive.writestr(info, "归档元数据")
+        data = stream.getvalue().replace(placeholder, encoded)
+        material = self.download(data)
+        self.assertEqual(material["issue"], "")
+        self.assertEqual(material["archive_entries"][0]["title"], name)
+        self.assertEqual(material["archive_entries"][0]["text"], "归档元数据")
+
+    def test_does_not_reencode_a_name_already_restored_by_zipfile(self):
+        name = "00测试目录1/元数据.xml"
+        encoded = name.encode("gbk")
+        placeholder = b"a" * (len(encoded) - 4) + b".xml"
+        data = zip_bytes([(placeholder.decode(), "归档元数据")]).replace(placeholder, encoded)
+        with ZipFile(BytesIO(data)) as archive:
+            member = archive.infolist()[0]
+            self.assertFalse(member.flag_bits & 0x800)
+            self.assertNotEqual(member.orig_filename, name)
+            # 重现 Python 3.13 按 Unicode 扩展还原 filename、保留 orig_filename 的状态。
+            member.filename = name
+            with patch("workflow.zentao.ZipFile", return_value=archive):
+                material = self.download(data)
         self.assertEqual(material["issue"], "")
         self.assertEqual(material["archive_entries"][0]["title"], name)
         self.assertEqual(material["archive_entries"][0]["text"], "归档元数据")
