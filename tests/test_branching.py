@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from workflow.branching import BRANCH_SCHEMA, configured_repositories, saved_branches
 from workflow.engine import PHASE_STAGE, Workflow
-from workflow.gitops import branch_catalog, git, prepare, refresh_branches
+from workflow.gitops import branch_catalog, fetch_branch, git, prepare, refresh_branches
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError
 from workflow.zentao import ZentaoClient, project_context
@@ -69,10 +69,12 @@ class BranchWorkflowChecks(TestCase):
             "frontend": [{"name": "示例档案馆/develop", "local": True, "remote": True, "commit": "a" * 40, "date": "2026-01-01", "subject": "示例前端修改"}],
             "backend": [{"name": "feature/示例", "local": True, "remote": True, "commit": "b" * 40, "date": "2026-01-01", "subject": "示例后端修改"}],
         }
+        self.fetched = []
         for target, replacement in (
             ("workflow.store.LOCAL", self.root),
             ("workflow.engine.branch_catalog", lambda repository: deepcopy(self.catalogs[repository["role"]])),
             ("workflow.engine.refresh_branches", lambda repository: deepcopy(self.catalogs[repository["role"]])),
+            ("workflow.engine.fetch_branch", self.fetch_branch),
             ("workflow.engine.acquire_workspace", self.prepare),
             ("workflow.engine.save_settings", self.save_settings),
         ):
@@ -90,6 +92,10 @@ class BranchWorkflowChecks(TestCase):
         self.turns = Mock(side_effect=lambda *args: state.update(stage=PHASE_STAGE[state["phase"]]))
         self.flow._start_turn = self.turns
         self.prepared = []
+
+    def fetch_branch(self, repository, name):
+        self.fetched.append((repository["role"], name))
+        return deepcopy(next(entry for entry in self.catalogs[repository["role"]] if entry["name"] == name))
 
     def prepare(self, selection, path, store, state):
         self.prepared.append({"branch": selection["branch"], "create": selection["create"], "track": selection.get("track", False)})
@@ -112,6 +118,7 @@ class BranchWorkflowChecks(TestCase):
         self.assertEqual(self.flow.state["phase"], "plan")
         self.assertEqual(self.flow.state["supplement"], "补充规则")
         self.assertEqual(self.settings["project_branches"], {})
+        self.assertEqual(self.fetched, [])
 
     def test_saved_common_branches_skip_ai_and_are_site_scoped(self):
         site = self.settings["zentao"]["base_url"]
@@ -154,6 +161,75 @@ class BranchWorkflowChecks(TestCase):
             self.complete(decision("frontend", "示例档案馆/develop"))
             self.assertEqual(refresh.call_count, 1)
         self.assertTrue(self.prepared[0]["create"] and self.prepared[0]["track"])
+        self.assertEqual(self.fetched, [("frontend", "示例档案馆/develop")])
+
+    def test_new_online_branch_is_fetched_before_ai_rechecks_real_commit_metadata(self):
+        self.flow.start_plan("")
+        online = {"name": "新项目分支", "local": False, "remote": True, "commit": "c" * 40,
+                  "date": "", "subject": "", "metadata_available": False}
+        self.catalogs["frontend"] = [{**online, "date": "2026-11-02", "subject": "目标项目修改", "metadata_available": True}]
+        with patch("workflow.engine.refresh_branches", return_value=[deepcopy(online)]):
+            self.complete(decision("frontend", status="not_found"), decision("backend", "feature/示例"))
+        self.assertFalse(self.fetched)
+        self.complete(decision("frontend", "新项目分支"))
+        repository = self.flow.state["branch_resolution"]["repositories"][0]
+        self.assertEqual(self.fetched, [("frontend", "新项目分支")])
+        self.assertEqual(repository["status"], "pending")
+        self.assertEqual(repository["catalog"][0]["subject"], "目标项目修改")
+        self.assertEqual(self.prepared, [])
+        self.complete(decision("frontend", "新项目分支"))
+        self.assertEqual(len(self.fetched), 1)
+        self.assertEqual(self.prepared[0]["branch"], "新项目分支")
+
+    def test_manual_remote_choice_fetches_only_chosen_branch(self):
+        self.catalogs["frontend"][0]["local"] = False
+        self.flow.start_plan("", manual=True)
+        self.flow.choose_branches({"frontend": "示例档案馆/develop", "backend": "feature/示例"})
+        self.assertEqual(self.fetched, [("frontend", "示例档案馆/develop")])
+        self.assertEqual(len(self.prepared), 2)
+
+    def test_targeted_fetch_failure_stops_without_workspace_creation_or_automatic_retry(self):
+        self.catalogs["frontend"][0]["local"] = False
+        self.flow.start_plan("")
+        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop"),
+                                                         decision("backend", "feature/示例")]})
+        with patch("workflow.engine.fetch_branch", side_effect=WorkflowError("目标分支拉取失败")) as fetch:
+            self.flow.submit(self.flow._completed, {"status": "completed"},
+                             self.flow.state["id"], self.flow.connection_epoch).result()
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(self.prepared, [])
+        self.assertEqual(self.flow.state["stage"], "已停止")
+        self.assertEqual(self.flow.state["branch_resolution"]["repositories"][0]["fetch_state"], "failed")
+
+    def test_pause_during_targeted_fetch_keeps_result_but_does_not_prepare_workspaces(self):
+        self.catalogs["frontend"][0]["local"] = False
+        self.flow.start_plan("")
+
+        def fetch(repository, name):
+            self.flow.pause()
+            return self.fetch_branch(repository, name)
+
+        with patch("workflow.engine.fetch_branch", side_effect=fetch):
+            self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
+        self.assertEqual(self.flow.state["stage"], "已暂停")
+        self.assertEqual(self.prepared, [])
+        self.assertEqual(self.fetched, [("frontend", "示例档案馆/develop")])
+
+    def test_pause_after_saved_remote_branch_listing_does_not_start_fetch(self):
+        self.catalogs["frontend"][0]["local"] = False
+        site = self.settings["zentao"]["base_url"]
+        self.settings["project_branches"] = {site: {"41": {"branches": {
+            "frontend": "示例档案馆/develop", "backend": "feature/示例"}}}}
+
+        def refresh(repository):
+            self.flow.pause()
+            return deepcopy(self.catalogs[repository["role"]])
+
+        with patch("workflow.engine.refresh_branches", side_effect=refresh):
+            self.flow.start_plan("")
+        self.assertEqual(self.fetched, [])
+        self.assertEqual(self.prepared, [])
+        self.assertEqual(self.flow.state["stage"], "已暂停")
 
     def test_missing_common_branch_refreshes_and_requires_replacement(self):
         site = self.settings["zentao"]["base_url"]
@@ -386,6 +462,7 @@ class GitBranchChecks(TestCase):
         git(self.source, "update-ref", "-d", "refs/remotes/origin/项目/远程分支")
         catalog = refresh_branches(self.repository)
         self.assertTrue(any(entry["name"] == "项目/远程分支" and not entry["local"] for entry in catalog))
+        fetch_branch(self.repository, "项目/远程分支")
         result = prepare(self.source, self.root / "workspace", "项目/远程分支",
                          "refs/remotes/origin/项目/远程分支", True, True)
         self.assertEqual(git(result["path"], "rev-parse", "--abbrev-ref", "@{upstream}"), "origin/项目/远程分支")
@@ -410,6 +487,70 @@ class GitBranchChecks(TestCase):
         hook.write_text("不执行此钩子", encoding="utf-8")
         with self.assertRaisesRegex(WorkflowError, "Git 钩子"):
             refresh_branches(self.repository)
+        with self.assertRaisesRegex(WorkflowError, "Git 钩子"):
+            fetch_branch(self.repository, "项目/远程分支")
+
+    def remote_commit(self, branch, content):
+        blob = git(self.remote, "hash-object", "-w", "--stdin", input_data=content)
+        tree = git(self.remote, "mktree", input_data=f"100644 blob {blob}\t远程文件.txt\n".encode("utf-8"))
+        parent = git(self.source, "rev-parse", "HEAD")
+        commit_id = git(self.remote, "-c", "user.name=远程检查", "-c", "user.email=remote@example.invalid",
+                        "commit-tree", tree, "-p", parent, "-m", branch)
+        git(self.remote, "update-ref", "refs/heads/" + branch, commit_id)
+        return commit_id
+
+    def test_refresh_reads_online_names_and_hashes_without_fetching_objects_or_reusing_old_subjects(self):
+        old = git(self.source, "rev-parse", "refs/remotes/origin/项目/远程分支")
+        updated = self.remote_commit("项目/远程分支", b"changed target")
+        added = self.remote_commit("新项目分支", b"new project")
+        with patch("workflow.gitops.git", wraps=git) as command:
+            catalog = {entry["name"]: entry for entry in refresh_branches(self.repository)}
+        self.assertFalse(any("fetch" in call.args[1:] for call in command.call_args_list))
+        self.assertEqual(catalog["项目/远程分支"]["commit"], updated)
+        self.assertEqual(catalog["新项目分支"]["commit"], added)
+        for name in ("项目/远程分支", "新项目分支"):
+            self.assertFalse(catalog[name]["metadata_available"])
+            self.assertEqual((catalog[name]["date"], catalog[name]["subject"]), ("", ""))
+        self.assertEqual(git(self.source, "rev-parse", "refs/remotes/origin/项目/远程分支"), old)
+        self.assertFalse(git(self.source, "cat-file", "-t", updated, optional=True))
+        self.assertFalse(git(self.source, "cat-file", "-t", added, optional=True))
+
+    def test_targeted_fetch_does_not_download_other_projects_or_change_local_files(self):
+        updated = self.remote_commit("项目/远程分支", b"chosen project")
+        unrelated = self.remote_commit("其他客户分支", b"unrelated project")
+        head = git(self.source, "rev-parse", "HEAD")
+        (self.source / "说明.txt").write_text("本机未提交改动", encoding="utf-8")
+        with patch("workflow.gitops.git", wraps=git) as command:
+            entry = fetch_branch(self.repository, "项目/远程分支")
+        calls = [call.args[1:] for call in command.call_args_list if call.args[1:2] == ("fetch",)]
+        self.assertEqual(calls, [("fetch", "--no-tags", "--", "origin",
+                                "+refs/heads/项目/远程分支:refs/remotes/origin/项目/远程分支")])
+        self.assertEqual(entry["commit"], updated)
+        self.assertEqual(entry["remote_commit"], updated)
+        self.assertTrue(entry["metadata_available"])
+        self.assertEqual(entry["subject"], "项目/远程分支")
+        self.assertFalse(git(self.source, "cat-file", "-t", unrelated, optional=True))
+        self.assertEqual(git(self.source, "rev-parse", "HEAD"), head)
+        self.assertEqual((self.source / "说明.txt").read_text(encoding="utf-8"), "本机未提交改动")
+
+    def test_targeted_fetch_updates_remote_tracking_ref_without_moving_local_branch(self):
+        git(self.source, "branch", "项目/远程分支")
+        head = git(self.source, "rev-parse", "HEAD")
+        updated = self.remote_commit("项目/远程分支", b"new remote history")
+        entry = fetch_branch(self.repository, "项目/远程分支")
+        self.assertTrue(entry["local"])
+        self.assertEqual(entry["commit"], head)
+        self.assertEqual(entry["remote_commit"], updated)
+        self.assertEqual(git(self.source, "rev-parse", "refs/heads/项目/远程分支"), head)
+
+    def test_malformed_online_listing_stops_without_fetch(self):
+        def command(path, *args, **kwargs):
+            return "unexpected output" if args[0] == "ls-remote" else git(path, *args, **kwargs)
+
+        with patch("workflow.gitops.git", side_effect=command) as call:
+            with self.assertRaisesRegex(WorkflowError, "远程分支清单格式"):
+                refresh_branches(self.repository)
+        self.assertFalse(any("fetch" in entry.args[1:] for entry in call.call_args_list))
 
     def test_deleted_remote_branch_is_not_reused_from_stale_tracking_ref(self):
         commit_id = git(self.source, "rev-parse", "HEAD")
@@ -417,3 +558,7 @@ class GitBranchChecks(TestCase):
         git(self.source, "update-ref", "refs/remotes/origin/项目/远程分支", commit_id)
         self.assertTrue(any(entry["name"] == "项目/远程分支" for entry in branch_catalog(self.repository)))
         self.assertFalse(any(entry["name"] == "项目/远程分支" for entry in refresh_branches(self.repository)))
+        git(self.source, "branch", "项目/远程分支")
+        kept = next(entry for entry in refresh_branches(self.repository) if entry["name"] == "项目/远程分支")
+        self.assertTrue(kept["local"])
+        self.assertFalse(kept["remote"])

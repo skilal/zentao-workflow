@@ -14,7 +14,7 @@ from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import validate_review_request
-from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, git, manifest, refresh_branches, working_paths
+from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
 from workflow.rpc import AppServer, thread_parameters
@@ -39,7 +39,7 @@ FINDING_SCHEMA = {"type": "object", "properties": {
     }, "required": ["id", "evidence"], "additionalProperties": False}}
 }, "required": ["summary", "findings", "resolved_previous"], "additionalProperties": False}
 
-ACTIVE = {"识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"}
+ACTIVE = {"识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"}
 COMPLETE = {"已完成（静态审查）", "已完成（未审查）"}
 PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中", "compile_fix": "编译修复中"}
 
@@ -412,7 +412,31 @@ class Workflow(CompileFlow, ProgressFlow):
             entry = next((entry for entry in repository["catalog"] if entry["name"] == name), None)
         if entry is None:
             raise WorkflowError(f"分支 {name} 已不可用，请重新读取并选择。")
+        if not entry["local"] and not self._fetch_branch(repository, name):
+            return
         repository.update(status="resolved", branch=name, source=source, reason=reason, question="")
+
+    def _fetch_branch(self, repository, name):
+        if name in repository.get("fetched_branches", []):
+            return True
+        if self.closed or self.state.get("pause_requested"):
+            return False
+        repository.update(fetch_state="running", fetch_branch=name)
+        self.state["stage"] = "拉取分支中"
+        self.save()
+        try:
+            metadata = fetch_branch(repository, name)
+        except WorkflowError:
+            repository["fetch_state"] = "failed"
+            self.save()
+            raise
+        entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
+        entry.update(metadata)
+        repository.setdefault("fetched_branches", []).append(name)
+        repository["fetch_state"] = "done"
+        self.state["stage"] = "已暂停" if self.state.get("pause_requested") else "识别分支中"
+        self.save()
+        return True
 
     def _advance_branches(self):
         state = self.state
@@ -481,6 +505,11 @@ class Workflow(CompileFlow, ProgressFlow):
                 branch = next(entry for entry in repository["catalog"] if entry["name"] == result["branch"])
                 if not branch["local"] and not repository["refreshed"]:
                     self._refresh_branches(repository)
+                    branch = next((entry for entry in repository["catalog"] if entry["name"] == result["branch"]), None)
+                    if branch and not branch["local"] and not state.get("pause_requested"):
+                        self._fetch_branch(repository, branch["name"])
+                elif not branch["local"] and branch["name"] not in repository.get("fetched_branches", []):
+                    self._fetch_branch(repository, branch["name"])
                 else:
                     self._select_branch(repository, branch["name"], "ai", result["reason"])
             elif result["status"] == "not_found" and not repository["refreshed"]:

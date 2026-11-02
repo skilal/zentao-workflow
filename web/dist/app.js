@@ -13,7 +13,7 @@ DOMPurify.addHook("afterSanitizeAttributes", node => {
 });
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
-const ACTIVE = new Set(["识别分支中", "刷新分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"]);
+const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"]);
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
   items: ["工作项与资料", "可从指派给你的需求、任务和 Bug 中选择处理对象，也可新建会话直接输入需求。"],
@@ -841,7 +841,7 @@ function WorkflowApp() {
     const detailRepositories = state.branch_resolution?.manual && !state.repos.length ? [] : model.settings.repositories.filter(repository => {
       const entry = repositories.find(entry => entry.role === repository.role);
       return state.repos.some(entry => entry.name === repository.name) || entry?.status === "needs_user" ||
-        entry?.reason || entry?.question || entry?.candidates.length > 0 || entry?.refresh_state;
+        entry?.reason || entry?.question || entry?.candidates.length > 0 || entry?.refresh_state || entry?.fetch_state;
     });
     return h("div", { className: "card-stack" },
       stage === "准备工作区失败" && checkout && h(CardBox, { title: "保留本机改动并切换分支" },
@@ -883,7 +883,8 @@ function WorkflowApp() {
           (entry?.reason || workspace) && h("p", { className: "muted" }, entry?.reason || "沿用当前会话已创建工作区的分支。"),
           entry?.question && h(Alert, { type: "warning", showIcon: true, message: entry.question }),
           entry?.candidates.length > 0 && h("p", { className: "muted" }, `AI 候选：${entry.candidates.join("、")}`),
-          entry?.refresh_state && h("p", { className: "muted" }, { running: "正在刷新远程分支…", done: "已刷新远程分支", failed: "远程分支刷新失败，修复连接后可恢复当前阶段" }[entry.refresh_state]),
+          entry?.refresh_state && h("p", { className: "muted" }, { running: "正在核对远程分支清单…", done: "已核对远程分支清单", failed: "远程分支清单核对失败，修复连接后可恢复当前阶段" }[entry.refresh_state]),
+          entry?.fetch_state && h("p", { className: "muted" }, `${{ running: "正在拉取目标分支", done: "已拉取目标分支", failed: "目标分支拉取失败" }[entry.fetch_state]}：${entry.fetch_branch}`),
           workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : []), ...(workspace.checkout_backup ? [{ key: "checkout_backup", label: "本机改动备份", children: h(Typography.Text, { copyable: true }, workspace.checkout_backup) }] : [])] }));
       })),
       (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&

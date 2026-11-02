@@ -82,20 +82,43 @@ def branch_catalog(repository):
         entry = result.setdefault(name, {"name": name, "local": False, "remote": False})
         entry["local" if local else "remote"] = True
         if local or "commit" not in entry:
-            entry.update(commit=commit_id, date=date, subject=subject)
+            entry.update(commit=commit_id, date=date, subject=subject, metadata_available=True)
     return sorted(result.values(), key=lambda entry: entry["name"])
 
 
 @locked_repository
 def refresh_branches(repository):
     reject_hooks(repository["path"])
-    git(repository["path"], "fetch", "--no-tags", "--", repository["remote"])
     heads = git(repository["path"], "ls-remote", "--heads", "--", repository["remote"])
-    live = {line.split("\t", 1)[1][len("refs/heads/"):] for line in heads.splitlines()}
-    catalog = branch_catalog(repository)
-    for entry in catalog:
-        entry["remote"] = entry["remote"] and entry["name"] in live
-    return [entry for entry in catalog if entry["local"] or entry["remote"]]
+    live = {}
+    for line in heads.splitlines():
+        commit_id, separator, ref = line.partition("\t")
+        if not commit_id or not separator or not ref.startswith("refs/heads/"):
+            raise WorkflowError("远程分支清单格式不符合预期，已停止刷新。")
+        live[ref[len("refs/heads/"):]] = commit_id
+    catalog = {entry["name"]: entry for entry in branch_catalog(repository)}
+    # 在线提交已变化时清空旧说明，候选分支定向拉取后再读取实际元数据。
+    for name, commit_id in live.items():
+        entry = catalog.setdefault(name, {"name": name, "local": False})
+        if not entry["local"] and entry.get("commit") != commit_id:
+            entry.update(commit=commit_id, date="", subject="", metadata_available=False)
+    for name, entry in catalog.items():
+        entry["remote"] = name in live
+        if entry["remote"]:
+            entry["remote_commit"] = live[name]
+    return sorted((entry for entry in catalog.values() if entry["local"] or entry["remote"]),
+                  key=lambda entry: entry["name"])
+
+
+@locked_repository
+def fetch_branch(repository, name):
+    reject_hooks(repository["path"])
+    git(repository["path"], "check-ref-format", "--branch", name)
+    refspec = f"+refs/heads/{name}:refs/remotes/{repository['remote']}/{name}"
+    git(repository["path"], "fetch", "--no-tags", "--", repository["remote"], refspec)
+    entry = next(entry for entry in branch_catalog(repository) if entry["name"] == name)
+    entry["remote_commit"] = git(repository["path"], "rev-parse", f"refs/remotes/{repository['remote']}/{name}")
+    return entry
 
 
 def reject_hooks(repository):
