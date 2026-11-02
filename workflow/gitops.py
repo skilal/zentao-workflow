@@ -3,6 +3,7 @@
 from hashlib import sha256
 from contextlib import ExitStack
 from functools import wraps
+from json import dumps
 from os import environ
 from pathlib import Path, PureWindowsPath
 from subprocess import CREATE_NO_WINDOW, PIPE, run
@@ -18,12 +19,12 @@ REPOSITORY_LOCKS = {}
 LOCK_REGISTRY = Lock()
 
 
-def git(repository, *arguments, optional=False, binary=False):
+def git(repository, *arguments, optional=False, binary=False, input_data=None):
     environment = dict(environ)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
     process = run(["git", "-c", "core.fsmonitor=false", "-C", str(repository), *arguments],
-                  stdin=PIPE, stdout=PIPE, stderr=PIPE, env=environment, creationflags=CREATE_NO_WINDOW)
+                  input=input_data or b"", stdout=PIPE, stderr=PIPE, env=environment, creationflags=CREATE_NO_WINDOW)
     if process.returncode and not optional:
         raise WorkflowError("Git 操作停止：" + process.stderr.decode("utf-8", errors="replace").strip())
     return process.stdout if binary else process.stdout.decode("utf-8", errors="replace").strip()
@@ -156,6 +157,82 @@ def workspace_claims(sessions, excluded_session):
             for repository in session["repos"]}
 
 
+def switch_branch(path, selection, baseline):
+    if selection["create"]:
+        if selection.get("track"):
+            git(path, "switch", "--track", "-c", selection["branch"], selection["base"])
+        else:
+            git(path, "switch", "-c", selection["branch"], baseline)
+    else:
+        git(path, "switch", selection["branch"])
+
+
+def checkout_snapshot(path):
+    staged = git(path, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-renames",
+                 "--name-only", "-z", binary=True)
+    paths = sorted(set(working_paths({"path": str(path)})) |
+                   {value.decode("utf-8") for value in staged.split(b"\0") if value})
+    contents = {}
+    for relative in paths:
+        file = safe_file({"path": str(path)}, relative)
+        contents[relative] = sha256(file.read_bytes()).hexdigest() if file.is_file() else "deleted"
+    index = git(path, "diff", "--cached", "--no-ext-diff", "--no-textconv", "--binary", binary=True)
+    return {"paths": paths, "fingerprint": sha256(index + dumps(contents, sort_keys=True).encode()).hexdigest()}
+
+
+@locked_repository
+def carry_checkout(repository, store, state, paths):
+    request = state["checkout_request"]
+    path, selection = Path(request["path"]), request["selection"]
+    if (request["status"] != "waiting" or not paths or len(paths) != len(set(paths))
+            or not set(paths).issubset(request["snapshot"]["paths"])):
+        raise WorkflowError("请从本次切换受阻的文件中明确选择要携带的改动。")
+    reject_hooks(path)
+    if workspace_claims(store.sessions(), state["id"]).get(str(path.resolve()).casefold()):
+        raise WorkflowError("该目录已被其他会话占用，不能智能切换。")
+    if (git(path, "rev-parse", "HEAD") != request["head"]
+            or git(path, "branch", "--show-current") != request["from_branch"]
+            or git(path, "rev-parse", "--verify", selection["base"] + "^{commit}") != request["baseline"]
+            or checkout_snapshot(path) != request["snapshot"]):
+        raise WorkflowError("分支或本机改动已变化，请重新尝试普通切换并核对文件。")
+    if git(path, "ls-files", "--unmerged", "-z", binary=True):
+        raise WorkflowError("仓库仍有未解决的合并冲突，请先手工处理。")
+    staged = git(path, "--literal-pathspecs", "diff", "--cached", "--no-ext-diff", "--no-textconv",
+                 "--binary", "--", *paths, binary=True)
+    git(path, "--literal-pathspecs", "stash", "push", "--include-untracked", "-m",
+        f"workflow-smart-checkout:{state['id']}", "--", *paths)
+    request.update(status="stashed", selected_paths=paths, stash=git(path, "rev-parse", "refs/stash"))
+    store.save(state)
+    try:
+        switch_branch(path, selection, request["baseline"])
+        request["status"] = "switched"
+        store.save(state)
+        # 按文件 stash 也会记录其他文件的索引，单独恢复选中文件的暂存差异。
+        git(path, "stash", "apply", request["stash"])
+        if staged:
+            git(path, "apply", "--cached", "--3way", "--binary", "--whitespace=nowarn", input_data=staged)
+    except WorkflowError as error:
+        request["status"] = "restore_failed" if request["status"] == "switched" else "switch_failed"
+        store.save(state)
+        raise WorkflowError(f"智能切换未完成，已停止；本机改动备份保留在 stash {request['stash']}。"
+                            "请手工完成切换及改动恢复，再确认继续。\n" + str(error)) from error
+    request["status"] = "restored"
+    store.save(state)
+
+
+@locked_repository
+def confirm_checkout(repository, store, state):
+    request = state["checkout_request"]
+    if request["status"] not in {"stashed", "switched", "restore_failed", "switch_failed"}:
+        raise WorkflowError("当前没有需要手工确认的智能切换。")
+    if (git(repository, "branch", "--show-current") != request["selection"]["branch"]
+            or git(repository, "rev-parse", "HEAD") != request["baseline"]
+            or git(repository, "ls-files", "--unmerged", "-z", binary=True)):
+        raise WorkflowError("请先切换到目标分支并解决合并冲突，再确认改动已恢复。")
+    request["status"] = "restored"
+    store.save(state)
+
+
 @locked_repository
 def acquire_workspace(selection, destination, store, state):
     """优先沿用目标分支目录，其次切换空闲目录，最后创建；登记与分配共用仓库锁。"""
@@ -205,19 +282,29 @@ def acquire_workspace(selection, destination, store, state):
         preserved = working_paths({"path": str(path)})
         switching = entry.get("branch") != "refs/heads/" + branch
         if switching:
-            if selection["create"]:
-                if selection.get("track"):
-                    git(path, "switch", "--track", "-c", branch, base)
-                else:
-                    git(path, "switch", "-c", branch, baseline)
-            else:
-                git(path, "switch", branch)
+            try:
+                switch_branch(path, selection, baseline)
+            except WorkflowError as error:
+                if "would be overwritten by checkout" in str(error):
+                    state["checkout_request"] = {"path": str(path), "selection": dict(selection),
+                        "head": git(path, "rev-parse", "HEAD"), "from_branch": git(path, "branch", "--show-current"),
+                        "baseline": baseline, "status": "waiting", "snapshot": checkout_snapshot(path)}
+                    store.save(state)
+                raise
+        request = state.get("checkout_request")
+        if request and request["selection"] == selection and Path(request["path"]).resolve() == path:
+            if request["status"] == "restored":
+                preserved += request["selected_paths"]
+            elif request["status"] == "waiting":
+                state.pop("checkout_request")
         reject_hooks(path)
         record = {"source": str(source), "path": str(path), "branch": branch, "base": base,
                   "baseline": baseline, "create": bool(selection["create"]),
                   "workspace_owned": path.parent == store.directory(state["id"]) / "workspace",
                   "workspace_mode": "switched" if switching else "reused",
                   "preserved_paths": sorted(set(preserved + working_paths({"path": str(path)})))}
+        if request and request["status"] == "restored" and request["selection"] == selection:
+            record["checkout_backup"] = request["stash"]
     record.update(name=selection["name"], role=selection["role"])
     state["repos"].append(record)
     store.save(state)

@@ -57,12 +57,27 @@ class BranchActionChecks(TestCase):
         choose.assert_called_once_with(choices)
 
     def test_branch_and_project_decisions_reject_stale_revision_or_wrong_session(self):
-        for action in ("plan", "edit_branches", "choose_branches", "confirm_project"):
+        for action in ("plan", "edit_branches", "choose_branches", "confirm_project", "smart_checkout", "checkout_resolved"):
             with self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request(action, revision=-1))
             with self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request(action, session_id="其他会话"))
         self.runtime.engine.submit.assert_not_called()
+
+    def test_smart_checkout_requires_explicit_files_and_deduplicates_requests(self):
+        operation = self.runtime.engine.smart_checkout = Mock()
+        for paths in (None, "pnpm-lock.yaml", [None], [[]]):
+            with self.subTest(paths=paths), self.assertRaises(WorkflowError):
+                self.application.dispatch(self.request("smart_checkout", {"paths": paths}))
+        operation.assert_not_called()
+        request = self.request("smart_checkout", {"paths": ["pnpm-lock.yaml"]})
+        self.application.dispatch(request)
+        duplicate = self.application.dispatch(request)
+        self.assertTrue(duplicate["duplicate"])
+        operation.assert_called_once_with(["pnpm-lock.yaml"])
+        confirm = self.runtime.engine.checkout_resolved = Mock()
+        self.application.dispatch(self.request("checkout_resolved"))
+        confirm.assert_called_once_with()
 
     def test_duplicate_branch_request_does_not_repeat_preparation(self):
         operation = self.runtime.engine.choose_branches = Mock()

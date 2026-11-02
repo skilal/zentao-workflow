@@ -835,12 +835,35 @@ function WorkflowApp() {
     const transfers = (imageTransfers[state.id] || []).filter(task => task.purpose !== "followup");
     const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy;
     const repositories = state.branch_resolution?.repositories || [];
+    const checkout = state.checkout_request;
+    const checkoutKey = checkout && [checkout.path, checkout.head, checkout.baseline, checkout.snapshot.fingerprint].join("\n");
+    const checkoutPaths = draft.checkout_key === checkoutKey ? draft.checkout_paths || [] : [];
     const detailRepositories = state.branch_resolution?.manual && !state.repos.length ? [] : model.settings.repositories.filter(repository => {
       const entry = repositories.find(entry => entry.role === repository.role);
       return state.repos.some(entry => entry.name === repository.name) || entry?.status === "needs_user" ||
         entry?.reason || entry?.question || entry?.candidates.length > 0 || entry?.refresh_state;
     });
     return h("div", { className: "card-stack" },
+      stage === "准备工作区失败" && checkout && h(CardBox, { title: "保留本机改动并切换分支" },
+        h("p", null, `${checkout.selection.name}：${checkout.from_branch} → ${checkout.selection.branch}`),
+        h(Typography.Paragraph, { copyable: true }, checkout.path),
+        checkout.status === "waiting" ? h(React.Fragment, null,
+          h(Alert, { type: "info", showIcon: true, message: "仅将勾选文件存入 stash 备份，切换后合并恢复。未勾选改动继续留在目录中；恢复冲突时停止并保留备份。" }),
+          h("p", { className: "muted" }, "保留文件不自动修改，不参与本轮需求审查和提交。请逐项勾选，不会自动选择。"),
+          h(Space, { direction: "vertical" }, checkout.snapshot.paths.map(path => h(Checkbox, {
+            key: path, checked: checkoutPaths.includes(path), disabled: busy,
+            onChange: event => changeDraft({ checkout_key: checkoutKey,
+              checkout_paths: event.target.checked ? [...checkoutPaths, path] : checkoutPaths.filter(value => value !== path) }) }, path))),
+          h("div", { className: "action-bar" },
+            h(Button, { disabled: busy, onClick: startPlan }, "重新检查本机改动"),
+            h(Button, { type: "primary", disabled: busy || !checkoutPaths.length,
+              onClick: () => act("smart_checkout", { paths: checkoutPaths }) }, "携带选中改动并继续"))) :
+          checkout.status !== "restored" && h(React.Fragment, null,
+            h(Alert, { type: "warning", showIcon: true, message: "智能切换已停止。请手工完成目标分支切换、恢复备份改动并解决冲突，再确认继续。" }),
+            h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy,
+              onClick: () => act("checkout_resolved") }, "已手工恢复改动并解决冲突，继续"))),
+        checkout.selected_paths && h("p", { className: "muted" }, `本次保留文件：${checkout.selected_paths.join("、")}`),
+        checkout.stash && h(Typography.Paragraph, { copyable: true }, `本机改动备份（保留）：${checkout.stash}`)),
       ACTIVE.has(stage) && state.phase === "branch" &&
       h(CardBox, { title: "项目与分支操作" },
         h(Space, null, h(Spin, { size: "small" }), stage)),
@@ -853,7 +876,7 @@ function WorkflowApp() {
           entry?.question && h(Alert, { type: "warning", showIcon: true, message: entry.question }),
           entry?.candidates.length > 0 && h("p", { className: "muted" }, `AI 候选：${entry.candidates.join("、")}`),
           entry?.refresh_state && h("p", { className: "muted" }, { running: "正在刷新远程分支…", done: "已刷新远程分支", failed: "远程分支刷新失败，修复连接后可恢复当前阶段" }[entry.refresh_state]),
-          workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : [])] }));
+          workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : []), ...(workspace.checkout_backup ? [{ key: "checkout_backup", label: "本机改动备份", children: h(Typography.Text, { copyable: true }, workspace.checkout_backup) }] : [])] }));
       })),
       (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&
         h(CardBox, { title: state.item === null ? "输入需求与验收标准" : "补充需求与验收标准" },
@@ -893,8 +916,8 @@ function WorkflowApp() {
               onChange: event => changeDraft({ compile_check_enabled: event.target.checked }) }, "Review 前自动检查后端编译"),
             h(Typography.Text, { type: "secondary" }, "仅检查有改动的后端模块；前端继续 Review。需要下载依赖时等待人工选择。")),
           ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "开始后固定模型与推理强度；已有改动保留且不提交"),
-            h(Button, { type: "primary", size: "large", disabled: !editable || transfers.length > 0 || (!state.codex && !sessionSelection) ||
-              (state.item === null && !draft.supplement.trim() && !state.supplement_images.length), onClick: startPlan }, state.item === null ? "发送并开始计划" : "开始需求分析与计划"))));
+            h(Button, { type: "primary", size: "large", disabled: !editable || (checkout && !["waiting", "restored"].includes(checkout.status)) || transfers.length > 0 || (!state.codex && !sessionSelection) ||
+              (state.item === null && !draft.supplement.trim() && !state.supplement_images.length), onClick: startPlan }, stage === "准备工作区失败" ? "重新准备工作区并继续" : state.item === null ? "发送并开始计划" : "开始需求分析与计划"))));
   }
 
   function renderFeedbackImages(images, editable = false, purpose = "followup") {

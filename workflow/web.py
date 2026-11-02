@@ -561,7 +561,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
@@ -649,6 +649,13 @@ class WebApplication:
                 if not isinstance(choices, dict):
                     raise WorkflowError("请明确选择待确定仓库的分支。")
                 operation, arguments = engine.choose_branches, (choices,)
+            elif action == "smart_checkout":
+                paths = data.get("paths")
+                if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+                    raise WorkflowError("请明确勾选要携带的本机改动文件。")
+                operation, arguments = engine.smart_checkout, (paths,)
+            elif action == "checkout_resolved":
+                operation, arguments = engine.checkout_resolved, ()
             elif action == "followup":
                 plan_mode = data.get("plan_mode", False)
                 if not isinstance(plan_mode, bool):

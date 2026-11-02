@@ -5,9 +5,9 @@ from json import loads
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from workflow.gitops import acquire_workspace, changed_paths, cleanup_workspaces, commit, differences, git, manifest, prepare, working_paths, worktrees
+from workflow.gitops import acquire_workspace, carry_checkout, changed_paths, cleanup_workspaces, commit, confirm_checkout, differences, git, manifest, prepare, working_paths, worktrees
 from workflow.engine import Workflow
 from workflow.mcp_server import Tools
 from workflow.settings import ROOT, WorkflowError
@@ -158,6 +158,170 @@ class WorkspaceReuseChecks(TestCase):
         self.assertFalse(git(self.source, "stash", "list"))
         self.assertFalse(self.state["repos"])
         self.assertEqual(len(worktrees(self.source)), 1)
+
+    def checkout_request(self, overlap=False):
+        original = "".join(f"第{index}行\n" for index in range(12))
+        file = self.source / "本机配置.txt"
+        file.write_text(original, encoding="utf-8")
+        git(self.source, "commit", "-am", "初始化多行配置")
+        git(self.source, "switch", "-c", "项目分支")
+        target = original.replace("第0行" if overlap else "第11行", "目标分支配置")
+        file.write_text(target, encoding="utf-8")
+        git(self.source, "commit", "-am", "目标项目配置")
+        git(self.source, "switch", "主分支")
+        local = original.replace("第0行", "本机保留配置")
+        file.write_text(local, encoding="utf-8")
+        with self.assertRaises(WorkflowError):
+            self.acquire("项目分支")
+        self.state.update(stage="准备工作区失败", selections=[self.selection("项目分支")], supplement="",
+                          snapshot={"sources": [], "materials": []})
+        self.store.save(self.state)
+        return local, target
+
+    def test_smart_checkout_merges_selected_file_and_continues_current_session(self):
+        local, target = self.checkout_request()
+        (self.source / "已暂存配置.txt").write_text("其他已暂存改动\n", encoding="utf-8")
+        git(self.source, "add", "已暂存配置.txt")
+        (self.source / "已暂存配置.txt").write_text("其他未暂存改动\n", encoding="utf-8")
+        (self.source / "其他.txt").write_text("未选本机资料\n", encoding="utf-8")
+        with self.assertRaises(WorkflowError):
+            self.acquire("项目分支")
+        index = git(self.source, "diff", "--cached", "--binary", binary=True)
+        settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        flow = Workflow(settings, lambda *args: None, self.store)
+        self.addCleanup(flow.close)
+        flow.state, flow._start_turn = self.state, Mock()
+        flow.smart_checkout(["本机配置.txt"])
+        flow._start_turn.assert_called_once()
+        request = self.state["checkout_request"]
+        self.assertEqual(request["status"], "restored")
+        self.assertEqual(git(self.source, "branch", "--show-current"), "项目分支")
+        self.assertEqual((self.source / "本机配置.txt").read_text(encoding="utf-8"),
+                         target.replace("第0行", "本机保留配置"))
+        self.assertEqual(git(self.source, "show", request["stash"] + ":本机配置.txt"), local.strip())
+        self.assertEqual(git(self.source, "diff", "--cached", "--binary", binary=True), index)
+        self.assertEqual((self.source / "已暂存配置.txt").read_text(encoding="utf-8"), "其他未暂存改动\n")
+        self.assertEqual((self.source / "其他.txt").read_text(encoding="utf-8"), "未选本机资料\n")
+        record = self.state["repos"][0]
+        self.assertEqual(record["checkout_backup"], request["stash"])
+        self.assertTrue({"本机配置.txt", "已暂存配置.txt", "其他.txt"}.issubset(record["preserved_paths"]))
+        self.assertFalse(manifest([record]))
+        (self.source / "任务.txt").write_text("需求修改\n", encoding="utf-8")
+        commit(record, "fix: 当前需求", manifest([record]))
+        self.assertEqual(git(self.source, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "任务.txt")
+        self.assertEqual(git(self.source, "diff", "--cached", "--binary", binary=True), index)
+
+    def test_old_checkout_failure_retries_saved_branches_without_reidentification(self):
+        self.checkout_request()
+        self.state.pop("checkout_request")
+        settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        flow = Workflow(settings, lambda *args: None, self.store)
+        self.addCleanup(flow.close)
+        flow.state, flow._resolve_branches = self.state, Mock()
+        with self.assertRaises(WorkflowError):
+            flow.start_plan("继续当前需求")
+        flow._resolve_branches.assert_not_called()
+        self.assertEqual(self.state["checkout_request"]["status"], "waiting")
+        self.assertEqual(self.state["selections"], [self.selection("项目分支")])
+
+    def test_smart_checkout_restores_selected_staged_and_unstaged_changes(self):
+        local, target = self.checkout_request()
+        git(self.source, "add", "本机配置.txt")
+        (self.source / "本机配置.txt").write_text(local.replace("第1行", "本机未暂存配置"), encoding="utf-8")
+        with self.assertRaises(WorkflowError):
+            self.acquire("项目分支")
+        carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        self.assertEqual(git(self.source, "show", ":本机配置.txt"),
+                         target.replace("第0行", "本机保留配置").strip())
+        self.assertEqual((self.source / "本机配置.txt").read_text(encoding="utf-8"),
+                         target.replace("第0行", "本机保留配置").replace("第1行", "本机未暂存配置"))
+
+    def test_smart_checkout_conflict_keeps_backup_and_waits_for_explicit_resolution(self):
+        local, target = self.checkout_request(overlap=True)
+        with self.assertRaisesRegex(WorkflowError, "备份保留"):
+            carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        request = self.state["checkout_request"]
+        self.assertEqual(request["status"], "restore_failed")
+        self.assertEqual(git(self.source, "show", request["stash"] + ":本机配置.txt"), local.strip())
+        self.assertTrue(git(self.source, "ls-files", "--unmerged"))
+        self.assertFalse(self.state["repos"])
+        with self.assertRaisesRegex(WorkflowError, "解决合并冲突"):
+            confirm_checkout(self.source, self.store, self.state)
+        settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        flow = Workflow(settings, lambda *args: None, self.store)
+        self.addCleanup(flow.close)
+        flow.state, flow._start_turn = self.store.load(self.state["id"]), Mock()
+        with self.assertRaisesRegex(WorkflowError, "智能切换尚未完成"):
+            flow.prepare_and_plan(flow.state["selections"], "")
+        flow._start_turn.assert_not_called()
+        (self.source / "本机配置.txt").write_text(local, encoding="utf-8")
+        git(self.source, "add", "本机配置.txt")
+        flow.checkout_resolved()
+        flow._start_turn.assert_called_once()
+        self.assertIn("本机配置.txt", flow.state["repos"][0]["preserved_paths"])
+        self.assertFalse(manifest(flow.state["repos"]))
+
+    def test_smart_checkout_rejects_unselected_unknown_duplicate_and_changed_files(self):
+        self.checkout_request()
+        for paths in ([], ["任务.txt"], ["本机配置.txt", "本机配置.txt"]):
+            with self.subTest(paths=paths), self.assertRaisesRegex(WorkflowError, "明确选择"):
+                carry_checkout(self.source, self.store, self.state, paths)
+        (self.source / "本机配置.txt").write_text("确认后又修改了配置\n", encoding="utf-8")
+        with self.assertRaisesRegex(WorkflowError, "本机改动已变化"):
+            carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        self.assertFalse(git(self.source, "stash", "list"))
+        self.assertEqual(git(self.source, "branch", "--show-current"), "主分支")
+
+    def test_smart_checkout_does_not_shelve_unselected_blocking_changes(self):
+        self.checkout_request()
+        git(self.source, "switch", "--discard-changes", "项目分支")
+        (self.source / "任务.txt").write_text("项目任务配置\n", encoding="utf-8")
+        git(self.source, "commit", "-am", "项目任务配置")
+        git(self.source, "switch", "主分支")
+        (self.source / "本机配置.txt").write_text("本机保留配置\n", encoding="utf-8")
+        (self.source / "任务.txt").write_text("未勾选的本机任务改动\n", encoding="utf-8")
+        with self.assertRaises(WorkflowError):
+            self.acquire("项目分支")
+        with self.assertRaisesRegex(WorkflowError, "备份保留"):
+            carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        request = self.state["checkout_request"]
+        self.assertEqual(request["status"], "switch_failed")
+        self.assertEqual(git(self.source, "branch", "--show-current"), "主分支")
+        self.assertEqual((self.source / "任务.txt").read_text(encoding="utf-8"), "未勾选的本机任务改动\n")
+        self.assertEqual(git(self.source, "show", request["stash"] + ":本机配置.txt"), "本机保留配置")
+        with self.assertRaisesRegex(WorkflowError, "目标分支"):
+            confirm_checkout(self.source, self.store, self.state)
+
+    def test_smart_checkout_preserves_untracked_backup_when_target_already_has_file(self):
+        git(self.source, "switch", "-c", "项目分支")
+        file = self.source / "本机[1].txt"
+        file.write_text("目标分支文件\n", encoding="utf-8")
+        git(self.source, "--literal-pathspecs", "add", "--", file.name)
+        git(self.source, "commit", "-m", "目标分支新增文件")
+        git(self.source, "switch", "主分支")
+        file.write_text("本机未跟踪文件\n", encoding="utf-8")
+        with self.assertRaises(WorkflowError):
+            self.acquire("项目分支")
+        with self.assertRaisesRegex(WorkflowError, "备份保留"):
+            carry_checkout(self.source, self.store, self.state, [file.name])
+        request = self.state["checkout_request"]
+        self.assertEqual(request["status"], "restore_failed")
+        self.assertEqual(file.read_text(encoding="utf-8"), "目标分支文件\n")
+        self.assertEqual(git(self.source, "show", request["stash"] + "^3:" + file.name), "本机未跟踪文件")
+
+    def test_smart_checkout_keeps_preexisting_stash_and_stops_for_hooks(self):
+        (self.source / "任务.txt").write_text("用户原有备份\n", encoding="utf-8")
+        git(self.source, "stash", "push", "-m", "用户原有备份")
+        original_stash = git(self.source, "rev-parse", "refs/stash")
+        self.checkout_request()
+        hook = self.source / ".git" / "hooks" / "post-checkout"
+        hook.write_text("不应执行此文件", encoding="utf-8")
+        with self.assertRaisesRegex(WorkflowError, "Git 钩子"):
+            carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        self.assertEqual(git(self.source, "rev-parse", "refs/stash"), original_stash)
+        hook.unlink()
+        carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        self.assertEqual(git(self.source, "rev-parse", "stash@{1}"), original_stash)
 
     def test_review_and_commit_include_only_task_files_and_keep_existing_index(self):
         originals = self.local_changes()

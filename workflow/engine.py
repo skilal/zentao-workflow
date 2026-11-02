@@ -14,7 +14,7 @@ from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import validate_review_request
-from workflow.gitops import acquire_workspace, branch_catalog, commit, ensure_baseline, git, manifest, refresh_branches, working_paths
+from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
 from workflow.rpc import AppServer, thread_parameters
@@ -334,7 +334,7 @@ class Workflow(CompileFlow, ProgressFlow):
         if "plan_started_at" not in state:
             state["plan_started_at"] = timestamp()
             self.save()
-        if state["repos"]:
+        if state["repos"] or (not manual and state["stage"] == "准备工作区失败" and state.get("selections")):
             if manual:
                 raise WorkflowError("工作区已经创建，不能改变当前会话分支。")
             self.prepare_and_plan(state["selections"], supplement)
@@ -490,8 +490,27 @@ class Workflow(CompileFlow, ProgressFlow):
         self.save()
         self._advance_branches()
 
+    def smart_checkout(self, paths):
+        state = self.require_state("准备工作区失败")
+        request = state.get("checkout_request")
+        if not request or request["selection"] not in state["selections"]:
+            raise WorkflowError("当前没有可处理的分支切换请求。")
+        carry_checkout(request["path"], self.store, state, paths)
+        self.prepare_and_plan(state["selections"], state["supplement"])
+
+    def checkout_resolved(self):
+        state = self.require_state("准备工作区失败")
+        request = state.get("checkout_request")
+        if not request or request["selection"] not in state["selections"]:
+            raise WorkflowError("当前没有可确认的分支切换请求。")
+        confirm_checkout(request["path"], self.store, state)
+        self.prepare_and_plan(state["selections"], state["supplement"])
+
     def prepare_and_plan(self, selections, supplement):
         state = self.require_state("资料已读取", "准备工作区失败")
+        checkout = state.get("checkout_request")
+        if checkout and checkout["status"] not in {"waiting", "restored"}:
+            raise WorkflowError("智能切换尚未完成，请手工恢复备份改动并确认后继续。")
         if not selections:
             raise WorkflowError("尚未确定代码仓库及分支。")
         if not state.get("snapshot"):
