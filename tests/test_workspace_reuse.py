@@ -289,8 +289,8 @@ class WorkspaceReuseChecks(TestCase):
         git(self.source, "add", "任务.txt")
         git(self.source, "commit", "--only", "-m", "目标分支更新", "--", "任务.txt")
         baseline, head = request["baseline"], git(self.source, "rev-parse", "HEAD")
-        with self.assertRaisesRegex(WorkflowError, f"原基准 {baseline[:12]}，当前提交 {head[:12]}"):
-            confirm_checkout(self.source, self.store, self.state)
+        self.assertFalse(confirm_checkout(self.source, self.store, self.state))
+        self.assertEqual(request["baseline_change"], {"previous": baseline, "current": head, "confirmed": False})
         self.assertEqual(request["baseline"], baseline)
         self.assertEqual(request["status"], "restore_failed")
 
@@ -313,6 +313,107 @@ class WorkspaceReuseChecks(TestCase):
         self.assertEqual(git(self.source, "show", request["stash"] + ":本机配置.txt"), "本机保留配置")
         with self.assertRaisesRegex(WorkflowError, "目标分支"):
             confirm_checkout(self.source, self.store, self.state)
+
+    def updated_checkout(self):
+        local, _ = self.checkout_request(overlap=True)
+        with self.assertRaisesRegex(WorkflowError, "备份保留"):
+            carry_checkout(self.source, self.store, self.state, ["本机配置.txt"])
+        (self.source / "本机配置.txt").write_text(local, encoding="utf-8")
+        git(self.source, "add", "本机配置.txt")
+        (self.source / "任务.txt").write_text("外部更新后的内容\n", encoding="utf-8")
+        git(self.source, "add", "任务.txt")
+        git(self.source, "commit", "--only", "-m", "外部更新", "--", "任务.txt")
+        return git(self.source, "rev-parse", "HEAD")
+
+    def test_preparation_previews_new_baseline_and_continues_only_after_confirmation(self):
+        head = self.updated_checkout()
+        self.state["plan_started_at"] = "准备工作区前已锁定项目"
+        self.state["error"] = "原基准已变化"
+        request = self.state["checkout_request"]
+        previous, stash = request["baseline"], request["stash"]
+        index = git(self.source, "diff", "--cached", "--binary", binary=True)
+        settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        flow = Workflow(settings, lambda *args: None, self.store)
+        self.addCleanup(flow.close)
+        flow.state, flow._start_turn = self.state, Mock()
+        flow.checkout_resolved()
+        flow._start_turn.assert_not_called()
+        self.assertEqual(request["baseline"], previous)
+        self.assertEqual(request["status"], "restore_failed")
+        self.assertEqual(flow.state["error"], "")
+        saved = self.store.load(self.state["id"])
+        self.assertEqual(saved["checkout_request"]["baseline_change"],
+                         {"previous": previous, "current": head, "confirmed": False})
+        flow.checkout_resolved(head)
+        flow._start_turn.assert_called_once()
+        self.assertEqual(request["baseline"], head)
+        self.assertTrue(request["baseline_change"]["confirmed"])
+        self.assertEqual(flow.state["repos"][0]["baseline"], head)
+        self.assertIn("本机配置.txt", flow.state["repos"][0]["preserved_paths"])
+        self.assertEqual(flow.state["repos"][0]["checkout_backup"], stash)
+        self.assertFalse(manifest(flow.state["repos"]))
+        self.assertEqual(git(self.source, "diff", "--cached", "--binary", binary=True), index)
+        self.assertEqual(git(self.source, "rev-parse", "refs/stash"), stash)
+
+    def test_new_baseline_confirmation_rechecks_preview_when_head_advances_again(self):
+        first = self.updated_checkout()
+        request = self.state["checkout_request"]
+        previous = request["baseline"]
+        with self.assertRaisesRegex(WorkflowError, "先核对页面"):
+            confirm_checkout(self.source, self.store, self.state, first)
+        self.assertFalse(confirm_checkout(self.source, self.store, self.state))
+        (self.source / "任务.txt").write_text("再次更新后的内容\n", encoding="utf-8")
+        git(self.source, "add", "任务.txt")
+        git(self.source, "commit", "--only", "-m", "再次外部更新", "--", "任务.txt")
+        second = git(self.source, "rev-parse", "HEAD")
+        self.assertFalse(confirm_checkout(self.source, self.store, self.state, first))
+        self.assertEqual(request["baseline"], previous)
+        self.assertEqual(request["baseline_change"]["current"], second)
+        self.assertFalse(request["baseline_change"]["confirmed"])
+        with self.assertRaisesRegex(WorkflowError, "先核对页面"):
+            confirm_checkout(self.source, self.store, self.state, first)
+        self.assertTrue(confirm_checkout(self.source, self.store, self.state, second))
+        self.assertEqual(request["baseline"], second)
+
+    def test_new_baseline_is_rejected_after_actual_planning_implementation_or_review(self):
+        self.updated_checkout()
+        previous = self.state["checkout_request"]["baseline"]
+        for key, value in (("stage", "已暂停"), ("phase", "implement"), ("phase", "review"),
+                           ("prepare_complete", True), ("thread_id", "已启动计划线程"),
+                           ("plan_round", {"number": 1}), ("plan", "已有计划"),
+                           ("approved_plan", "已确认计划"), ("reviews", [{}]), ("commits", {"前端": "已提交"})):
+            original = self.state.get(key)
+            self.state[key] = value
+            with self.subTest(key=key, value=value), self.assertRaisesRegex(WorkflowError, "仅尚未开始实际计划"):
+                confirm_checkout(self.source, self.store, self.state)
+            self.state[key] = original
+        self.assertEqual(self.state["checkout_request"]["baseline"], previous)
+        self.assertNotIn("baseline_change", self.state["checkout_request"])
+
+    def test_new_baseline_rejects_rollback_and_diverged_history(self):
+        self.updated_checkout()
+        request = self.state["checkout_request"]
+        previous = request["baseline"]
+        git(self.source, "reset", "--soft", previous + "^")
+        with self.assertRaisesRegex(WorkflowError, "不是旧基准的快进更新"):
+            confirm_checkout(self.source, self.store, self.state)
+        git(self.source, "commit", "-m", "分叉后的提交")
+        with self.assertRaisesRegex(WorkflowError, "不是旧基准的快进更新"):
+            confirm_checkout(self.source, self.store, self.state)
+        self.assertEqual(request["baseline"], previous)
+        self.assertNotIn("baseline_change", request)
+
+    def test_returning_to_original_baseline_invalidates_pending_new_baseline(self):
+        head = self.updated_checkout()
+        request = self.state["checkout_request"]
+        previous = request["baseline"]
+        self.assertFalse(confirm_checkout(self.source, self.store, self.state))
+        git(self.source, "reset", "--soft", previous)
+        with self.assertRaisesRegex(WorkflowError, "页面展示的新基准已失效"):
+            confirm_checkout(self.source, self.store, self.state, head)
+        self.assertTrue(confirm_checkout(self.source, self.store, self.state))
+        self.assertEqual(request["baseline"], previous)
+        self.assertNotIn("baseline_change", request)
 
     def test_smart_checkout_preserves_untracked_backup_when_target_already_has_file(self):
         git(self.source, "switch", "-c", "项目分支")

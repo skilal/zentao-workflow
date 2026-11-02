@@ -498,13 +498,16 @@ class Workflow(CompileFlow, ProgressFlow):
         carry_checkout(request["path"], self.store, state, paths)
         self.prepare_and_plan(state["selections"], state["supplement"])
 
-    def checkout_resolved(self):
+    def checkout_resolved(self, baseline=None):
         state = self.require_state("准备工作区失败")
         request = state.get("checkout_request")
         if not request or request["selection"] not in state["selections"]:
             raise WorkflowError("当前没有可确认的分支切换请求。")
-        confirm_checkout(request["path"], self.store, state)
-        self.prepare_and_plan(state["selections"], state["supplement"])
+        if confirm_checkout(request["path"], self.store, state, baseline):
+            self.prepare_and_plan(state["selections"], state["supplement"])
+        else:
+            state["error"] = ""
+            self.save()
 
     def prepare_and_plan(self, selections, supplement):
         state = self.require_state("资料已读取", "准备工作区失败")

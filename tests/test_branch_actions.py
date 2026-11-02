@@ -77,7 +77,13 @@ class BranchActionChecks(TestCase):
         operation.assert_called_once_with(["pnpm-lock.yaml"])
         confirm = self.runtime.engine.checkout_resolved = Mock()
         self.application.dispatch(self.request("checkout_resolved"))
-        confirm.assert_called_once_with()
+        confirm.assert_called_once_with(None)
+        for baseline in (False, [], " "):
+            with self.subTest(baseline=baseline), self.assertRaises(WorkflowError):
+                self.application.dispatch(self.request("checkout_resolved", {"baseline": baseline}))
+        self.application.dispatch(self.request("checkout_resolved", {"baseline": "新基准提交"}))
+        self.assertEqual(confirm.call_count, 2)
+        confirm.assert_called_with("新基准提交")
 
     def test_duplicate_branch_request_does_not_repeat_preparation(self):
         operation = self.runtime.engine.choose_branches = Mock()

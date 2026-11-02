@@ -858,6 +858,14 @@ function WorkflowApp() {
             h(Button, { disabled: busy, onClick: startPlan }, "重新检查本机改动"),
             h(Button, { type: "primary", disabled: busy || !checkoutPaths.length,
               onClick: () => act("smart_checkout", { paths: checkoutPaths }) }, "携带选中改动并继续"))) :
+          checkout.baseline_change && !checkout.baseline_change.confirmed ? h(React.Fragment, null,
+            h(Alert, { type: "info", showIcon: true, message: "目标分支已快进更新。请核对提交变化，确认后以新提交建立本轮工作区基准并继续。" }),
+            h(Descriptions, { column: 1, size: "small", items: [
+              { key: "previous", label: "旧基准", children: h(Typography.Text, { code: true, copyable: true }, checkout.baseline_change.previous) },
+              { key: "current", label: "新基准", children: h(Typography.Text, { code: true, copyable: true }, checkout.baseline_change.current) }] }),
+            h("p", { className: "muted" }, "仅准备阶段允许确认；本机保留文件仍不参与本轮需求修改、审查和提交，stash 备份继续保留。"),
+            h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy,
+              onClick: () => act("checkout_resolved", { baseline: checkout.baseline_change.current }) }, "确认使用新基准并继续"))) :
           checkout.status !== "restored" && h(React.Fragment, null,
             h(Alert, { type: "warning", showIcon: true, message: "智能切换已停止。请手工完成目标分支切换、恢复备份改动并解决冲突，再确认继续。" }),
             h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy,

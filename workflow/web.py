@@ -655,7 +655,10 @@ class WebApplication:
                     raise WorkflowError("请明确勾选要携带的本机改动文件。")
                 operation, arguments = engine.smart_checkout, (paths,)
             elif action == "checkout_resolved":
-                operation, arguments = engine.checkout_resolved, ()
+                baseline = data.get("baseline")
+                if baseline is not None and (not isinstance(baseline, str) or not baseline.strip()):
+                    raise WorkflowError("请明确确认页面展示的新基准提交。")
+                operation, arguments = engine.checkout_resolved, (baseline,)
             elif action == "followup":
                 plan_mode = data.get("plan_mode", False)
                 if not isinstance(plan_mode, bool):

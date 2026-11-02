@@ -221,7 +221,7 @@ def carry_checkout(repository, store, state, paths):
 
 
 @locked_repository
-def confirm_checkout(repository, store, state):
+def confirm_checkout(repository, store, state, baseline=None):
     request = state["checkout_request"]
     if request["status"] not in {"stashed", "switched", "restore_failed", "switch_failed"}:
         raise WorkflowError("当前没有需要手工确认的智能切换。")
@@ -232,11 +232,31 @@ def confirm_checkout(repository, store, state):
     if git(repository, "ls-files", "--unmerged", "-z", binary=True):
         raise WorkflowError("仓库仍有未解决的合并冲突，请先解决合并冲突，再确认改动已恢复。")
     head = git(repository, "rev-parse", "HEAD")
+    change = request.get("baseline_change")
+    if baseline is not None and (not change or baseline != change["current"]):
+        raise WorkflowError("请先核对页面展示的提交变化，再明确确认当前新基准。")
     if head != request["baseline"]:
-        raise WorkflowError(f"目标分支提交已变化：原基准 {request['baseline'][:12]}，当前提交 {head[:12]}。"
-                            "当前会话尚未确认新基准，请先核对提交变化。")
+        # plan_started_at 在分支识别前设置，以实际计划线程和产物界定准备阶段。
+        if (state["stage"] != "准备工作区失败" or state["phase"] != "plan"
+                or any(state.get(key) for key in ("prepare_complete", "thread_id", "plan_round", "plan",
+                                                  "approved_plan", "reviews", "commits"))):
+            raise WorkflowError("目标分支提交已变化；仅尚未开始实际计划的工作区准备阶段允许确认新基准。"
+                                "当前会话必须停止并重新核对原计划与代码。")
+        if git(repository, "merge-base", request["baseline"], head, optional=True) != request["baseline"]:
+            raise WorkflowError("目标分支当前提交不是旧基准的快进更新，不能直接确认新基准，请先核对提交历史。")
+        if baseline != head:
+            request["baseline_change"] = {"previous": request["baseline"], "current": head, "confirmed": False}
+            store.save(state)
+            return False
+        request["baseline"] = head
+        change["confirmed"] = True
+    else:
+        if baseline is not None:
+            raise WorkflowError("目标分支已回到旧基准，页面展示的新基准已失效，请重新核对改动恢复情况。")
+        request.pop("baseline_change", None)
     request["status"] = "restored"
     store.save(state)
+    return True
 
 
 @locked_repository
