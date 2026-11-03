@@ -9,6 +9,7 @@ from sys import stdin, stdout
 from workflow.compile_checks import compile_context
 from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
+from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
 from workflow.delivery import previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, safe_file
 from workflow.settings import WorkflowError
@@ -25,6 +26,7 @@ FILE_ARGS = {"repository": STRING, "path": STRING}
 LINE_ARGS = {"start_line": {"type": "integer", "minimum": 1},
              "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}
 TOOLS = [
+    ("read_followup_attachment", "只读已发送的续聊 ZIP；不指定成员编号时返回目录清单，指定 member_id 时按行读取 XML，其他格式仅列出信息。", schema({"attachment_id": STRING, "member_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("read_answer_attachment", "按编号只读已提交的问题附件；图片返回图片内容，文本按行分页，无法解析时明确返回限制。", schema({"attachment_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
     ("list_files", "列出指定仓库的文件；pattern 为 glob；不访问依赖、Git 和输出目录。", schema({"repository": STRING, "pattern": STRING}, ("repository",))),
@@ -138,6 +140,7 @@ class Tools:
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
                     "answer_attachments": submitted_attachments(state),
+                    "followup_attachments": submitted_followup_attachments(state),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                     "continuation_context": state.get("continuation_context"),
                     "review_enabled": state.get("review_enabled", True),
@@ -148,6 +151,8 @@ class Tools:
             return register_input(self.store, state, arguments.get("questions"))
         if name == "read_answer_attachment":
             return read_answer_attachment(self.store, state, arguments)
+        if name == "read_followup_attachment":
+            return read_followup_attachment(self.store, state, arguments)
         if name == "request_review":
             request = validate_review_request(state, arguments)
             path = self.store.directory(self.session_id) / f"review-request-{state['delivery_round']}.json"

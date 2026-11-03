@@ -58,7 +58,7 @@ def run():
             reply.fill("实际结果：保存失败；预期结果：保存成功。")
 
             # 失败图片须由用户明确移除；不能带着失败队列发送。
-            page.locator("input[type=file]").set_input_files({"name": "错误.svg", "mimeType": "image/svg+xml", "buffer": b"<svg/>"})
+            page.locator("input[type=file][accept*=png]").set_input_files({"name": "错误.svg", "mimeType": "image/svg+xml", "buffer": b"<svg/>"})
             failed = page.locator(".attachment").filter(has_text="错误.svg")
             expect(failed.get_by_text("上传失败", exact=True)).to_be_visible()
             expect(send).to_be_disabled()
@@ -66,7 +66,7 @@ def run():
             expect(send).to_be_enabled()
 
             # 正常上传、预览和移除走实际本地 HTTP 接口。
-            page.locator("input[type=file]").set_input_files({"name": "上传截图.png", "mimeType": "image/png", "buffer": PNG})
+            page.locator("input[type=file][accept*=png]").set_input_files({"name": "上传截图.png", "mimeType": "image/png", "buffer": PNG})
             uploaded = page.locator(".attachment").filter(has_text="上传截图.png")
             expect(uploaded.locator("img")).to_be_visible()
             uploaded.get_by_role("button", name="移除", exact=True).click()
@@ -122,7 +122,7 @@ def run():
             expect(page.locator("#review-1 .review-actions, #review-2 .review-actions")).to_have_count(0)
 
             # 纯图片反馈也可重复发起新一轮。
-            page.locator("input[type=file]").set_input_files({"name": "第二次截图.png", "mimeType": "image/png", "buffer": PNG})
+            page.locator("input[type=file][accept*=png]").set_input_files({"name": "第二次截图.png", "mimeType": "image/png", "buffer": PNG})
             expect(page.get_by_alt_text("第二次截图.png")).to_be_visible()
             expect(send).to_be_enabled()
             send.click()
@@ -189,7 +189,7 @@ def run():
             expect(plan_switch).not_to_be_checked()
             plan_switch.click()
             review_switch.click()
-            page.locator("input[type=file]").set_input_files({"name": "暂停补充.png", "mimeType": "image/png", "buffer": PNG})
+            page.locator("input[type=file][accept*=png]").set_input_files({"name": "暂停补充.png", "mimeType": "image/png", "buffer": PNG})
             expect(page.get_by_alt_text("暂停补充.png")).to_be_visible()
             reply.fill("补充边界条件，与原功能一起完成")
             repos = deepcopy(state["repos"])

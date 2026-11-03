@@ -15,6 +15,7 @@ from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import validate_review_request
+from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
 from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
@@ -164,7 +165,7 @@ class Workflow(CompileFlow, ProgressFlow):
                 if entry.get("delivery_round", 1) == self.state.get("delivery_round", 1)
                 and index >= self.state.get("review_start", 0)]
 
-    def validate_followup(self, text, image_ids):
+    def validate_followup(self, text, image_ids, attachments=()):
         state = self.state
         if state.get("pending") or pending_input(self.store, state):
             raise WorkflowError("仍有问题等待明确答复，请先从暂停点继续并回答。")
@@ -177,11 +178,11 @@ class Workflow(CompileFlow, ProgressFlow):
         available = {image["id"]: image for image in state.get("followup_images", []) if "history_index" not in image}
         if any(value not in available for value in image_ids):
             raise WorkflowError("截图不属于当前待发送反馈，不能使用其他会话或已发送图片。")
-        if not text.strip() and not image_ids:
-            raise WorkflowError("请填写消息或添加至少一张图片。")
+        if not text.strip() and not image_ids and not attachments:
+            raise WorkflowError("请填写消息、添加图片或上传 ZIP。")
         return [deepcopy(available[value]) for value in image_ids]
 
-    def followup(self, text, images, request_id, review_enabled, plan_mode=False):
+    def followup(self, text, images, request_id, review_enabled, plan_mode=False, attachments=()):
         state = self.state
         in_progress = state["phase"] != "complete"
         number = state.get("delivery_round", 1)
@@ -208,6 +209,9 @@ class Workflow(CompileFlow, ProgressFlow):
         for image in state.get("followup_images", []):
             if image["id"] in image_ids:
                 image["history_index"] = history_index
+        for attachment in attachments:
+            attachment["history_index"] = history_index
+        attachment_views = [attachment_view(entry) for entry in attachments]
         # 关闭旧连接后再替换回合，旧连接迟到事件不能推进新消息。
         self._close_rpc()
         if plan_mode:
@@ -222,12 +226,13 @@ class Workflow(CompileFlow, ProgressFlow):
                      review_start=len(state["reviews"]),
                      uncommitted_manifest={}, review_requested=False, commit_message="", delivery_request=None,
                      review_enabled=review_enabled, approval_source="" if plan_mode else "followup", followup={"text": text.strip(), "images": images,
+                         "attachments": attachment_views,
                          "request_id": request_id, "history_index": history_index, "plan_mode": plan_mode, "in_progress": in_progress,
-                         "authorization_hash": sha256(dumps([text.strip(), [image["id"] for image in images]],
+                         "authorization_hash": sha256(dumps([text.strip(), [image["id"] for image in images], [entry["id"] for entry in attachment_views]],
                                                             ensure_ascii=False).encode("utf-8")).hexdigest()})
         request_path = self.store.directory(state["id"]) / f"review-request-{state['delivery_round']}.json"
         request_path.unlink(missing_ok=True)
-        self.note("用户", text.strip(), images=images, request_id=request_id, review_enabled=review_enabled, plan_mode=plan_mode)
+        self.note("用户", text.strip(), images=images, followup_attachments=attachment_views, request_id=request_id, review_enabled=review_enabled, plan_mode=plan_mode)
         self._prepare_followup()
 
     def _prepare_followup(self):
@@ -684,6 +689,7 @@ class Workflow(CompileFlow, ProgressFlow):
         session_path = self.store.directory(state["id"])
         turn_cwd = session_path if phase == "branch" else session_path / "workspace"
         context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"],
+                   "followup_attachments": submitted_followup_attachments(state),
                    "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
                    "answer_attachments": submitted_attachments(state),
                    "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
@@ -771,7 +777,7 @@ class Workflow(CompileFlow, ProgressFlow):
             raise WorkflowError("计划内容与待确认版本不一致。")
         feedback = state.get("followup") or {}
         if (state["snapshot"]["blockers"] and not state["supplement"].strip() and not state.get("supplement_images")
-                and not feedback.get("text") and not feedback.get("images")):
+                and not feedback.get("text") and not feedback.get("images") and not feedback.get("attachments")):
             if source == "auto":
                 return
             raise WorkflowError("存在明确的资料缺失，请先补充必要内容，再确认更新后的计划。")

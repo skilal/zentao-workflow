@@ -61,6 +61,9 @@ def write_authorized(state):
     if state.get("approval_source") == "followup":
         feedback = state["followup"]
         scope = dumps([feedback["text"], [image["id"] for image in feedback["images"]]], ensure_ascii=False)
+        if "attachments" in feedback:
+            scope = dumps([feedback["text"], [image["id"] for image in feedback["images"]],
+                           [entry["id"] for entry in feedback["attachments"]]], ensure_ascii=False)
         return sha256(scope.encode("utf-8")).hexdigest() == feedback.get("authorization_hash")
     plan = state.get("approved_plan", "")
     return bool(plan and sha256(plan.encode("utf-8")).hexdigest() == state.get("approved_hash"))
@@ -87,7 +90,7 @@ def initial_state(item, record_id):
         "plan_round": None, "approval_source": "",
         "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [],
         "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
-        "delivery_round": 1, "deliveries": [], "followup_images": [], "answer_attachments": [],
+        "delivery_round": 1, "deliveries": [], "followup_images": [], "followup_attachments": [], "answer_attachments": [],
     }
     if item is None:
         state["project"] = {"id": 0, "name": "", "candidates": []}

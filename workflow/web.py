@@ -30,6 +30,7 @@ from workflow.zentao import KINDS, ZentaoClient, identifier
 from workflow.user_input import pending_input
 from workflow.pdf_materials import material_files
 from workflow.answer_attachments import answer_request_id, attachment_file, prepare_answer
+from workflow.followup_attachments import attachment_file as followup_attachment_file, inspect_zip, prepare_attachments
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -42,6 +43,7 @@ def public_state(state):
     result = deepcopy(state)
     result.setdefault("supplement_images", [])
     result.setdefault("followup_images", [])
+    result.setdefault("followup_attachments", [])
     result.setdefault("answer_attachments", [])
     if result.get("pending"):
         result["pending"]["attachment_request_id"] = answer_request_id(state)
@@ -407,6 +409,36 @@ class WebApplication:
             runtime.engine.save()
             return self.preview_payload(runtime) if preview_id else self.session_payload(runtime)
 
+    def upload_followup_attachment(self, session_id, revision, name, data):
+        with self.condition:
+            runtime = self._supplement_runtime(session_id, revision, purpose="followup")
+            maximum = self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
+            if (not isinstance(name, str) or not name.strip() or Path(name).suffix.lower() != ".zip"
+                    or not 0 < len(data) <= maximum):
+                raise WorkflowError("请选择 ZIP 文件，单个文件大小不能超过配置的附件上限。")
+            entries = inspect_zip(data)
+            identifier = uuid4().hex
+            path = runtime.engine.store.directory(session_id) / "attachments" / "followup" / f"{identifier}.zip"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            runtime.engine.state.setdefault("followup_attachments", []).append({
+                "id": identifier, "name": name, "size": len(data), "path": str(path), "entries": entries})
+            runtime.engine.save()
+            return self.session_payload(runtime)
+
+    def remove_followup_attachment(self, session_id, revision, attachment_id):
+        with self.condition:
+            runtime = self._supplement_runtime(session_id, revision, purpose="followup")
+            state = runtime.engine.state
+            entries = state.get("followup_attachments", [])
+            entry = next((entry for entry in entries if entry["id"] == attachment_id and "history_index" not in entry), None)
+            if entry is None:
+                raise WorkflowError("附件不在当前待发送消息中。")
+            followup_attachment_file(runtime.engine.store, state, entry).unlink()
+            entries.remove(entry)
+            runtime.engine.save()
+            return self.session_payload(runtime)
+
     def remove_supplement_image(self, session_id, revision, image_id, preview_id=None, purpose="supplement"):
         with self.condition:
             runtime = self._supplement_runtime(session_id, revision, preview_id, purpose)
@@ -730,8 +762,9 @@ class WebApplication:
                 if not isinstance(review_enabled, bool):
                     raise WorkflowError("请明确设置修改后自动 Review 开关。")
                 text = data.get("text", "")
-                images = engine.validate_followup(text, data.get("image_ids", []))
-                operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode)
+                attachments = prepare_attachments(state, data.get("attachment_ids", []))
+                images = engine.validate_followup(text, data.get("image_ids", []), attachments)
+                operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
             elif action == "answer":
                 text = data.get("text", "")
                 answers, attachments = prepare_answer(state, text, data.get("answers"), data.get("attachment_ids"), data.get("answer_request_id"))
@@ -962,6 +995,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._supplement_image(query)
             elif path == "/api/answer-attachments":
                 self._answer_attachment(query)
+            elif path == "/api/followup-attachments":
+                self._followup_attachment(query)
             elif path.startswith("/api/"):
                 self._json(404, {"error": "接口不存在。"})
             else:
@@ -984,7 +1019,8 @@ class WebHandler(BaseHTTPRequestHandler):
             parsed = urlparse(self.path)
             image_upload = parsed.path == "/api/supplement-images"
             answer_upload = parsed.path == "/api/answer-attachments"
-            file_upload = image_upload or answer_upload
+            followup_upload = parsed.path == "/api/followup-attachments"
+            file_upload = image_upload or answer_upload or followup_upload
             length = int(self.headers.get("Content-Length", "0"))
             maximum = application.settings["zentao"]["max_attachment_mb"] * 1024 * 1024 if file_upload else 1024 * 1024
             if not 0 < length <= maximum:
@@ -1000,7 +1036,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 session_id = query.get("session_id", [None])[0]
                 revision = int(query.get("revision", ["-1"])[0])
                 with application.condition:
-                    if answer_upload:
+                    if answer_upload or followup_upload:
                         runtime = application.sessions.get(session_id)
                         runtime.uploads += 1
                     elif preview_id:
@@ -1014,11 +1050,14 @@ class WebHandler(BaseHTTPRequestHandler):
                     if answer_upload:
                         self._json(200, application.upload_answer_attachment(session_id, revision, query.get("answer_request_id", [None])[0],
                             query.get("question_id", [None])[0], query.get("name", [""])[0], data))
+                    elif followup_upload:
+                        self._json(200, application.upload_followup_attachment(session_id, revision,
+                            query.get("name", [""])[0], data))
                     else:
                         self._json(200, application.upload_supplement_image(session_id, revision,
                             query.get("name", [""])[0], data, preview_id, query.get("purpose", ["supplement"])[0]))
                 finally:
-                    if answer_upload or preview_id:
+                    if answer_upload or followup_upload or preview_id:
                         with application.condition:
                             runtime.uploads -= 1
                 return
@@ -1036,6 +1075,8 @@ class WebHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/answer-attachments/remove":
                 self._json(200, application.remove_answer_attachment(data.get("session_id"), data.get("revision"),
                     data.get("answer_request_id"), data.get("question_id"), data.get("attachment_id")))
+            elif self.path == "/api/followup-attachments/remove":
+                self._json(200, application.remove_followup_attachment(data.get("session_id"), data.get("revision"), data.get("attachment_id")))
             elif self.path == "/api/projects":
                 self._json(200, application.add_project(data))
             elif self.path == "/api/sessions/title":
@@ -1114,6 +1155,23 @@ class WebHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         if not entry.get("image"):
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(entry["name"]))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _followup_attachment(self, query):
+        runtime = self.server.application.sessions.get(query.get("session_id", [None])[0])
+        state = runtime.engine.state
+        entry = next((entry for entry in state.get("followup_attachments", [])
+                      if entry["id"] == query.get("attachment_id", [None])[0]), None)
+        if entry is None:
+            raise WorkflowError("附件不在当前会话中。")
+        data = followup_attachment_file(runtime.engine.store, state, entry).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(entry["name"]))
         self.end_headers()
         self.wfile.write(data)
 

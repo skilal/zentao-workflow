@@ -217,6 +217,7 @@ function WorkflowApp() {
   const draftRef = useRef(draft);
   const imageInput = useRef(null);
   const followupImageInput = useRef(null);
+  const followupZipInput = useRef(null);
   const imageQueues = useRef({});
   const [imageTransfers, setImageTransfers] = useState({});
   const [materialsOpen, setMaterialsOpen] = useState(false);
@@ -306,7 +307,7 @@ function WorkflowApp() {
           if (task.purpose === "answer" && current.state.pending?.attachment_request_id !== task.answer_request_id) throw new Error("当前问题已经变化，请重新查看问题。");
           const query = new URLSearchParams({ ...viewAddress(id), revision: current.revision, name: task.name,
             ...(task.purpose === "answer" ? { answer_request_id: task.answer_request_id, question_id: task.question_id } : { purpose: task.purpose }) });
-          const payload = await fetch(`/api/${task.purpose === "answer" ? "answer-attachments" : "supplement-images"}?${query}`, { method: "POST", credentials: "same-origin",
+          const payload = await fetch(`/api/${task.purpose === "answer" ? "answer-attachments" : task.purpose === "followup_zip" ? "followup-attachments" : "supplement-images"}?${query}`, { method: "POST", credentials: "same-origin",
             headers: { "Content-Type": "application/octet-stream", "X-Workflow-Token": csrf.current }, body: task.file }).then(readResponse);
           if (payload.preview_id) receivePreview(payload);
           else if (modelRef.current.sessions[id]) receiveState(payload);
@@ -318,7 +319,7 @@ function WorkflowApp() {
   }
   function addImages(files, purpose = "supplement") {
     const id = modelRef.current.state?.id;
-    if (!id || !(purpose === "followup" ? followupEditable : supplementEditable)) return;
+    if (!id || !(["followup", "followup_zip"].includes(purpose) ? followupEditable : supplementEditable)) return;
     const queue = imageQueues.current[id] ||= { tasks: [], running: false };
     queue.tasks.push(...Array.from(files, file => ({ uid: crypto.randomUUID(), file, name: file.name,
       status: "waiting", error: "", purpose })));
@@ -355,6 +356,17 @@ function WorkflowApp() {
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
         body: JSON.stringify({ session_id: id, revision: viewPayload(id).revision, answer_request_id: entry.request_id,
           question_id: entry.question_id, attachment_id: entry.id }) }).then(readResponse);
+      if (modelRef.current.sessions[id]) receiveState(payload);
+    } catch (error) { notice.error({ message: "移除附件失败", description: error.message }); }
+    finally { setRequestsPending(previous => ({ ...previous, [id]: null })); }
+  }
+  async function removeFollowupFile(entry) {
+    const id = state.id;
+    setRequestsPending(previous => ({ ...previous, [id]: "remove_attachment" }));
+    try {
+      const payload = await fetch("/api/followup-attachments/remove", { method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
+        body: JSON.stringify({ session_id: id, revision: viewPayload(id).revision, attachment_id: entry.id }) }).then(readResponse);
       if (modelRef.current.sessions[id]) receiveState(payload);
     } catch (error) { notice.error({ message: "移除附件失败", description: error.message }); }
     finally { setRequestsPending(previous => ({ ...previous, [id]: null })); }
@@ -689,10 +701,11 @@ function WorkflowApp() {
   async function answer() {
     if (state.can_followup) {
       const images = state.followup_images.filter(image => image.history_index === undefined);
+      const attachments = state.followup_attachments.filter(entry => entry.history_index === undefined);
       if (busy || transfers.length) return;
-      if (!draft.reply.trim() && !images.length) { notice.warning({ message: "请填写消息或添加图片" }); return; }
+      if (!draft.reply.trim() && !images.length && !attachments.length) { notice.warning({ message: "请填写消息、添加图片或上传 ZIP" }); return; }
       const id = state.id;
-      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), plan_mode: draft.plan_mode, review_enabled: draft.review_enabled });
+      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), attachment_ids: attachments.map(entry => entry.id), plan_mode: draft.plan_mode, review_enabled: draft.review_enabled });
       if (result) {
         if (modelRef.current.selectedSessionId === id) changeDraft({ reply: "", answers: {}, plan_mode: false, review_enabled: false });
         else {
@@ -1011,6 +1024,20 @@ function WorkflowApp() {
       h("div", { className: "attachment-name" }, `第 ${page.page} 页 · 已准备供 Codex 读取`)));
   }
 
+  function renderFollowupFiles(entries, editable = false) {
+    return h("div", { className: "attachment-grid" }, entries.map(entry => h("div", { className: "attachment", key: entry.id },
+      h("div", { className: "attachment-name" }, h("a", {
+        href: `/api/followup-attachments?${new URLSearchParams({ session_id: state.id, attachment_id: entry.id })}`, download: entry.name }, entry.name)),
+      h(Typography.Text, { type: "secondary" }, `${(entry.size / 1024).toFixed(1)} KB · 只读取目录与 XML`),
+      h(Collapse, { ghost: true, items: [{ key: "entries", label: "目录与读取状态", children:
+        entry.entries.length ? entry.entries.map(member => h("div", { className: "attachment-name", key: member.member_id },
+          h("div", null, member.name), h(Typography.Text, { type: member.issue ? "warning" : "secondary" },
+            member.directory ? "目录" : `${member.extension.toUpperCase() || "无扩展名"} · ${member.size} 字节 · ${member.issue || (member.readable ? "XML 可读取" : "仅列出文件信息")}`))) :
+          h(Typography.Text, { type: "secondary" }, "空 ZIP，无目录或文件") }] }),
+      editable && h("div", { className: "supplement-image-actions" }, h(Tag, { color: "success" }, "已上传"),
+        h(Button, { size: "small", type: "text", danger: true, disabled: !followupEditable, onClick: () => removeFollowupFile(entry) }, "移除")))));
+  }
+
   function renderAnswerFiles(entries, editable = false, showQuestion = false) {
     return h("div", { className: "attachment-grid" }, entries.map(entry => {
       const url = `/api/answer-attachments?${new URLSearchParams({ session_id: state.id, attachment_id: entry.id })}`;
@@ -1037,7 +1064,7 @@ function WorkflowApp() {
   }
 
   function renderFeedbackTransfers() {
-    return renderFileTransfers(transfers.filter(task => task.purpose === "followup"), followupEditable);
+    return renderFileTransfers(transfers.filter(task => ["followup", "followup_zip"].includes(task.purpose)), followupEditable);
   }
 
   function renderPlan() {
@@ -1097,6 +1124,7 @@ function WorkflowApp() {
                       entry.review_output ? renderReview({ result: entry.review_output }, entry.text, entry.review_error) : h("pre", { className: "review-original" }, entry.text) :
                     entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.display_text || entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup"),
+                entry.followup_attachments?.length > 0 && renderFollowupFiles(entry.followup_attachments),
                 entry.attachments?.length > 0 && renderAnswerFiles(entry.attachments, false, true)))),
             !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
@@ -1142,10 +1170,15 @@ function WorkflowApp() {
                 addImages(event.target.files, "followup"); event.target.value = "";
               } }),
               h(Button, { disabled: !followupEditable, onClick: () => followupImageInput.current.click() }, "上传图片"),
-              h(Typography.Text, { type: "secondary" }, `单张不超过 ${model.settings.max_attachment_mb} MB；可用于提问、说明或反馈问题`)),
+              h("input", { type: "file", ref: followupZipInput, hidden: true, multiple: true, accept: ".zip", onChange: event => {
+                addImages(event.target.files, "followup_zip"); event.target.value = "";
+              } }),
+              h(Button, { disabled: !followupEditable, onClick: () => followupZipInput.current.click() }, "上传 ZIP"),
+              h(Typography.Text, { type: "secondary" }, `单个不超过 ${model.settings.max_attachment_mb} MB；ZIP 只读取目录与 XML，OFD 等文件仅列出信息`)),
             renderFeedbackImages(state.followup_images.filter(image => image.history_index === undefined), followupEditable),
+            renderFollowupFiles(state.followup_attachments.filter(entry => entry.history_index === undefined), followupEditable),
             renderFeedbackTransfers(),
-            transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败图片后再发送。")),
+            transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败附件后再发送。")),
           h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || !answersComplete || answerTransfers.length > 0 || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明")))),
       h("div", { className: "card-stack" },
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
