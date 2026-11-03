@@ -204,7 +204,7 @@ function WorkflowApp() {
   const sending = requestsPending[model?.selectedSessionId || model?.preview?.preview_id || "new"] || requestsPending.new || requestsPending.global || "";
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionFilter, setSessionFilter] = useState("all");
-  const [collapsedProjects, setCollapsedProjects] = useState(() => JSON.parse(sessionStorage.getItem("workflow-collapsed-projects") || "[]"));
+  const [collapsedProjects, setCollapsedProjects] = useState(() => JSON.parse(localStorage.getItem("workflow-collapsed-projects") || "[]"));
   const [dragSessionId, setDragSessionId] = useState(null);
   const [dropProjectId, setDropProjectId] = useState(null);
   const viewEpoch = useRef(0);
@@ -455,7 +455,7 @@ function WorkflowApp() {
   }
   function changeProjectCollapse(keys) {
     setCollapsedProjects(keys);
-    sessionStorage.setItem("workflow-collapsed-projects", JSON.stringify(keys));
+    localStorage.setItem("workflow-collapsed-projects", JSON.stringify(keys));
   }
   function addProjectPartition() {
     let projectId;
