@@ -219,6 +219,7 @@ function WorkflowApp() {
   const followupImageInput = useRef(null);
   const imageQueues = useRef({});
   const [imageTransfers, setImageTransfers] = useState({});
+  const [materialsOpen, setMaterialsOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
   const [diffs, setDiffs] = useState(null);
   const [settingsForm] = Form.useForm();
@@ -575,6 +576,8 @@ function WorkflowApp() {
     return () => window.removeEventListener("pagehide", discardPreview);
   }, []);
 
+  useEffect(() => { setMaterialsOpen(false); }, [model?.selectedSessionId, page]);
+
   const state = model?.state;
   const stage = state?.stage || "";
   const review = state?.reviews?.filter((entry, index) => (entry.delivery_round || 1) === (state.delivery_round || 1) && index >= (state.review_start || 0)).at(-1);
@@ -741,6 +744,35 @@ function WorkflowApp() {
     finally { setRequestsPending(previous => { const next = { ...previous }; delete next.global; return next; }); }
   }
 
+  function renderWorkItemMaterials(snapshot, address) {
+    if (!snapshot) return h(Empty, { description: "本会话暂无已保存的工作项资料" });
+    return h(React.Fragment, null,
+      !snapshot.sources.length && h(Empty, { description: "本会话暂无已保存的工作项资料" }),
+      snapshot.blockers?.length > 0 && h(Alert, { type: "warning", showIcon: true, message: "有待补充的需求资料", description: h("div", null, snapshot.blockers.map((text, index) => h("div", { key: index }, text))), style: { marginBottom: 20 } }),
+      snapshot.sources.map((source, index) => h("div", { className: "source-block", key: `${source.kind}:${source.id}:${index}` },
+        h("div", { className: "source-heading" }, h(Tag, { color: source.selected ? "blue" : "default" }, source.selected || (source.selected == null && index === 0) ? "选中工作项" : "关联资料"), h("strong", null, source.title), h(Typography.Text, { type: "secondary" }, `${TYPE_NAMES[source.kind]} #${source.id}`),
+          source.version != null && h(Tag, null, `关联版本 ${source.version}`)),
+        source.note && h(Typography.Text, { type: "secondary" }, source.note),
+        h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")),
+        h("div", { className: "attachment-grid" }, snapshot.materials.filter(material => source.material_ids.includes(material.file_id)).map(material => {
+          const url = `/api/material?${new URLSearchParams({ ...address, file_id: material.file_id })}`;
+          const fileName = material.title.toLowerCase().endsWith(`.${material.extension}`) ? material.title : `${material.title}.${material.extension}`;
+          return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),
+            h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, fileName)),
+            material.issue && h(Typography.Text, { type: "warning" }, material.issue),
+            renderPdfPages(material, url),
+            material.archive_entries?.map((entry, index) => {
+              const entryUrl = `${url}&entry=${index}`;
+              return h("div", { className: "attachment", key: index },
+                entry.image && h(Image, { src: entryUrl, alt: entry.title, preview: { mask: "查看图片" } }),
+                h("div", { className: "attachment-name" }, entry.path ? h("a", { href: entryUrl }, entry.title) : entry.title),
+                entry.issue && h(Typography.Text, { type: "warning" }, entry.issue), renderPdfPages(entry, entryUrl));
+            }));
+      })))),
+      snapshot.feishu_links?.length > 0 && h(Alert, { type: "info", showIcon: true, message: "飞书文档暂未接入", style: { marginTop: 18 },
+        description: h("div", null, h("p", null, "如果文档中有必要业务规则，请在计划前补充相关内容。"), snapshot.feishu_links.map(url => h("div", { key: url }, h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, url)))) }));
+  }
+
   function renderItems() {
     const rows = model.items.filter(item => (filter === "all" || item.kind === filter) &&
       (!query.trim() || `${item.id} ${item.title}`.toLowerCase().includes(query.trim().toLowerCase())));
@@ -786,30 +818,7 @@ function WorkflowApp() {
             const [kind, id] = key.split(":"); return { kind, id: Number(id) };
           }) }) }, "重新读取资料"), style: { marginBottom: 16 } }),
         !snapshot ? h("div", { className: "empty-area" }, h(Empty, { description: model.busy === "collect" || sending === "collect" ? "正在读取所选工作项的完整资料…" : "勾选工作项后自动读取描述、图片、附件及关联需求" })) :
-          h(React.Fragment, null,
-            snapshot.blockers?.length > 0 && h(Alert, { type: "warning", showIcon: true, message: "有待补充的需求资料", description: h("div", null, snapshot.blockers.map((text, index) => h("div", { key: index }, text))), style: { marginBottom: 20 } }),
-            snapshot.sources.map((source, index) => h("div", { className: "source-block", key: `${source.kind}:${source.id}:${index}` },
-              h("div", { className: "source-heading" }, h(Tag, { color: source.selected ? "blue" : "default" }, source.selected || (source.selected == null && index === 0) ? "选中工作项" : "关联资料"), h("strong", null, source.title), h(Typography.Text, { type: "secondary" }, `${TYPE_NAMES[source.kind]} #${source.id}`),
-                source.version != null && h(Tag, null, `关联版本 ${source.version}`)),
-              source.note && h(Typography.Text, { type: "secondary" }, source.note),
-              h("pre", { className: "description-text" }, plainDescription(source.content) || (source.origin === "task" ? "任务详情未提供关联需求正文，可结合任务描述分析" : "该工作项没有有效描述，请在计划前补充目标和验收标准。")),
-              h("div", { className: "attachment-grid" }, snapshot.materials.filter(material => source.material_ids.includes(material.file_id)).map(material => {
-              const url = `/api/material?${new URLSearchParams({ ...(model.preview ? { preview_id: state.id } : { session: state.id }), file_id: material.file_id })}`;
-               const fileName = material.title.toLowerCase().endsWith(`.${material.extension}`) ? material.title : `${material.title}.${material.extension}`;
-              return h("div", { className: "attachment", key: material.file_id }, material.image && h(Image, { src: url, alt: material.title, preview: { mask: "查看图片" } }),
-                h("div", { className: "attachment-name" }, material.image ? `${material.title} · ${material.file_id}` : h("a", { href: url }, fileName)),
-                material.issue && h(Typography.Text, { type: "warning" }, material.issue),
-                renderPdfPages(material, url),
-                material.archive_entries?.map((entry, index) => {
-                  const entryUrl = `${url}&entry=${index}`;
-                  return h("div", { className: "attachment", key: index },
-                    entry.image && h(Image, { src: entryUrl, alt: entry.title, preview: { mask: "查看图片" } }),
-                    h("div", { className: "attachment-name" }, entry.path ? h("a", { href: entryUrl }, entry.title) : entry.title),
-                    entry.issue && h(Typography.Text, { type: "warning" }, entry.issue), renderPdfPages(entry, entryUrl));
-                }));
-            })))),
-            snapshot.feishu_links?.length > 0 && h(Alert, { type: "info", showIcon: true, message: "飞书文档暂未接入", style: { marginTop: 18 },
-              description: h("div", null, h("p", null, "如果文档中有必要业务规则，请在计划前补充相关内容。"), snapshot.feishu_links.map(url => h("div", { key: url }, h("a", { href: url, target: "_blank", rel: "noopener noreferrer" }, url)))) }))),
+          renderWorkItemMaterials(snapshot, model.preview ? { preview_id: state.id } : { session: state.id })),
       snapshot && renderBranches());
   }
 
@@ -1328,6 +1337,7 @@ function WorkflowApp() {
   const heading = PAGES[page];
   const renderers = { items: renderItems, plan: renderPlan, settings: renderSettings };
   const menuIcons = ["▦", "☷", "⚙"];
+  const hasWorkItemMaterials = page !== "settings" && model.selectedSessionId && state?.id === model.selectedSessionId && sessionItems(state).length > 0;
   const hasProjectInfo = page !== "settings" && selectionMatches;
   const showProjectInfo = hasProjectInfo && !projectInfoHidden;
   const implementationPlanTitle = state?.approval_source === "followup" ? "原需求实施计划" : "实施计划";
@@ -1358,7 +1368,9 @@ function WorkflowApp() {
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h("div", { className: page === "settings" ? "" : "session-workspace" }, page !== "settings" && renderSessions(), h("div", { className: "session-content" },
           page !== "settings" && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
-            h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasProjectInfo && projectInfoHidden &&
+            h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasWorkItemMaterials &&
+              h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
+                onClick: () => setMaterialsOpen(true) }, "工作项资料"), hasProjectInfo && projectInfoHidden &&
               h(Button, { size: "small", "aria-controls": "project-info", "aria-expanded": false, onClick: () => {
                 setProjectInfoHidden(false); sessionStorage.setItem("workflow-project-info-hidden", "false");
               } }, "项目信息"), hasImplementationPlan && implementationPlanHidden &&
@@ -1371,6 +1383,13 @@ function WorkflowApp() {
           h("div", { className: `session-body${showSidebar ? " with-sidebar" : ""}` },
             h("div", { className: "workspace-main" }, renderers[page]()), showSidebar &&
               h("div", { className: "session-sidebar card-stack" }, showProjectInfo && renderProjectInfo(), showImplementationPlan && renderImplementationPlan())))), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
+    h(Drawer, { title: "工作项资料", "aria-label": "工作项资料", placement: "right", width: "min(960px, 100vw)", rootClassName: "materials-drawer",
+      open: Boolean(materialsOpen && hasWorkItemMaterials), onClose: () => setMaterialsOpen(false), destroyOnClose: true },
+      materialsOpen && hasWorkItemMaterials && h("div", { id: "work-item-materials" },
+        h(Typography.Paragraph, { type: "secondary" }, "本会话资料快照"),
+        h(Space, { wrap: true, style: { marginBottom: 16 } }, ...sessionItems(state).map(item =>
+          h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
+        renderWorkItemMaterials(state.snapshot, { session: state.id }))),
     h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
       diffs === null ? h(Spin, null) : h(Collapse, { defaultActiveKey: diffs.map((_, index) => String(index)), items: diffs.map((diff, index) => ({ key: String(index), label: diff.repository,
         children: diff.commit ? h(Typography.Text, { copyable: true }, diff.commit) : h(React.Fragment, null, h("pre", { className: "diff-text" }, diff.stat || "没有已跟踪文件差异"), diff.patch && h("pre", { className: "diff-text" }, diff.patch),
