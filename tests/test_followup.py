@@ -402,6 +402,68 @@ class FollowupChecks(TestCase):
         self.assertEqual(self.state["commit_message"], "")
         self.finish()
 
+    def test_replace_text_can_repair_previous_task_file_and_tracks_it_in_current_delivery(self):
+        path = Path(self.state["repos"][0]["path"])
+        (path / "本机.txt").write_text("本机保留修改\n", encoding="utf-8")
+        self.send("修改保存提示", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮错误代码\n"})
+        self.finish()
+        self.send("修复上轮错误代码", review_enabled=False)
+        tools = Tools(self.state["id"])
+        arguments = {"repository": "前端", "path": "业务.txt", "old": "错误", "new": "正确"}
+        description = next(description for name, description, _ in TOOLS if name == "replace_text")
+        params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
+                  "tool_description": description, "tool_params": arguments}}
+        self.assertTrue(is_controlled_write(self.state, params))
+        tools.call("replace_text", arguments)
+        # 控制器保存内存状态之后，MCP 的独立替换记录仍支持同文件的下一次替换。
+        self.engine.save()
+        tools.call("replace_text", {**arguments, "old": "上轮", "new": "本轮"})
+        self.finish()
+        self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "本轮正确代码\n")
+        self.assertIn("前端/业务.txt", self.state["uncommitted_manifest"])
+        self.assertNotIn("业务.txt", self.state["repos"][0]["preserved_paths"])
+        self.assertIn("本机.txt", self.state["repos"][0]["preserved_paths"])
+        self.assertEqual((path / "本机.txt").read_text(encoding="utf-8"), "本机保留修改\n")
+        self.assertFalse(self.state["review_requested"])
+
+    def test_replace_text_still_rejects_unrelated_and_externally_changed_preserved_files(self):
+        path = Path(self.state["repos"][0]["path"])
+        (path / "本机.txt").write_text("本机保留修改\n", encoding="utf-8")
+        self.send("修改任务文件", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮任务代码\n"})
+        self.finish()
+        (path / "业务.txt").write_text("外部修改后的代码\n", encoding="utf-8")
+        self.send("修复任务文件", review_enabled=False)
+        tools = Tools(self.state["id"])
+        with self.assertRaisesRegex(WorkflowError, "被外部修改"):
+            tools.call("replace_text", {"repository": "前端", "path": "业务.txt", "old": "代码", "new": "修复"})
+        arguments = {"repository": "前端", "path": "本机.txt", "old": "修改", "new": "覆盖"}
+        description = next(description for name, description, _ in TOOLS if name == "replace_text")
+        params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
+                  "tool_description": description, "tool_params": arguments}}
+        self.assertFalse(is_controlled_write(self.state, params))
+        with self.assertRaisesRegex(WorkflowError, "本机保留改动"):
+            tools.call("replace_text", arguments)
+        self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "外部修改后的代码\n")
+
+    def test_replaced_historical_file_can_still_be_explicitly_reviewed_and_committed(self):
+        self.send("修改任务文件", review_enabled=False)
+        Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "上轮错误代码\n"})
+        self.finish()
+        self.send("修复错误并重新 Review 提交", review_enabled=False)
+        tools = Tools(self.state["id"])
+        tools.call("replace_text", {"repository": "前端", "path": "业务.txt", "old": "错误", "new": "正确"})
+        tools.call("request_review", {"instruction": "修复错误并重新 Review 提交", "commit_message": "修复历史代码",
+                   "include_paths": [{"repository": "前端", "path": "业务.txt"}]})
+        self.complete("已修复并登记请求。")
+        self.assertEqual(self.state["phase"], "review")
+        self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        path = Path(self.state["repos"][0]["path"])
+        self.assertEqual(git(path, "show", "HEAD:业务.txt"), "上轮正确代码")
+        self.assertEqual(git(path, "log", "-1", "--format=%s"), "修复历史代码")
+
     def test_rolled_back_delivery_can_be_reviewed_and_recommitted(self):
         for mode in ("--mixed", "--soft"):
             with self.subTest(mode=mode):

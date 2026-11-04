@@ -15,7 +15,7 @@ from workflow.baseline import BaselineFlow
 from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
 from workflow.context import context_hash, requirement_context
-from workflow.delivery import validate_review_request
+from workflow.delivery import apply_followup_replacements, validate_review_request
 from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
 from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
@@ -185,6 +185,7 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
 
     def followup(self, text, images, request_id, review_enabled, plan_mode=False, attachments=()):
         state = self.state
+        apply_followup_replacements(self.store, state)
         in_progress = state["phase"] != "complete"
         number = state.get("delivery_round", 1)
         archived = {key: deepcopy(state.get(key)) for key in
@@ -233,6 +234,8 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
                                                             ensure_ascii=False).encode("utf-8")).hexdigest()})
         request_path = self.store.directory(state["id"]) / f"review-request-{state['delivery_round']}.json"
         request_path.unlink(missing_ok=True)
+        replacement_path = self.store.directory(state["id"]) / f"followup-replacements-{state['delivery_round']}.json"
+        replacement_path.unlink(missing_ok=True)
         self.note("用户", text.strip(), images=images, followup_attachments=attachment_views, request_id=request_id, review_enabled=review_enabled, plan_mode=plan_mode)
         self._prepare_followup()
 
@@ -264,6 +267,8 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
                          "未完成会话须结合 continuation_context，继续完成原目标及本次补充，保留已有代码。"
                          "本次计划模式已关闭，不自行切换计划模式；范围不明确或需要重新计划时提问等待用户决定。"
                          "本轮首次修改不占用 Review 后修复次数。Review 是否执行由控制器根据 review_enabled 和代码差异决定，"
+                         "用户要求修复上轮代码时，可用 replace_text 修改 previous_task_changes 中 unchanged=true 的任务文件，"
+                         "控制器会将实际替换文件纳入本轮；其他本机保留文件仍禁止修改。"
                          "用户明确要求重新 Review、提交或重新提交时，先调用 workflow.request_review 登记请求，"
                          "引用用户原话；需纳入的历史任务文件从 task_context.previous_task_changes 选择，"
                          "先核对当前差异与本次任务范围；范围明确时直接登记，不因 unchanged 为 false 重复要求确认提交。"
@@ -287,7 +292,7 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
         for repository in state["repos"]:
             included = {entry["path"] for entry in request["include_paths"] if entry["repository"] == repository["name"]}
             repository["preserved_paths"] = [value for value in repository.get("preserved_paths", []) if value not in included]
-            repository["adopted_paths"] = sorted(included)
+            repository["adopted_paths"] = sorted({*repository.get("adopted_paths", []), *included})
         state.update(review_requested=True, commit_message=request["commit_message"], delivery_request=request)
         self.save()
         self.note("控制器", "已接收本轮明确的审查提交请求，将重新 Review，通过后本地提交。")
@@ -1175,6 +1180,7 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
             return
         if turn.get("id") and state.get("turn_id") and turn["id"] != state["turn_id"]:
             return
+        apply_followup_replacements(self.store, state)
         self.set_progress_status("waiting" if state.get("pending") else
                              {"completed": "completed", "interrupted": "interrupted"}.get(turn.get("status"), "failed"))
         if state.get("pause_requested"):

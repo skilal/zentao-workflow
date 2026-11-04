@@ -1,6 +1,7 @@
 """仅提供工作区文件和需求资料工具的本地 STDIO MCP。"""
 
 from fnmatch import fnmatch
+from hashlib import sha256
 from json import dumps, loads
 from os import scandir
 from pathlib import Path
@@ -10,7 +11,7 @@ from workflow.compile_checks import compile_context
 from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
 from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
-from workflow.delivery import previous_task_changes, validate_review_request
+from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, safe_file
 from workflow.settings import WorkflowError
 from workflow.store import SessionStore, write_authorized
@@ -224,8 +225,18 @@ class Tools:
                     or checks[-1]["status"] != "repairing" or repository["name"] != checks[-1].get("repair_repository")
                     or Path(relative).as_posix() not in checks[-1].get("repair_paths", [])):
                 raise WorkflowError("编译修复只能修改控制器授权的本次错误文件。")
-        if path.relative_to(Path(repository["path"]).resolve()).as_posix().casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
-            raise WorkflowError("该文件包含任务开始前的本机保留改动，不会自动修改或提交；需要修改时请先取得用户明确指示。")
+        relative = path.relative_to(Path(repository["path"]).resolve()).as_posix()
+        replacement_path = None
+        if relative.casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
+            candidate = next((entry for entry in previous_task_changes(state)
+                              if entry["repository"] == repository["name"] and entry["path"] == relative), None) if (
+                name == "replace_text" and state["phase"] == "followup" and state.get("approval_source") == "followup") else None
+            if candidate is None:
+                raise WorkflowError("该文件包含任务开始前的本机保留改动，不会自动修改或提交；需要修改时请先取得用户明确指示。")
+            replacement_path, replacements = followup_replacements(self.store, state)
+            recorded = replacements["files"].get(repository["name"], {}).get(relative)
+            if not candidate["unchanged"] and sha256(path.read_bytes()).hexdigest() != recorded:
+                raise WorkflowError("该历史任务文件已在上轮交付后被外部修改，未自动覆盖；请先明确确认这些改动。")
         if path.name.casefold() in ("agents.md", "claude.md", "qwen.md"):
             raise WorkflowError("工作流不允许通过修改项目指令文件扩大执行权限。")
         if name == "delete_file":
@@ -252,6 +263,11 @@ class Tools:
             raise WorkflowError("写入内容超出单文件上限。")
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="")
+        if replacement_path is not None:
+            replacements["files"].setdefault(repository["name"], {})[relative] = sha256(path.read_bytes()).hexdigest()
+            temporary = replacement_path.with_suffix(".json.tmp")
+            temporary.write_text(dumps(replacements, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(replacement_path)
         return "文件已保存，仅允许静态检查。"
 
     def read_request(self, repositories, arguments):

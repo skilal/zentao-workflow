@@ -2,6 +2,7 @@
 
 from pathlib import Path
 
+from workflow.delivery import previous_task_changes
 from workflow.gitops import safe_file
 from workflow.mcp_server import SKIP, TOOLS
 from workflow.settings import WorkflowError
@@ -53,6 +54,10 @@ def is_controlled_write(state, params):
         path = safe_file(repository, relative)
     except WorkflowError:
         return False
-    if path.relative_to(Path(repository["path"]).resolve()).as_posix().casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
-        return False
+    relative = path.relative_to(Path(repository["path"]).resolve()).as_posix()
+    if relative.casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
+        return (tool[0] == "replace_text" and state["phase"] == "followup"
+                and state.get("approval_source") == "followup"
+                and any(entry["repository"] == repository["name"] and entry["path"] == relative
+                        for entry in previous_task_changes(state)))
     return True

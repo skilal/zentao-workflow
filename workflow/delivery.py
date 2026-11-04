@@ -1,8 +1,10 @@
 """续聊中显式审查提交请求的范围校验，不执行 Git 提交。"""
 
+from hashlib import sha256
+from json import loads
 from pathlib import Path
 
-from workflow.gitops import manifest
+from workflow.gitops import manifest, safe_file
 from workflow.settings import WorkflowError
 from workflow.store import write_authorized
 
@@ -36,6 +38,46 @@ def previous_task_changes(state):
     return candidates
 
 
+def followup_replacements(store, state):
+    """替换记录独立落盘，避免 MCP 子进程更新被控制器内存状态覆盖。"""
+    followup = state["followup"]
+    path = store.directory(state["id"]) / f"followup-replacements-{state['delivery_round']}.json"
+    if not path.exists():
+        return path, {"request_id": followup["request_id"],
+                      "authorization_hash": followup["authorization_hash"], "files": {}}
+    record = loads(path.read_text(encoding="utf-8"))
+    if (record["request_id"] != followup["request_id"]
+            or record["authorization_hash"] != followup["authorization_hash"]):
+        raise WorkflowError("历史任务文件替换记录不属于本轮授权，已停止。")
+    return path, record
+
+
+def apply_followup_replacements(store, state):
+    if state["phase"] != "followup":
+        return
+    path = store.directory(state["id"]) / f"followup-replacements-{state['delivery_round']}.json"
+    if not path.exists():
+        return
+    _, record = followup_replacements(store, state)
+    if not record["files"]:
+        return
+    candidates = {(entry["repository"], entry["path"]) for entry in previous_task_changes(state)}
+    adopted = []
+    for repository in state["repos"]:
+        for relative, digest in record["files"].get(repository["name"], {}).items():
+            if relative in repository.get("adopted_paths", []):
+                continue
+            if (repository["name"], relative) not in candidates:
+                raise WorkflowError("替换文件不属于本会话可追溯的历史任务改动，已停止。")
+            path = safe_file(repository, relative)
+            if not path.is_file() or sha256(path.read_bytes()).hexdigest() != digest:
+                raise WorkflowError("历史任务文件在替换后发生变化，请人工核对后继续。")
+            adopted.append((repository, relative))
+    for repository, relative in adopted:
+        repository["preserved_paths"] = [value for value in repository["preserved_paths"] if value != relative]
+        repository["adopted_paths"] = sorted({*repository.get("adopted_paths", []), relative})
+
+
 def validate_review_request(state, arguments):
     if (state["phase"] != "followup" or state["stage"] != "续聊处理中"
             or state.get("approval_source") != "followup" or not write_authorized(state)):
@@ -53,6 +95,8 @@ def validate_review_request(state, arguments):
     if not isinstance(paths, list):
         raise WorkflowError("请明确提供需要纳入审查的历史任务文件清单。")
     candidates = {(entry["repository"], entry["path"]) for entry in previous_task_changes(state)}
+    candidates.update((repository["name"], relative) for repository in state["repos"]
+                      for relative in repository.get("adopted_paths", []))
     selected = set()
     for entry in paths:
         if (not isinstance(entry, dict) or set(entry) != {"repository", "path"}
