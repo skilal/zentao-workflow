@@ -143,6 +143,7 @@ class Tools:
                     "followup_attachments": submitted_followup_attachments(state),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                     "continuation_context": state.get("continuation_context"),
+                    "baseline_change": (state.get("baseline_changes") or [None])[-1],
                     "review_enabled": state.get("review_enabled", True),
                     "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
                     "compile_check": state.get("compile_check", {"enabled": False}),

@@ -656,7 +656,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "answer"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
@@ -765,6 +765,15 @@ class WebApplication:
                 attachments = prepare_attachments(state, data.get("attachment_ids", []))
                 images = engine.validate_followup(text, data.get("image_ids", []), attachments)
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
+            elif action == "preview_baseline":
+                operation, arguments = engine.change_baseline, ()
+            elif action == "confirm_baseline":
+                token = data.get("token")
+                if not isinstance(token, str) or not token:
+                    raise WorkflowError("请明确确认页面展示的审查基线预览。")
+                operation, arguments = engine.change_baseline, (token,)
+            elif action == "cancel_baseline":
+                operation, arguments = engine.cancel_baseline_change, ()
             elif action == "answer":
                 text = data.get("text", "")
                 answers, attachments = prepare_answer(state, text, data.get("answers"), data.get("attachment_ids"), data.get("answer_request_id"))

@@ -57,12 +57,29 @@ class BranchActionChecks(TestCase):
         choose.assert_called_once_with(choices)
 
     def test_branch_and_project_decisions_reject_stale_revision_or_wrong_session(self):
-        for action in ("plan", "edit_branches", "choose_branches", "confirm_project", "smart_checkout", "checkout_resolved"):
+        for action in ("plan", "edit_branches", "choose_branches", "confirm_project", "smart_checkout", "checkout_resolved",
+                       "preview_baseline", "confirm_baseline", "cancel_baseline"):
             with self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request(action, revision=-1))
             with self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request(action, session_id="其他会话"))
         self.runtime.engine.submit.assert_not_called()
+
+    def test_baseline_actions_require_explicit_preview_token_and_deduplicate(self):
+        operation = self.runtime.engine.change_baseline = Mock()
+        self.application.dispatch(self.request("preview_baseline"))
+        operation.assert_called_once_with()
+        for token in (None, False, [], ""):
+            with self.subTest(token=token), self.assertRaises(WorkflowError):
+                self.application.dispatch(self.request("confirm_baseline", {"token": token}))
+        request = self.request("confirm_baseline", {"token": "人工确认的预览"})
+        self.application.dispatch(request)
+        self.assertTrue(self.application.dispatch(request)["duplicate"])
+        self.assertEqual(operation.call_count, 2)
+        operation.assert_called_with("人工确认的预览")
+        cancel = self.runtime.engine.cancel_baseline_change = Mock()
+        self.application.dispatch(self.request("cancel_baseline"))
+        cancel.assert_called_once_with()
 
     def test_smart_checkout_requires_explicit_files_and_deduplicates_requests(self):
         operation = self.runtime.engine.smart_checkout = Mock()

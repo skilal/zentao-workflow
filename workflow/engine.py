@@ -11,6 +11,7 @@ from threading import Lock, RLock
 from workflow.approvals import is_controlled_write
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
+from workflow.baseline import BaselineFlow
 from workflow.compile_flow import CompileFlow
 from workflow.compile_checks import compile_context
 from workflow.context import context_hash, requirement_context
@@ -89,7 +90,7 @@ def skipped_review_ids(state, delivery_round):
     return skipped
 
 
-class Workflow(CompileFlow, ProgressFlow):
+class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
         self.emit = emit
@@ -697,6 +698,7 @@ class Workflow(CompileFlow, ProgressFlow):
                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                    "continuation_context": state.get("continuation_context"),
+                   "baseline_change": (state.get("baseline_changes") or [None])[-1],
                    "review_enabled": state.get("review_enabled", True),
                    "compile_check": state.get("compile_check", {"enabled": False}),
                    "compile_checks": compile_context(state),
@@ -875,6 +877,7 @@ class Workflow(CompileFlow, ProgressFlow):
     def _begin_review(self):
         state = self.state
         self._guard_compile()
+        state.pop("baseline_review_pending", None)
         state["review_manifest"] = manifest(state["repos"])
         state["phase"] = "review"
         prompt = (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip()
@@ -1051,7 +1054,10 @@ class Workflow(CompileFlow, ProgressFlow):
             return
         if state["phase"] == "review":
             # 恢复动作只重新审查；上次结果不能在重启后直接触发提交。
-            self._begin_review()
+            if state.get("baseline_review_pending"):
+                self._before_review()
+            else:
+                self._begin_review()
             return
         if state["phase"] == "branch":
             self._resolve_branches()

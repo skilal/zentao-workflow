@@ -1184,10 +1184,29 @@ function WorkflowApp() {
         h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
           h(Button, { block: true, disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
+          h(Button, { block: true, disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Object.keys(state.commits || {}).length > 0 ||
+            !["已暂停", "已停止", "等待计划确认", "等待计划补充", "等待修复选择", "等待编译选择"].includes(stage),
+            onClick: () => act("preview_baseline") }, "变更审查基线"),
           h(Button, { block: true, disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
             "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。需要澄清时等待明确回答；审查通过后仅本地 commit，不 push。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
+        state.baseline_change_request && h(CardBox, { title: "确认变更审查基线" },
+          h(Alert, { type: "warning", showIcon: true, message: "将当前 HEAD 设为本轮新基线", description:
+            "原线程、聊天、计划、附件和历史记录保留，确认前备份完整会话。旧基线下的审查及检查结论失效；新基线之前的已提交代码将移出本轮审查范围。工作区、暂存区和本机保留文件不变。" }),
+          state.baseline_change_request.repositories.map(repo => h("div", { key: repo.name, style: { marginTop: 16 } },
+            h(Typography.Text, { strong: true }, `${repo.name} · ${repo.branch} · ${repo.relationship}`),
+            h(Descriptions, { column: 1, size: "small", items: [
+              { key: "old", label: "旧基线", children: h(Typography.Text, { code: true, copyable: true }, repo.previous) },
+              { key: "new", label: "新基线", children: h(Typography.Text, { code: true, copyable: true }, repo.current) },
+              { key: "path", label: "工作目录", children: h(Typography.Text, { copyable: true }, repo.path) },
+              { key: "remaining", label: "保留的本轮差异", children: repo.remaining_paths.length ? repo.remaining_paths.join("、") : "无未提交任务文件" },
+              { key: "preserved", label: "本机保留文件", children: `${repo.preserved_paths.length} 个，继续排除` }] }),
+            repo.stat && h(Collapse, { ghost: true, items: [{ key: "stat", label: "将移出或改变本轮审查范围的提交差异", children: h("pre", { className: "review-original" }, repo.stat) }] }))),
+          h("div", { className: "action-bar" },
+            h(Button, { disabled: busy, onClick: () => act("cancel_baseline") }, "取消变更"),
+            h(Button, { disabled: busy, onClick: () => act("preview_baseline") }, "重新预览"),
+            h(Button, { type: "primary", disabled: busy, onClick: () => act("confirm_baseline", { token: state.baseline_change_request.token }) }, "确认变更并保留会话"))),
         Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
         state.deliveries.length > 0 && h(CardBox, { title: "历史交付记录" }, h(Collapse, { ghost: true, items: state.deliveries.map(delivery => ({
           key: delivery.number, label: `第 ${delivery.number} 轮交付 · ${timeLabel(delivery.completed_at)}${typeof delivery.review_enabled === "boolean" ? ` · 自动 Review ${delivery.review_enabled ? "开启" : "关闭"}` : ""}${delivery.stage ? ` · ${delivery.stage}` : ""}`,
@@ -1204,7 +1223,7 @@ function WorkflowApp() {
     return h(CardBox, { title: "后端编译检查", extra: h(Tag, null, state.compile_check?.enabled ? "已开启" : "已关闭") },
       checks.length === 0 ? h(Typography.Text, { type: "secondary" }, state.compile_check?.enabled ? "实施或修复完成后，按模块检查有任务改动的后端；前端继续参与 Review。" : "本会话不自动执行后端编译检查。") :
         h(Collapse, { defaultActiveKey: [latest.id], key: latest.id, ghost: true, items: checks.map((batch, index) => ({
-          key: batch.id, label: `第 ${index + 1} 次检查 · 第 ${batch.delivery_round} 轮交付 · 自动修复 ${batch.fix_round}/${batch.limit}`,
+          key: batch.id, label: `第 ${index + 1} 次检查 · 第 ${batch.delivery_round} 轮交付 · 自动修复 ${batch.fix_round}/${batch.limit}${batch.status === "invalidated" ? " · 基线已变更，结论已失效" : ""}`,
           children: h(Space, { direction: "vertical", style: { width: "100%" } }, batch.repositories.length === 0 && "没有需要编译的后端任务改动，前端仍按原流程参与 Review。",
             batch.repositories.map(entry => {
               const current = state.repos.some(repo => repo.name === entry.name && repo.role === "backend") &&
