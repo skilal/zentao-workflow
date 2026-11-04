@@ -45,6 +45,15 @@ function stepOf(state) {
   return 0;
 }
 function CardBox(props) { return h(Card, { className: "app-card", ...props }, props.children); }
+function DetailSection({ title, summary, children, defaultOpen = false, expansionKey = "", className = "" }) {
+  const [expanded, setExpanded] = useState(defaultOpen);
+  useEffect(() => { setExpanded(defaultOpen); }, [expansionKey, defaultOpen]);
+  return h(Collapse, { className: `app-card detail-section ${className}`, size: "small",
+    activeKey: expanded ? ["details"] : [], onChange: keys => setExpanded(keys.includes("details")),
+    items: [{ key: "details", label: h("div", { className: "detail-section-heading" },
+      h("span", { className: "detail-section-title" }, title),
+      summary && h("div", { className: "detail-section-summary" }, summary)), children }] });
+}
 const Markdown = React.memo(function Markdown({ text }) {
   const source = String(text || "").replace(/<\/?proposed_plan>/g, "");
   const html = DOMPurify.sanitize(marked.parse(source, { gfm: true, breaks: false }), {
@@ -914,7 +923,7 @@ function WorkflowApp() {
           onClick: () => act("approve_plan", { plan_hash: state.plan_hash }) }, "确认当前计划并实施")));
   }
 
-  function renderBranches() {
+  function renderBranches({ compact = false } = {}) {
     const transfers = (imageTransfers[state.id] || []).filter(task => task.purpose === "supplement");
     const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy;
     const repositories = state.branch_resolution?.repositories || [];
@@ -958,10 +967,12 @@ function WorkflowApp() {
       ACTIVE.has(stage) && state.phase === "branch" &&
       h(CardBox, { title: "项目与分支操作" },
         h(Space, null, h(Spin, { size: "small" }), stage)),
-      detailRepositories.length > 0 && h("div", { className: "repository-grid" }, detailRepositories.map(repository => {
+      detailRepositories.length > 0 && h("div", { className: compact ? "card-stack" : "repository-grid" }, detailRepositories.map(repository => {
         const entry = repositories.find(entry => entry.role === repository.role);
         const workspace = state.repos.find(entry => entry.name === repository.name);
-        return h(CardBox, { className: "app-card repository-card", key: repository.name,
+        const folded = compact && Boolean(workspace);
+        return h(folded ? DetailSection : CardBox, { className: folded ? "repository-details" : "app-card repository-card",
+          ...(folded ? { summary: workspace.branch } : {}), key: repository.name,
           title: `${repository.name}分支与工作区` },
           (entry?.reason || workspace) && h("p", { className: "muted" }, entry?.reason || "沿用当前会话已创建工作区的分支。"),
           entry?.question && h(Alert, { type: "warning", showIcon: true, message: entry.question }),
@@ -1100,7 +1111,7 @@ function WorkflowApp() {
       ...(state.progress_turns || []).map(turn => ({ process: turn, index: turn.history_index }))]
       .filter(entry => entry.role !== "控制器" || entry.display_text).sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
     const processRunning = state.progress_turns?.at(-1)?.status === "running";
-    return h("div", { className: "conversation-grid" },
+    return h("div", { className: "card-stack conversation-layout", key: state.id },
       h(Modal, { title: "变更仓库目录与审查基线", open: baselineDirectoriesOpen,
         onCancel: () => setBaselineDirectoriesOpen(false), footer: h(Space, null,
           h(Button, { disabled: busy, onClick: () => setBaselineDirectoriesOpen(false) }, "取消"),
@@ -1116,7 +1127,6 @@ function WorkflowApp() {
             h(Input, { "aria-label": `${repo.name}仓库目录`, disabled: busy,
               value: draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path,
               onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) }))))),
-      h("div", { className: "card-stack" },
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
@@ -1196,16 +1206,13 @@ function WorkflowApp() {
             renderFeedbackTransfers(),
             transfers.some(task => task.status === "error") && h(Typography.Text, { type: "warning" }, "请重试或移除失败附件后再发送。")),
           h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: !canAnswer || !answersComplete || answerTransfers.length > 0 || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明"))),
-        renderBranches(),
-        renderCompileChecks()),
-      h("div", { className: "card-stack" },
-        h(CardBox, { title: "流程操作" }, h(Space, { direction: "vertical", style: { width: "100%" } },
-          h(Button, { block: true, disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
-          h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
-          h(Button, { block: true, disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Object.keys(state.commits || {}).length > 0 ||
+        h(CardBox, { title: "流程操作" }, h(Space, { wrap: true },
+          h(Button, { disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
+          h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
+          h(Button, { disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Object.keys(state.commits || {}).length > 0 ||
             !["已暂停", "已停止", "等待计划确认", "等待计划补充", "等待修复选择", "等待编译选择"].includes(stage),
             onClick: () => setBaselineDirectoriesOpen(true) }, "变更目录与审查基线"),
-          h(Button, { block: true, disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
+          h(Button, { disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
             "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。需要澄清时等待明确回答；审查通过后仅本地 commit，不 push。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
@@ -1228,23 +1235,26 @@ function WorkflowApp() {
             h(Button, { disabled: busy, onClick: () => act("cancel_baseline") }, "取消变更"),
             h(Button, { disabled: busy, onClick: () => setBaselineDirectoriesOpen(true) }, "重新预览"),
             h(Button, { type: "primary", disabled: busy, onClick: () => act("confirm_baseline", { token: state.baseline_change_request.token }) }, "确认变更并保留会话"))),
-        Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
-        state.deliveries.length > 0 && h(CardBox, { title: "历史交付记录" }, h(Collapse, { ghost: true, items: state.deliveries.map(delivery => ({
+        renderCompileChecks(),
+        renderBranches({ compact: true }),
+        Object.keys(state.commits || {}).length > 0 && h(DetailSection, { title: "本地提交记录", summary: `${Object.keys(state.commits).length} 个仓库` }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
+        state.deliveries.length > 0 && h(DetailSection, { title: "历史交付记录", summary: `${state.deliveries.length} 轮交付` }, h(Collapse, { ghost: true, items: [...state.deliveries].reverse().map(delivery => ({
           key: delivery.number, label: `第 ${delivery.number} 轮交付 · ${timeLabel(delivery.completed_at)}${typeof delivery.review_enabled === "boolean" ? ` · 自动 Review ${delivery.review_enabled ? "开启" : "关闭"}` : ""}${delivery.stage ? ` · ${delivery.stage}` : ""}`,
           children: h(Descriptions, { column: 1, items: Object.entries(delivery.commits).map(([name, sha]) => ({ key: name, label: name,
             children: h(Typography.Text, { code: true, copyable: true }, sha) })) })
-        })) }))));
+        })) })));
   }
 
   function renderCompileChecks() {
     const checks = state.compile_checks || [];
     const latest = checks.at(-1);
     const statusNames = { pending: "等待检查", running: "正在检查", passed: "通过", skipped: "人工跳过",
-      dependencies: "缺少依赖", blocked: "需要人工处理", code_error: "代码错误", excluded: "不再检查" };
-    return h(CardBox, { title: "后端编译检查", extra: h(Tag, null, state.compile_check?.enabled ? "已开启" : "已关闭") },
-      checks.length === 0 ? h(Typography.Text, { type: "secondary" }, state.compile_check?.enabled ? "实施或修复完成后，按模块检查有任务改动的后端；前端继续参与 Review。" : "本会话不自动执行后端编译检查。") :
-        h(Collapse, { defaultActiveKey: [latest.id], key: latest.id, ghost: true, items: checks.map((batch, index) => ({
-          key: batch.id, label: `第 ${index + 1} 次检查 · 第 ${batch.delivery_round} 轮交付 · 自动修复 ${batch.fix_round}/${batch.limit}${batch.status === "invalidated" ? " · 基线已变更，结论已失效" : ""}`,
+      dependencies: "缺少依赖", blocked: "需要人工处理", code_error: "代码错误", excluded: "不再检查",
+      waiting: "等待处理", repairing: "正在修复", analyzing: "正在分析", complete: "检查完成", invalidated: "结论已失效" };
+    const items = checks.map((batch, index) => ({
+          key: batch.id, label: h(Space, { size: "small", wrap: true },
+            `第 ${index + 1} 次检查 · 第 ${batch.delivery_round} 轮交付 · 自动修复 ${batch.fix_round}/${batch.limit}`,
+            h(Tag, null, statusNames[batch.status])),
           children: h(Space, { direction: "vertical", style: { width: "100%" } }, batch.repositories.length === 0 && "没有需要编译的后端任务改动，前端仍按原流程参与 Review。",
             batch.repositories.map(entry => {
               const current = state.repos.some(repo => repo.name === entry.name && repo.role === "backend") &&
@@ -1275,7 +1285,21 @@ function WorkflowApp() {
                   entry.status === "code_error" && batch.fix_round >= batch.limit && h(Button, { disabled: busy, onClick: () => choose("add_round") }, "追加一轮编译修复"),
                   h(Button, { disabled: busy, onClick: () => choose("pause") }, "暂停")));
             })),
-        })) }));
+        }));
+    const active = latest?.delivery_round === state.delivery_round && ["running", "waiting", "repairing", "analyzing"].includes(latest.status);
+    const result = latest?.status === "complete" ? [...new Set(latest.repositories.filter(entry => entry.status !== "excluded")
+      .map(entry => statusNames[entry.status]))].join("、") || "无需检查" : latest ? statusNames[latest.status] : "尚无记录";
+    return h(DetailSection, { title: "后端编译检查", className: "compile-checks",
+      summary: h(Space, { size: "small", wrap: true }, h(Tag, null, state.compile_check?.enabled ? "已开启" : "已关闭"),
+        h(Tag, { color: active ? latest.status === "waiting" ? "gold" : "processing" : latest?.status === "complete" ? "success" : "default" }, result),
+        checks.length > 0 && h("span", null, `${checks.length} 次检查`)),
+      defaultOpen: active, expansionKey: latest ? `${latest.id}:${latest.status}:${latest.fix_round}` : "empty" },
+      latest ? h(React.Fragment, null,
+        h("div", { className: "compile-current" }, h("div", { className: "compile-batch-summary" }, items.at(-1).label), items.at(-1).children),
+        checks.length > 1 && h(Collapse, { className: "compile-history", size: "small", ghost: true,
+          items: [{ key: "history", label: `历史检查记录（${checks.length - 1} 次）`,
+            children: h(Collapse, { size: "small", ghost: true, items: items.slice(0, -1).reverse() }) }] })) :
+        h(Typography.Text, { type: "secondary" }, state.compile_check?.enabled ? "实施或修复完成后，按模块检查有任务改动的后端；前端继续参与 Review。" : "本会话不自动执行后端编译检查。"));
   }
 
   function renderReview(entry, originalText, validationError = "") {

@@ -75,6 +75,10 @@ def check():
             page.reload()
             expect(download).to_be_visible()
             download.click()
+            compile_header = page.locator(".compile-checks > .ant-collapse-item > .ant-collapse-header")
+            expect(compile_header.get_by_text("通过", exact=True)).to_be_visible()
+            expect(compile_header).to_have_attribute("aria-expanded", "false")
+            compile_header.click()
             expect(page.get_by_text("编译检查通过。", exact=True)).to_be_visible()
             assert runner.call_count == 1
             assert runner.call_args.args[2] is True

@@ -21,6 +21,10 @@ const { chromium } = require(path.join(modules, "playwright"));
     await page.getByRole("button", { name: "补齐依赖并重新检查（允许下载）", exact: true }).waitFor();
     await page.screenshot({ path: screenshot, fullPage: true });
     await page.getByRole("button", { name: "补齐依赖并重新检查（允许下载）", exact: true }).click();
+    const compileHeader = page.locator(".compile-checks > .ant-collapse-item > .ant-collapse-header");
+    await compileHeader.getByText("通过", { exact: true }).waitFor();
+    assert.equal(await compileHeader.getAttribute("aria-expanded"), "false");
+    await compileHeader.click();
     await page.getByText("编译检查通过。", { exact: true }).waitFor();
     assert.equal(await page.getByRole("button", { name: "补齐依赖并重新检查（允许下载）", exact: true }).count(), 0);
     // 通过现有会话列表选择，避免依赖页面内部模型字段。
