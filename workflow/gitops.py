@@ -177,7 +177,8 @@ def prepare(repository, destination, branch, base, create, track=False):
 def workspace_claims(sessions, excluded_session):
     return {str(Path(repository["path"]).resolve()).casefold(): session["id"]
             for session in sessions if session["id"] != excluded_session and session["phase"] != "complete"
-            for repository in session["repos"]}
+            for repository in [*session["repos"], *(repo for repo in session.get("retired_repos", [])
+                                                   if repo.get("workspace_owned", True))]}
 
 
 def switch_branch(path, selection, baseline):

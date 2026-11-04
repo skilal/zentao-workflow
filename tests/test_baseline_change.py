@@ -8,7 +8,8 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from workflow.engine import Workflow
-from workflow.gitops import git
+from workflow.gitops import cleanup_workspaces, git, workspace_claims
+from workflow.store import session_repositories
 from workflow.settings import ROOT, WorkflowError
 
 
@@ -47,7 +48,7 @@ class BaselineChangeChecks(TestCase):
             git(path, "add", "本机.txt")
             self.state["repos"].append({"name": role, "role": role, "path": str(path),
                 "source": str(path), "branch": "项目分支", "baseline": baseline,
-                "preserved_paths": ["本机.txt"]})
+                "workspace_owned": False, "preserved_paths": ["本机.txt"]})
         self.state["history"] = [{"role": "用户", "text": "原始需求及回答"}]
         self.state["reviews"] = [{"number": 1, "result": {"findings": []}}]
         self.state["decisions"] = [{"round": 1, "fix_ids": ["R01-01"]}]
@@ -172,3 +173,133 @@ class BaselineChangeChecks(TestCase):
             with self.assertRaises(OSError):
                 self.engine.change_baseline(token)
         self.assertEqual(self.state, old)
+
+    def relocation_targets(self):
+        targets = {}
+        for repo in self.state["repos"]:
+            path = self.root / (repo["role"] + "-2")
+            git(self.root, "clone", "--local", repo["path"], str(path))
+            (path / "本机.txt").write_text("新目录本机改动", encoding="utf-8")
+            git(path, "add", "本机.txt")
+            targets[repo["name"]] = str(path)
+        return targets
+
+    def test_relocation_accepts_original_detached_head_and_preserves_both_directories(self):
+        targets = self.relocation_targets()
+        old = deepcopy(self.state["repos"])
+        self.state["selections"] = [{"name": repo["name"], "path": repo["path"], "create": False}
+                                    for repo in old]
+        git(old[0]["path"], "switch", "--detach")
+        self.engine.change_baseline(paths=targets)
+        preview = self.state["baseline_change_request"]
+        self.assertTrue(all(repo["directory_changed"] for repo in preview["repositories"]))
+        self.assertEqual(self.state["repos"], old)
+        self.assertEqual(preview["repositories"][0]["previous_remaining_paths"], ["任务.txt"])
+        self.engine.change_baseline(preview["token"])
+        for previous, repo, selection in zip(old, self.state["repos"], self.state["selections"]):
+            self.assertEqual(repo["path"], targets[repo["name"]])
+            self.assertEqual(repo["source"], targets[repo["name"]])
+            self.assertEqual(selection["path"], repo["path"])
+            self.assertEqual(repo["preserved_paths"], ["本机.txt"])
+            self.assertFalse(repo["workspace_owned"])
+            self.assertEqual((Path(previous["path"]) / "任务.txt").read_text(encoding="utf-8"), "未提交任务")
+            self.assertTrue(git(repo["path"], "diff", "--cached", "--name-only"))
+        self.assertEqual(git(old[0]["path"], "branch", "--show-current"), "")
+        self.assertEqual(self.state["thread_id"], "原线程")
+        self.assertEqual(self.state["retired_repos"], old)
+        self.assertTrue(all(repo in session_repositories(self.state) for repo in old))
+        claims = workspace_claims([self.state], "其他会话")
+        self.assertIn(targets[old[0]["name"]].casefold(), claims)
+        self.assertNotIn(old[0]["path"].casefold(), claims)
+
+    def test_new_directory_does_not_need_to_contain_old_baseline(self):
+        path = self.root / "新独立仓库"
+        path.mkdir()
+        git(path, "init", "-b", "项目分支")
+        git(path, "-c", "user.name=检查", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "新基线")
+        self.engine.change_baseline(paths={"frontend": str(path)})
+        selected = self.state["baseline_change_request"]["repositories"][0]
+        self.assertEqual(selected["relationship"], "更换目录，重新建立基线")
+        self.engine.change_baseline(self.state["baseline_change_request"]["token"])
+        self.assertEqual(self.state["repos"][0]["path"], str(path))
+
+    def test_relocation_rejects_claimed_target_and_checks_again_at_confirmation(self):
+        targets = self.relocation_targets()
+        self.engine.change_baseline(paths=targets)
+        token = self.state["baseline_change_request"]["token"]
+        other = self.engine.store.new(None)
+        other["repos"] = [{"path": targets["frontend"]}]
+        self.engine.store.save(other)
+        old = deepcopy(self.state["repos"])
+        with self.assertRaisesRegex(WorkflowError, "未完成会话"):
+            self.engine.change_baseline(token)
+        self.assertEqual(self.state["repos"], old)
+
+    def test_relocation_rechecks_new_directory_files_before_confirmation(self):
+        targets = self.relocation_targets()
+        self.engine.change_baseline(paths=targets)
+        token = self.state["baseline_change_request"]["token"]
+        (Path(targets["backend"]) / "新文件.txt").write_text("变化", encoding="utf-8")
+        with self.assertRaisesRegex(WorkflowError, "重新预览"):
+            self.engine.change_baseline(token)
+
+    def test_relocation_preserves_staged_only_changes_even_when_worktree_matches_head(self):
+        targets = self.relocation_targets()
+        path = Path(targets["frontend"])
+        original = (path / "任务.txt").read_bytes()
+        (path / "任务.txt").write_text("只在暂存区保留", encoding="utf-8")
+        git(path, "add", "任务.txt")
+        (path / "任务.txt").write_bytes(original)
+        staged = git(path, "diff", "--cached", "--binary", binary=True)
+        self.engine.change_baseline(paths=targets)
+        self.engine.change_baseline(self.state["baseline_change_request"]["token"])
+        self.assertIn("任务.txt", self.state["repos"][0]["preserved_paths"])
+        self.assertEqual(git(path, "diff", "--cached", "--binary", binary=True), staged)
+        self.assertEqual((path / "任务.txt").read_bytes(), original)
+
+    def test_retired_owned_workspace_is_reserved_and_cleaned_without_deleting_new_directory(self):
+        targets = self.relocation_targets()
+        repo = self.state["repos"][0]
+        workspace = self.engine.store.directory(self.state["id"]) / "workspace"
+        workspace.mkdir()
+        old_path = workspace / "repo-1"
+        git(repo["path"], "worktree", "add", "--detach", str(old_path), "HEAD")
+        repo.update(path=str(old_path), workspace_owned=True)
+        self.engine.change_baseline(paths=targets)
+        self.engine.change_baseline(self.state["baseline_change_request"]["token"])
+        self.assertIn(str(old_path).casefold(), workspace_claims([self.state], "其他会话"))
+        cleanup_workspaces(self.engine.store, self.state, [])
+        self.assertFalse(old_path.exists())
+        self.assertTrue(Path(targets["frontend"]).is_dir())
+
+    def test_relocation_validates_paths_before_changing_session(self):
+        for paths in ([], {"未知仓库": str(self.root)}, {"frontend": "相对路径"},
+                      {"frontend": str(self.root / "不存在")},
+                      {"frontend": self.state["repos"][1]["path"], "backend": self.state["repos"][1]["path"]}):
+            with self.subTest(paths=paths), self.assertRaises(WorkflowError):
+                self.engine.change_baseline(paths=paths)
+        self.assertNotIn("retired_repos", self.state)
+
+    def test_migrated_next_round_keeps_new_directories_and_original_thread(self):
+        from test_followup import FollowupChecks
+
+        fixture = FollowupChecks()
+        fixture.setUp()
+        try:
+            fixture.send("仅了解当前代码，不修改", review_enabled=False)
+            fixture.pause_current()
+            targets = {}
+            for repo in fixture.state["repos"]:
+                path = fixture.root / (repo["role"] + "-relocated")
+                git(fixture.root, "clone", "--local", repo["path"], str(path))
+                targets[repo["name"]] = str(path)
+            fixture.engine.change_baseline(paths=targets)
+            fixture.engine.change_baseline(fixture.state["baseline_change_request"]["token"])
+            fixture.engine.resume()
+            fixture.complete("当前代码已说明")
+            self.assertEqual(fixture.state["phase"], "complete")
+            fixture.send("继续说明，不修改", review_enabled=False)
+            self.assertEqual(fixture.state["thread_id"], "原需求线程")
+            self.assertTrue(all(repo["path"] == targets[repo["name"]] for repo in fixture.state["repos"]))
+        finally:
+            fixture.doCleanups()

@@ -766,7 +766,7 @@ class WebApplication:
                 images = engine.validate_followup(text, data.get("image_ids", []), attachments)
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
             elif action == "preview_baseline":
-                operation, arguments = engine.change_baseline, ()
+                operation, arguments = engine.change_baseline, (None, data["paths"]) if "paths" in data else ()
             elif action == "confirm_baseline":
                 token = data.get("token")
                 if not isinstance(token, str) or not token:

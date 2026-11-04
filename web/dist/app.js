@@ -222,6 +222,7 @@ function WorkflowApp() {
   const [imageTransfers, setImageTransfers] = useState({});
   const [materialsOpen, setMaterialsOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [baselineDirectoriesOpen, setBaselineDirectoriesOpen] = useState(false);
   const [diffs, setDiffs] = useState(null);
   const [settingsForm] = Form.useForm();
   const settingsModel = Form.useWatch("model", settingsForm);
@@ -419,6 +420,7 @@ function WorkflowApp() {
     sessionStorage.setItem("workflow-session", "");
     applyModel({ ...modelRef.current, selectedSessionId: null });
     setDiffOpen(false);
+    setBaselineDirectoriesOpen(false);
     navigate("plan");
     await act("new_conversation", { project_id: projectId });
   }
@@ -429,6 +431,7 @@ function WorkflowApp() {
     sessionStorage.setItem("workflow-session", id);
     applyModel({ ...modelRef.current, selectedSessionId: id });
     setDiffOpen(false);
+    setBaselineDirectoriesOpen(false);
     if (targetPage) navigate(targetPage);
     try {
       const payload = await fetch(`/api/session?id=${encodeURIComponent(id)}`, { cache: "no-store" }).then(readResponse);
@@ -1098,6 +1101,21 @@ function WorkflowApp() {
       .filter(entry => entry.role !== "控制器" || entry.display_text).sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
     const processRunning = state.progress_turns?.at(-1)?.status === "running";
     return h("div", { className: "conversation-grid" },
+      h(Modal, { title: "变更仓库目录与审查基线", open: baselineDirectoriesOpen,
+        onCancel: () => setBaselineDirectoriesOpen(false), footer: h(Space, null,
+          h(Button, { disabled: busy, onClick: () => setBaselineDirectoriesOpen(false) }, "取消"),
+          h(Button, { type: "primary", disabled: busy, onClick: async () => {
+            const paths = Object.fromEntries(state.repos.map(repo => [repo.name,
+              draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path]));
+            if (await act("preview_baseline", { paths })) setBaselineDirectoriesOpen(false);
+          } }, "预览目录与基线")) },
+        h(Alert, { type: "info", showIcon: true, message: "更换仅对当前会话生效", description:
+          "填写已检出原目标分支的 Git 仓库根目录。保留原线程和历史消息；旧目录文件留在原处，新目录已有改动按本机保留文件排除。下一步预览后仍须明确确认。" }),
+        h(Form, { layout: "vertical", style: { marginTop: 16 } }, state.repos.map(repo =>
+          h(Form.Item, { key: repo.name, label: `${repo.name}仓库目录（分支：${repo.branch}）` },
+            h(Input, { "aria-label": `${repo.name}仓库目录`, disabled: busy,
+              value: draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path,
+              onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) }))))),
       h("div", { className: "card-stack" },
         renderBranches(),
         renderCompileChecks(),
@@ -1186,26 +1204,29 @@ function WorkflowApp() {
           h(Button, { block: true, disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
           h(Button, { block: true, disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Object.keys(state.commits || {}).length > 0 ||
             !["已暂停", "已停止", "等待计划确认", "等待计划补充", "等待修复选择", "等待编译选择"].includes(stage),
-            onClick: () => act("preview_baseline") }, "变更审查基线"),
+            onClick: () => setBaselineDirectoriesOpen(true) }, "变更目录与审查基线"),
           h(Button, { block: true, disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
             "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。需要澄清时等待明确回答；审查通过后仅本地 commit，不 push。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
         state.baseline_change_request && h(CardBox, { title: "确认变更审查基线" },
           h(Alert, { type: "warning", showIcon: true, message: "将当前 HEAD 设为本轮新基线", description:
-            "原线程、聊天、计划、附件和历史记录保留，确认前备份完整会话。旧基线下的审查及检查结论失效；新基线之前的已提交代码将移出本轮审查范围。工作区、暂存区和本机保留文件不变。" }),
+            "原线程、聊天、计划、附件和历史记录保留，确认前备份完整会话。旧基线下的审查及检查结论失效；新基线之前的已提交代码将移出本轮审查范围。更换目录时旧文件留在原处，新目录已有改动全部排除；不自动复制代码。" }),
           state.baseline_change_request.repositories.map(repo => h("div", { key: repo.name, style: { marginTop: 16 } },
             h(Typography.Text, { strong: true }, `${repo.name} · ${repo.branch} · ${repo.relationship}`),
             h(Descriptions, { column: 1, size: "small", items: [
               { key: "old", label: "旧基线", children: h(Typography.Text, { code: true, copyable: true }, repo.previous) },
               { key: "new", label: "新基线", children: h(Typography.Text, { code: true, copyable: true }, repo.current) },
               { key: "path", label: "工作目录", children: h(Typography.Text, { copyable: true }, repo.path) },
+              ...(repo.directory_changed ? [
+                { key: "old_path", label: "原工作目录", children: h(Typography.Text, { copyable: true }, repo.previous_path) },
+                { key: "old_files", label: "旧目录改动（不搬迁）", children: repo.previous_remaining_paths.length ? repo.previous_remaining_paths.join("、") : "无未提交任务文件" }] : []),
               { key: "remaining", label: "保留的本轮差异", children: repo.remaining_paths.length ? repo.remaining_paths.join("、") : "无未提交任务文件" },
-              { key: "preserved", label: "本机保留文件", children: `${repo.preserved_paths.length} 个，继续排除` }] }),
+              { key: "preserved", label: "本机保留文件", children: repo.preserved_paths.length ? repo.preserved_paths.join("、") : "无" }] }),
             repo.stat && h(Collapse, { ghost: true, items: [{ key: "stat", label: "将移出或改变本轮审查范围的提交差异", children: h("pre", { className: "review-original" }, repo.stat) }] }))),
           h("div", { className: "action-bar" },
             h(Button, { disabled: busy, onClick: () => act("cancel_baseline") }, "取消变更"),
-            h(Button, { disabled: busy, onClick: () => act("preview_baseline") }, "重新预览"),
+            h(Button, { disabled: busy, onClick: () => setBaselineDirectoriesOpen(true) }, "重新预览"),
             h(Button, { type: "primary", disabled: busy, onClick: () => act("confirm_baseline", { token: state.baseline_change_request.token }) }, "确认变更并保留会话"))),
         Object.keys(state.commits || {}).length > 0 && h(CardBox, { title: "本地提交记录" }, h(Descriptions, { column: 1, items: Object.entries(state.commits).map(([name, sha]) => ({ key: name, label: name, children: h(Typography.Text, { copyable: true, code: true }, sha) })) })),
         state.deliveries.length > 0 && h(CardBox, { title: "历史交付记录" }, h(Collapse, { ghost: true, items: state.deliveries.map(delivery => ({

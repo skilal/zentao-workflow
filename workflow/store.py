@@ -78,7 +78,8 @@ def followup_available(state):
 
 
 def session_repositories(state):
-    return [*state["repos"], *(repo for delivery in state.get("deliveries", []) for repo in delivery["repos"])]
+    return [*state["repos"], *state.get("retired_repos", []),
+            *(repo for delivery in state.get("deliveries", []) for repo in delivery["repos"])]
 
 
 def initial_state(item, record_id):

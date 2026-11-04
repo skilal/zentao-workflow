@@ -69,13 +69,16 @@ class BranchActionChecks(TestCase):
         operation = self.runtime.engine.change_baseline = Mock()
         self.application.dispatch(self.request("preview_baseline"))
         operation.assert_called_once_with()
+        paths = {"前端": "D:/wkproj/ais-web-2", "后端": "D:/wkproj/ais-server-2"}
+        self.application.dispatch(self.request("preview_baseline", {"paths": paths}))
+        operation.assert_called_with(None, paths)
         for token in (None, False, [], ""):
             with self.subTest(token=token), self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request("confirm_baseline", {"token": token}))
         request = self.request("confirm_baseline", {"token": "人工确认的预览"})
         self.application.dispatch(request)
         self.assertTrue(self.application.dispatch(request)["duplicate"])
-        self.assertEqual(operation.call_count, 2)
+        self.assertEqual(operation.call_count, 3)
         operation.assert_called_with("人工确认的预览")
         cancel = self.runtime.engine.cancel_baseline_change = Mock()
         self.application.dispatch(self.request("cancel_baseline"))
