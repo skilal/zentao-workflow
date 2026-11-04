@@ -17,9 +17,10 @@ from workflow.settings import WorkflowError
 
 
 DEPENDENCY_ERRORS = (
-    "cannot access", "has not been downloaded", "could not resolve dependencies",
+    "has not been downloaded", "could not resolve dependencies",
     "could not resolve artifact", "could not find artifact", "non-resolvable parent pom",
     "pluginresolutionexception", "plugin or one of its dependencies could not be resolved",
+    "cannot be resolved in offline mode",
 )
 ENVIRONMENT_ERRORS = (
     "unsupported class file",
@@ -96,8 +97,12 @@ def compile_context(state):
     batch = checks[-1]
     backend_names = {repo["name"] for repo in state["repos"] if repo["role"] == "backend"}
     result = {key: batch[key] for key in ("status", "fix_round", "limit")}
-    result["repositories"] = [{key: entry[key] for key in ("name", "status", "modules", "summary", "diagnostics")}
+    result["repositories"] = [{key: entry[key] for key in
+                               ("name", "status", "modules", "summary", "diagnostics", "failure_reasons", "analysis")
+                               if key in entry}
                               for entry in batch["repositories"] if entry["name"] in backend_names]
+    if batch.get("analysis_repository") in backend_names:
+        result["analysis_repository"] = batch["analysis_repository"]
     if batch.get("repair_repository") in backend_names:
         result.update(repair_repository=batch["repair_repository"], repair_paths=batch["repair_paths"])
     return [result]
@@ -208,27 +213,64 @@ def code_diagnostics(repository, output):
             line = int(match[1])
             if tracked and not any(start <= line < end for start, end in ranges):
                 return []
-            excerpt = normalized[match.start():].splitlines()[0][:350]
-            evidence.append({"path": relative, "line": line, "message": redact(excerpt)})
+            lines = normalized[match.end():].split("\n")
+            message = lines[0].strip()
+            if not message:
+                return []
+            for continuation in lines[1:4]:
+                continuation = sub(r"^\s*\[ERROR\]\s*", "", continuation).strip()
+                if not search(r"^(?:symbol|location|符号|位置)\s*[:：]", continuation, IGNORECASE):
+                    break
+                message += "；" + continuation
+            evidence.append({"path": relative, "line": line, "message": redact(message)[:600]})
     # 诊断指向其他文件时，不能仅凭部分证据自动修复。
     all_locations = list(finditer(r"[^\s\[\]():]+\.java[:\s]*[\[(:]\d+", output.replace("\\", "/")))
     if not evidence or len(all_locations) > len(evidence):
         return []
-    return evidence[:12]
+    return list({(item["path"], item["line"], item["message"]): item for item in evidence}.values())[:12]
+
+
+def failure_reasons(repository, output):
+    """只保留必要的脱敏错误原因，不持久化整段输出、堆栈或构建进度。"""
+    cleaned = redact(output).replace("\\", "/")
+    cleaned = cleaned.replace(str(Path(repository["path"])).replace("\\", "/") + "/", "")
+    reasons = []
+    for line in cleaned.splitlines():
+        if not search(r"^\s*\[(?:ERROR|FATAL)\]|^\s*(?:Caused by:|Error:|错误[:：])", line, IGNORECASE) and not any(
+                marker in line.lower() for marker in ENVIRONMENT_ERRORS + DEPENDENCY_ERRORS):
+            continue
+        reason = sub(r"^\s*\[(?:ERROR|FATAL)\]\s*", "", line).strip()
+        if (not reason or search(r"^(?:->\s*\[Help|\[Help|For more information|To see the full|Re-run Maven|"
+                                 r"After correcting|mvn\s|at\s)", reason, IGNORECASE)):
+            continue
+        reason = reason[:600]
+        if reason not in reasons:
+            reasons.append(reason)
+        if len(reasons) == 8:
+            break
+    return reasons
 
 
 def classify(repository, returncode, output):
     lower = output.lower()
     if not returncode:
         return {"status": "passed", "summary": "编译检查通过。", "diagnostics": []}
+    reasons = failure_reasons(repository, output)
     if any(marker in lower for marker in ENVIRONMENT_ERRORS):
-        return {"status": "blocked", "summary": "环境、网络或工具配置异常，请人工处理后重新检查。", "diagnostics": []}
-    if any(marker in lower for marker in DEPENDENCY_ERRORS):
-        return {"status": "dependencies", "summary": "本机依赖或缓存不足，需要人工选择是否允许下载。", "diagnostics": []}
-    evidence = code_diagnostics(repository, output) if any(marker in lower for marker in CODE_ERRORS) else []
+        return {"status": "blocked", "summary": "环境、网络或工具配置异常，具体原因见下方；处理后可重新检查。",
+                "diagnostics": [], "failure_reasons": reasons}
+    if any(marker in lower for marker in DEPENDENCY_ERRORS) or (
+            "offline" in lower and any(marker in lower for marker in ("cannot access", "cannot resolve"))):
+        return {"status": "dependencies", "summary": "本机缺少依赖或 Maven 插件，可选择补齐依赖并重新检查；下载须明确授权。",
+                "diagnostics": [], "failure_reasons": reasons}
+    has_code_error = any(marker in lower for marker in CODE_ERRORS) or search(
+        r"(?m)^\s*\[ERROR\][^\r\n]*\.java[:\s]*[\[(:]\d+", output.replace("\\", "/"))
+    evidence = code_diagnostics(repository, output) if has_code_error else []
     if evidence:
-        return {"status": "code_error", "summary": "编译诊断明确指向本轮修改的代码。", "diagnostics": evidence}
-    return {"status": "blocked", "summary": "检查未通过，尚不能确认属于本次引入的代码错误，请人工处理。", "diagnostics": []}
+        return {"status": "code_error", "summary": "编译诊断明确指向本轮修改的代码。", "diagnostics": evidence,
+                "failure_reasons": reasons}
+    return {"status": "blocked", "summary": "检查未通过，尚不能确认属于本次引入的代码错误，可先分析失败原因。",
+            "diagnostics": [], "failure_reasons": reasons}
 
 
 class CompileRunner:

@@ -13,7 +13,7 @@ DOMPurify.addHook("afterSanitizeAttributes", node => {
 });
 const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
-const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"]);
+const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"]);
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
   items: ["工作项与资料", "可从指派给你的需求、任务和 Bug 中选择处理对象，也可新建会话直接输入需求。"],
@@ -38,7 +38,7 @@ function stepOf(state) {
   if (!state) return 0;
   if (state.phase === "complete") return state.stage === "已完成（未审查）" ? 2 : 4;
   if (state.phase === "plan") return state.repos?.length ? 1 : 0;
-  if (["followup", "compile", "compile_fix"].includes(state.phase)) return 2;
+  if (["followup", "compile", "compile_fix", "compile_analysis"].includes(state.phase)) return 2;
   if (state.phase === "review" || state.phase === "fix") return 3;
   if (state.phase === "implement") return 2;
   if (state.repos?.length) return 1;
@@ -1144,7 +1144,7 @@ function WorkflowApp() {
                 entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup"),
                 entry.followup_attachments?.length > 0 && renderFollowupFiles(entry.followup_attachments),
                 entry.attachments?.length > 0 && renderAnswerFiles(entry.attachments, false, true)))),
-            !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中"].includes(stage) &&
+            !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中", "编译分析中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
                 stage === "准备工作区中" ? " 正在准备工作区…" : " 模型正在处理中…"),
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
@@ -1257,11 +1257,19 @@ function WorkflowApp() {
               return h("div", { className: "question", key: entry.name },
                 h(Space, null, h("strong", null, entry.name), h(Tag, { color: entry.status === "passed" ? "success" : entry.status === "skipped" ? "default" : "gold" }, statusNames[entry.status] || entry.status)),
                 h("p", null, entry.summary),
+                ["blocked", "dependencies", "code_error"].includes(entry.status) &&
+                  (entry.failure_reasons?.length > 0 || !entry.diagnostics?.length) && h(Alert, {
+                  type: "warning", showIcon: true, message: "失败原因", description: entry.failure_reasons?.length > 0 ?
+                    h("ul", { className: "markdown-body" }, entry.failure_reasons.map((reason, number) => h("li", { key: number }, reason))) :
+                    entry.failure_reasons ? "本次未提取到具体诊断，可先分析失败原因。" : "该历史记录未保存具体失败原因，请重新检查以取得诊断。" }),
                 entry.modules.length > 0 && h(Typography.Paragraph, { type: "secondary" }, `模块：${entry.modules.join("、")}（含所需模块）`),
                 entry.diagnostics?.map((diagnostic, number) => h("p", { key: number }, `${diagnostic.path}:${diagnostic.line} · ${diagnostic.message}`)),
+                entry.analysis && h("div", null, h("strong", null, "失败分析"), h(Markdown, { text: entry.analysis })),
                 retired && h(Button, { disabled: busy, onClick: () => choose("retry") }, "前端检查已取消，继续后端流程"),
                 current && h(Space, { wrap: true },
-                  entry.status === "dependencies" && h(Button, { disabled: busy, onClick: () => choose("download") }, "允许下载并继续"),
+                  entry.status === "dependencies" && h(Button, { type: "primary", disabled: busy, onClick: () => choose("download") }, "补齐依赖并重新检查（允许下载）"),
+                  entry.status === "code_error" && batch.fix_round < batch.limit && h(Button, { type: "primary", disabled: busy, onClick: () => choose("fix") }, "修复代码并重新检查"),
+                  ["blocked", "dependencies", "code_error"].includes(entry.status) && h(Button, { disabled: busy, onClick: () => choose("analyze") }, "分析失败原因"),
                   h(Button, { disabled: busy, onClick: () => choose("retry") }, "重新检查"),
                   h(Button, { disabled: busy, onClick: () => choose("skip") }, "跳过该仓库本轮检查"),
                   entry.status === "code_error" && batch.fix_round >= batch.limit && h(Button, { disabled: busy, onClick: () => choose("add_round") }, "追加一轮编译修复"),

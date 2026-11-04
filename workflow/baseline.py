@@ -107,7 +107,7 @@ class BaselineFlow:
                 if batch.get("delivery_round", 1) == state.get("delivery_round", 1):
                     batch.setdefault("status_before_baseline_change", batch["status"])
                     batch["status"] = "invalidated"
-            if state["phase"] in {"review", "compile", "compile_fix"}:
+            if state["phase"] in {"review", "compile", "compile_fix", "compile_analysis"}:
                 state.update(phase="review", baseline_review_pending=True, review_requested=True)
             if state["phase"] == "plan" and state.get("plan_round"):
                 state["plan_round"]["asked"] = True

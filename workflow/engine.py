@@ -43,9 +43,9 @@ FINDING_SCHEMA = {"type": "object", "properties": {
     }, "required": ["id", "evidence"], "additionalProperties": False}}
 }, "required": ["summary", "findings", "resolved_previous"], "additionalProperties": False}
 
-ACTIVE = {"识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中"}
+ACTIVE = {"识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"}
 COMPLETE = {"已完成（静态审查）", "已完成（未审查）"}
-PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中", "compile_fix": "编译修复中"}
+PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中", "compile_fix": "编译修复中", "compile_analysis": "编译分析中"}
 
 
 def parse_review(text):
@@ -1043,6 +1043,11 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
         if state["phase"] == "compile":
             self._resume_compile()
             return
+        if state["phase"] == "compile_analysis":
+            batch = self._compile_batch()
+            entry = next(entry for entry in batch["repositories"] if entry["name"] == batch["analysis_repository"])
+            self._analyze_compile(entry)
+            return
         if state["phase"] == "compile_fix":
             batch = self._compile_batch()
             repository = next(repo for repo in state["repos"] if repo["name"] == batch["repair_repository"])
@@ -1198,6 +1203,9 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
             return
         if state["phase"] == "branch":
             self._complete_branches(text)
+            return
+        if state["phase"] == "compile_analysis":
+            self._compile_analyzed(text)
             return
         if self.completed_plan:
             plan = self.completed_plan

@@ -6,7 +6,7 @@ from uuid import uuid4
 from workflow.settings import WorkflowError
 
 
-INPUT_STAGES = {"计划中", "实施中", "修复中", "续聊处理中", "编译修复中", "审查中"}
+INPUT_STAGES = {"计划中", "实施中", "修复中", "续聊处理中", "编译修复中", "编译分析中", "审查中"}
 
 
 def input_request_path(store, state):

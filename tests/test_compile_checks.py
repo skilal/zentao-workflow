@@ -231,6 +231,122 @@ class CompileChecks(TestCase):
         self.assertEqual(classify(self.repo, 1, "artifact has not been downloaded in offline mode")["status"], "dependencies")
         self.assertEqual(classify(self.repo, 1, "Could not transfer artifact: connection timed out")["status"], "blocked")
 
+    def test_failures_preserve_only_necessary_redacted_reasons(self):
+        output = ("[INFO] 正在处理工程\n[ERROR] Failed to execute goal: unexpected failure\n"
+                  "[ERROR] missing setting token=私密值 https://user:pass@example.invalid/private\n"
+                  "    at example.Main.run(Main.java:12)\n[ERROR] -> [Help 1]\n"
+                  "[ERROR] For more information about the errors, read the articles\n")
+        result = classify(self.repo, 1, output)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(len(result["failure_reasons"]), 2)
+        serialized = dumps(result, ensure_ascii=False)
+        for unwanted in ("私密值", "user:pass", "example.invalid", "正在处理工程", "Main.run", "Help 1", "For more information"):
+            self.assertNotIn(unwanted, serialized)
+
+    def test_offline_missing_plugin_is_repairable_dependency_but_java_access_is_not(self):
+        result = classify(self.repo, 1, "[ERROR] Cannot resolve plugin org.example:compiler:1 in offline mode")
+        self.assertEqual(result["status"], "dependencies")
+        self.assertIn("org.example:compiler:1", result["failure_reasons"][0])
+        output = f"[ERROR] {self.repo['path']}/档案服务/业务.java:[1,12] cannot access example.Missing"
+        self.assertEqual(classify(self.repo, 1, output)["status"], "code_error")
+
+    def test_java_locations_with_localized_errors_and_symbol_details_are_preserved(self):
+        output = (f"[ERROR] {self.repo['path']}/档案服务/业务.java:[1,12] 找不到符号\n"
+                  "[ERROR]   符号: 方法 缺少的方法()\n[ERROR]   位置: 类 业务\n")
+        result = classify(self.repo, 1, output)
+        self.assertEqual(result["status"], "code_error")
+        self.assertIn("缺少的方法()", result["diagnostics"][0]["message"])
+        self.assertNotIn(self.repo["path"].replace("\\", "/"), dumps(result, ensure_ascii=False))
+        result = classify(self.repo, 1, output.replace("[1,12]", "[8,12]"))
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(result["failure_reasons"])
+
+    def test_unrelated_plugin_failure_does_not_turn_java_warning_into_repair(self):
+        output = f"[WARNING] {self.repo['path']}/档案服务/业务.java:[1,12] deprecated\n[ERROR] unknown plugin failure"
+        self.assertEqual(classify(self.repo, 1, output)["status"], "blocked")
+
+    def test_unprefixed_environment_error_and_truncated_location_are_not_lost(self):
+        result = classify(self.repo, 1, "The JAVA_HOME environment variable is not defined correctly")
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("JAVA_HOME", result["failure_reasons"][0])
+        result = classify(self.repo, 1, f"[ERROR] {self.repo['path']}/档案服务/业务.java:[1,12]")
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["diagnostics"], [])
+
+    def test_tool_exceptions_keep_the_specific_redacted_failure_reason(self):
+        with patch.object(CompileRunner, "check", side_effect=OSError("工具读取失败 token=不应保存")):
+            self.flow._before_review()
+        entry = self.state["compile_checks"][-1]["repositories"][0]
+        self.assertIn("工具读取失败", entry["failure_reasons"][0])
+        self.assertNotIn("不应保存", dumps(self.state, ensure_ascii=False))
+
+    def test_unknown_failures_can_be_analyzed_read_only_without_entering_review(self):
+        failure = {**BLOCKED, "failure_reasons": ["缺少配置项。"]}
+        self.start([failure])
+        check = self.decide("analyze")
+        check.assert_not_called()
+        self.assertEqual(self.state["phase"], "compile_analysis")
+        self.assertEqual(self.state["stage"], "编译分析中")
+        self.assertEqual(compile_context(self.state)[0]["analysis_repository"], "后端")
+        self.flow.save()
+        tools = Tools(self.state["id"])
+        tools.store = self.flow.store
+        with self.assertRaisesRegex(WorkflowError, "当前阶段禁止修改"):
+            tools.call("write_file", {"repository": "后端", "path": "档案服务/业务.java", "content": "不应修改"})
+        self.flow.last_message = "缺少配置项，需要人工补充。token=不应保存"
+        with patch.object(CompileRunner, "check") as check:
+            self.flow._completed({"status": "completed"}, self.state["id"], self.flow.connection_epoch)
+        check.assert_not_called()
+        self.assertEqual(self.state["phase"], "compile")
+        self.assertEqual(self.state["stage"], "等待编译选择")
+        entry = self.state["compile_checks"][-1]["repositories"][0]
+        self.assertEqual(entry["status"], "blocked")
+        self.assertIn("缺少配置项", entry["analysis"])
+        self.assertNotIn("不应保存", dumps(self.state, ensure_ascii=False))
+        with self.assertRaisesRegex(WorkflowError, "已明确诊断"):
+            self.decide("fix")
+
+    def test_analysis_result_does_not_apply_to_changed_source(self):
+        self.start([BLOCKED])
+        self.decide("analyze")
+        self.change("档案服务/业务.java", "分析期间的修改\n")
+        with self.assertRaisesRegex(WorkflowError, "分析期间代码"):
+            self.flow._compile_analyzed("分析结论")
+        self.assertEqual(self.state["phase"], "compile")
+        self.assertEqual(self.state["stage"], "等待编译选择")
+        self.assertNotIn("analysis_repository", self.state["compile_checks"][-1])
+
+    def test_analysis_pause_resume_remains_read_only_and_does_not_compile(self):
+        self.start([BLOCKED])
+        self.decide("analyze")
+        self.flow.pause()
+        with patch.object(CompileRunner, "check") as check:
+            self.flow.resume()
+        check.assert_not_called()
+        self.assertEqual(self.state["phase"], "compile_analysis")
+        self.assertEqual(self.state["compile_checks"][-1]["fix_round"], 0)
+
+    def test_manual_fix_requires_current_code_evidence_and_remaining_round(self):
+        self.start([self.code_error()])
+        self.state.update(phase="compile", stage="等待编译选择")
+        self.state["compile_checks"][-1]["status"] = "waiting"
+        check = self.decide("fix")
+        check.assert_not_called()
+        self.assertEqual(self.state["phase"], "compile_fix")
+        self.assertEqual(self.state["compile_checks"][-1]["fix_round"], 2)
+
+    def test_failures_and_analysis_are_visible_to_model_and_persist_across_restart(self):
+        failure = {**BLOCKED, "failure_reasons": ["缺少文件。"], "analysis": "需要补充文件。"}
+        self.start([failure])
+        entry = self.state["compile_checks"][-1]["repositories"][0]
+        # 适配器不返回分析；模拟保存已完成的只读分析。
+        entry["analysis"] = "需要补充文件。"
+        self.flow.save()
+        self.flow.state = self.flow.store.load(self.state["id"])
+        context = compile_context(self.flow.state)[0]["repositories"][0]
+        self.assertEqual(context["failure_reasons"], ["缺少文件。"])
+        self.assertEqual(context["analysis"], "需要补充文件。")
+
     def test_compiler_mutations_are_detected_and_preserved_files_included(self):
         runner = CompileRunner()
         self.assertIn("保留.txt", source_snapshot(self.repo))

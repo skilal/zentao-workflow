@@ -73,7 +73,7 @@ def followup_available(state):
     phase, stage = state.get("phase"), state.get("stage")
     completed = phase == "complete" and stage in {"已完成（静态审查）", "已完成（未审查）"}
     paused = (stage == "已暂停" and state.get("prepare_complete") and not state.get("commits")
-              and phase in {"plan", "implement", "review", "fix", "followup", "compile", "compile_fix"})
+              and phase in {"plan", "implement", "review", "fix", "followup", "compile", "compile_fix", "compile_analysis"})
     return bool((completed or paused) and state.get("thread_id") and state.get("repos") and not state.get("pending"))
 
 
