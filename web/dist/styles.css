@@ -115,6 +115,7 @@ button, input, textarea { font: inherit; }
 .plan-panel { max-height: 360px; overflow: auto; }
 .plan-panel .markdown-body { font-size: 12px; }
 .plan-panel .markdown-body :is(h1, h2, h3, h4, h5, h6) { font-size: 14px; }
+.implementation-plan-details .ant-modal-body { max-height: calc(100dvh - 200px); overflow: auto; }
 .plan-status { margin-bottom: 12px; }
 .plan-version { font-size: 11px; color: #98a2b3; margin: 12px 0; overflow-wrap: anywhere; }
 .review-summary { display: flex; gap: 15px; align-items: flex-start; }

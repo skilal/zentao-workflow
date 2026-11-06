@@ -230,6 +230,7 @@ function WorkflowApp() {
   const imageQueues = useRef({});
   const [imageTransfers, setImageTransfers] = useState({});
   const [materialsOpen, setMaterialsOpen] = useState(false);
+  const [planDetailsOpen, setPlanDetailsOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
   const [baselineDirectoriesOpen, setBaselineDirectoriesOpen] = useState(false);
   const [diffs, setDiffs] = useState(null);
@@ -600,7 +601,7 @@ function WorkflowApp() {
     return () => window.removeEventListener("pagehide", discardPreview);
   }, []);
 
-  useEffect(() => { setMaterialsOpen(false); }, [model?.selectedSessionId, page]);
+  useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
 
   const state = model?.state;
   const stage = state?.stage || "";
@@ -910,9 +911,11 @@ function WorkflowApp() {
     const planStatus = feedbackAuthorized ? "原计划 · 业务背景" : approved && state.phase === "complete" ? "计划已完成" : stage;
     return h("section", { id: "implementation-plan", "aria-label": implementationPlanTitle },
       h(CardBox, { size: "small", className: "app-card sidebar-card implementation-plan-card", title: implementationPlanTitle,
-        extra: h(Button, { type: "text", size: "small", "aria-label": `隐藏${implementationPlanTitle}`, onClick: () => {
-          setImplementationPlanHidden(true); sessionStorage.setItem("workflow-implementation-plan-hidden", "true");
-        } }, "隐藏") },
+        extra: h(Space, { size: 0 },
+          h(Button, { type: "link", size: "small", disabled: !state.plan, onClick: () => setPlanDetailsOpen(true) }, "查看详情"),
+          h(Button, { type: "text", size: "small", "aria-label": `隐藏${implementationPlanTitle}`, onClick: () => {
+            setImplementationPlanHidden(true); sessionStorage.setItem("workflow-implementation-plan-hidden", "true");
+          } }, "隐藏")) },
         state.plan ? h(React.Fragment, null,
           h("div", { className: "plan-status" }, stageTag(planStatus),
             approved && !feedbackAuthorized && h(Tag, null, state.approval_source === "auto" ? "自动授权实施" : "人工确认实施")),
@@ -1522,6 +1525,12 @@ function WorkflowApp() {
         h(Space, { wrap: true, style: { marginBottom: 16 } }, ...sessionItems(state).map(item =>
           h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
         renderWorkItemMaterials(state.snapshot, { session: state.id }))),
+    h(Modal, { title: `${implementationPlanTitle}详情`, className: "implementation-plan-details", centered: true,
+      width: "min(1200px, calc(100vw - 32px))", open: Boolean(planDetailsOpen && hasImplementationPlan && state.plan),
+      onCancel: () => setPlanDetailsOpen(false), footer: h(Button, { onClick: () => setPlanDetailsOpen(false) }, "关闭"), destroyOnClose: true },
+      planDetailsOpen && hasImplementationPlan && h(React.Fragment, null,
+        h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`),
+        h(Markdown, { text: state.plan }))),
     h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
       diffs === null ? h(Spin, null) : h(Collapse, { defaultActiveKey: diffs.map((_, index) => String(index)), items: diffs.map((diff, index) => ({ key: String(index), label: diff.repository,
         children: diff.commit ? h(Typography.Text, { copyable: true }, diff.commit) : h(React.Fragment, null, h("pre", { className: "diff-text" }, diff.stat || "没有已跟踪文件差异"), diff.patch && h("pre", { className: "diff-text" }, diff.patch),
