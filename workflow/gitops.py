@@ -301,8 +301,13 @@ def acquire_workspace(selection, destination, store, state):
         reusable = not owner and (path == source or managed == state["id"] or
             (managed in session_states and session_states[managed]["phase"] == "complete"))
         if entry.get("branch") == "refs/heads/" + selection["branch"]:
-            if not reusable or "locked" in entry or "prunable" in entry:
-                raise WorkflowError(f"分支 {selection['branch']} 已被占用：{path}（会话：{owner or managed or '外部工作区'}）。请先完成或删除占用会话，或明确选择其他分支。")
+            if "locked" in entry or "prunable" in entry:
+                raise WorkflowError(f"目标分支工作区被锁定或登记失效，已停止：{path}")
+            if not reusable:
+                if owner or managed:
+                    raise WorkflowError(f"分支 {selection['branch']} 已被占用：{path}（会话：{owner or managed}）。请先完成或删除占用会话，或明确选择其他分支。")
+                raise WorkflowError(f"分支 {selection['branch']} 已在外部工作区检出：{path}。"
+                                    "请点击“预览复用已有工作区”，核对后明确确认复用；不会自动接管该目录。")
             available = [entry]
             break
         if reusable and "locked" not in entry and "prunable" not in entry:

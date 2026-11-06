@@ -656,7 +656,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "answer"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
@@ -765,6 +765,18 @@ class WebApplication:
                 attachments = prepare_attachments(state, data.get("attachment_ids", []))
                 images = engine.validate_followup(text, data.get("image_ids", []), attachments)
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
+            elif action == "preview_workspace_reuse":
+                repository = data.get("repository")
+                if not isinstance(repository, str) or not repository.strip():
+                    raise WorkflowError("请明确选择要预览复用的仓库。")
+                operation, arguments = engine.preview_workspace_reuse, (repository,)
+            elif action == "confirm_workspace_reuse":
+                token = data.get("token")
+                if not isinstance(token, str) or not token:
+                    raise WorkflowError("请明确确认页面展示的外部工作区预览。")
+                operation, arguments = engine.confirm_workspace_reuse, (token,)
+            elif action == "cancel_workspace_reuse":
+                operation, arguments = engine.cancel_workspace_reuse, ()
             elif action == "preview_baseline":
                 operation, arguments = engine.change_baseline, (None, data["paths"]) if "paths" in data else ()
             elif action == "confirm_baseline":

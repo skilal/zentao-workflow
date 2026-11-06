@@ -925,9 +925,14 @@ function WorkflowApp() {
 
   function renderBranches({ compact = false } = {}) {
     const transfers = (imageTransfers[state.id] || []).filter(task => task.purpose === "supplement");
-    const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy;
+    const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy && !state.workspace_reuse_request;
     const repositories = state.branch_resolution?.repositories || [];
     const checkout = state.checkout_request;
+    const reuse = state.workspace_reuse_request;
+    const canReuse = !state.prepare_complete && ["plan", "followup"].includes(state.phase) &&
+      ["准备工作区失败", "已停止", "已暂停"].includes(stage) && !state.pending && !state.manual_compile &&
+      !Object.keys(state.commits || {}).length && (!checkout || ["waiting", "restored"].includes(checkout.status));
+    const reuseCandidates = (state.selections || []).filter(selection => !state.repos.some(repo => repo.name === selection.name));
     const checkoutKey = checkout && [checkout.path, checkout.head, checkout.baseline, checkout.snapshot.fingerprint].join("\n");
     const checkoutPaths = draft.checkout_key === checkoutKey ? draft.checkout_paths || [] : [];
     const detailRepositories = state.branch_resolution?.manual && !state.repos.length ? [] : model.settings.repositories.filter(repository => {
@@ -936,6 +941,28 @@ function WorkflowApp() {
         entry?.reason || entry?.question || entry?.candidates.length > 0 || entry?.refresh_state || entry?.fetch_state;
     });
     return h("div", { className: "card-stack" },
+      canReuse && reuseCandidates.length > 0 && h(CardBox, { title: "复用已有工作区" },
+        h("p", { className: "muted" }, "原目标分支已在其他工具创建的工作区检出时，可先预览，核对后明确确认复用。其他未完成会话的目录不能接管。"),
+        h("div", { className: "action-bar" }, reuseCandidates.map(selection => h(Button, {
+          key: selection.name, disabled: busy || model.working,
+          onClick: () => act("preview_workspace_reuse", { repository: selection.name }) }, `预览复用已有工作区（${selection.name}）`))),
+        reuse && h(React.Fragment, null,
+          h(Alert, { type: "warning", showIcon: true, message: "以当前 HEAD 建立本轮初始基线", description:
+            "该提交及之前的代码不纳入本轮差异。已有未提交修改按本机保留内容排除，不自动修改或提交；确认后继续原会话，删除会话保留此目录。" }),
+          h(Descriptions, { column: 1, size: "small", items: [
+            { key: "name", label: "仓库", children: reuse.name },
+            { key: "path", label: "工作目录", children: h(Typography.Text, { copyable: true }, reuse.path) },
+            { key: "branch", label: "原目标分支", children: reuse.branch },
+            { key: "head", label: "本轮初始基线", children: h(Typography.Text, { code: true, copyable: true }, reuse.head) },
+            { key: "subject", label: "最近提交", children: reuse.subject },
+            { key: "occupancy", label: "会话占用", children: reuse.occupancy },
+            { key: "preserved", label: "本机保留文件", children: reuse.snapshot.paths.length ? reuse.snapshot.paths.join("、") : "无" }] }),
+          h("div", { className: "action-bar" },
+            h(Button, { disabled: busy || model.working, onClick: () => act("cancel_workspace_reuse") }, "取消复用"),
+            h(Button, { disabled: busy || model.working,
+              onClick: () => act("preview_workspace_reuse", { repository: reuse.name }) }, "重新预览"),
+            h(Button, { type: "primary", disabled: busy || model.working,
+              onClick: () => act("confirm_workspace_reuse", { token: reuse.token }) }, "确认复用并继续")))),
       stage === "准备工作区失败" && checkout && h(CardBox, { title: "保留本机改动并切换分支" },
         h("p", null, `${checkout.selection.name}：${checkout.from_branch} → ${checkout.selection.branch}`),
         h(Typography.Paragraph, { copyable: true }, checkout.path),

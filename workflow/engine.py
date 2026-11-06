@@ -25,6 +25,7 @@ from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.store import SessionStore, followup_available, session_title, timestamp
 from workflow.user_input import input_request_path, pending_input
+from workflow.workspace_reuse import WorkspaceReuseFlow
 from workflow.zentao import ZentaoClient, project_context
 
 
@@ -90,7 +91,7 @@ def skipped_review_ids(state, delivery_round):
     return skipped
 
 
-class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
+class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
         self.emit = emit
@@ -241,6 +242,8 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
 
     def _prepare_followup(self):
         state = self.state
+        if state.get("workspace_reuse_request"):
+            raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
         state.update(stage="准备工作区中", pause_requested=False)
         self.save()
         self._close_rpc()
@@ -342,6 +345,8 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
 
     def start_plan(self, supplement, manual=False):
         state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支")
+        if state.get("workspace_reuse_request"):
+            raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
         if not state.get("snapshot"):
             raise WorkflowError("需求资料尚未完整读取。")
         if "plan_started_at" not in state:
@@ -553,6 +558,8 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
 
     def prepare_and_plan(self, selections, supplement):
         state = self.require_state("资料已读取", "准备工作区失败")
+        if state.get("workspace_reuse_request"):
+            raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
         checkout = state.get("checkout_request")
         if checkout and checkout["status"] not in {"waiting", "restored"}:
             raise WorkflowError("智能切换尚未完成，请手工恢复备份改动并确认后继续。")
@@ -1032,6 +1039,8 @@ class Workflow(BaselineFlow, CompileFlow, ProgressFlow):
 
     def resume(self):
         state = self.require_state("已暂停", "已停止")
+        if state.get("workspace_reuse_request"):
+            raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
         if state["commits"]:
             raise WorkflowError("存在部分提交，只能先完成或处理该提交过程。")
         state["pause_requested"] = False
