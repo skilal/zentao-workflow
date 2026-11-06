@@ -36,7 +36,9 @@ TOOLS = [
     ("publish_artifact", "将当前会话工作区内已有的普通文件复制为独立成果，提供预览和下载；name 为展示及下载文件名，不修改源文件。", schema({
         **FILE_ARGS, "name": STRING
     }, ("repository", "path", "name"))),
-    ("read_followup_attachment", "只读已发送的续聊 ZIP；不指定成员编号时返回目录清单，指定 member_id 时按行读取 XML，其他格式仅列出信息。", schema({"attachment_id": STRING, "member_id": STRING, **LINE_ARGS}, ("attachment_id",))),
+    ("read_followup_attachment", "只读已发送的续聊附件：文本和 DOCX 按行读取；DOCX 用 image_id 读取图片，PDF 用 page 从 1 开始读取页图；ZIP 仍用 member_id 读取 XML，其他成员仅列清单。收到文件不代表已读内容。", schema({
+        "attachment_id": STRING, "member_id": STRING, "image_id": STRING, "page": {"type": "integer", "minimum": 1}, **LINE_ARGS
+    }, ("attachment_id",))),
     ("read_answer_attachment", "按编号只读已提交的问题附件；图片返回图片内容，文本按行分页，无法解析时明确返回限制。", schema({"attachment_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
     ("set_session_title", "结合已读资料为新建工作项会话登记简短中文概括名称；只传首个工作项的概括标题，多任务后缀由控制器添加。仅计划分析阶段可用，不修改业务文件或人工名称。", schema({"title": STRING}, ("title",))),
@@ -341,7 +343,7 @@ def serve(session_id):
             elif method == "tools/call":
                 try:
                     value = tools.call(request["params"]["name"], request["params"].get("arguments", {}))
-                    result = {"content": value["content"]} if request["params"]["name"] == "read_answer_attachment" and "content" in value else {
+                    result = {"content": value["content"]} if request["params"]["name"] in {"read_answer_attachment", "read_followup_attachment"} and "content" in value else {
                         "content": [{"type": "text", "text": value if isinstance(value, str) else dumps(value, ensure_ascii=False)}]}
                 except (WorkflowError, OSError, ValueError, KeyError) as error:
                     result = {"isError": True, "content": [{"type": "text", "text": str(error)}]}

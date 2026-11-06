@@ -78,7 +78,7 @@ def run():
             page.goto(server.origin)
             button = page.locator(".workflow-strip-actions").get_by_role("button", name="工作项资料", exact=True)
             drawer = page.get_by_role("dialog", name="工作项资料", exact=True)
-            reply = page.get_by_placeholder("输入问题、需要获取的信息或修改要求，可粘贴图片…")
+            reply = page.get_by_placeholder("输入问题、需要获取的信息或修改要求，可粘贴图片和文件…")
             reply.fill("保留未发送的草稿")
             feed = page.locator(".conversation-feed")
             feed.evaluate("element => { element.scrollTop = 60; element.dispatchEvent(new Event('scroll')); }")

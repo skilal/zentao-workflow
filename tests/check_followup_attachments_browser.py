@@ -36,8 +36,8 @@ def run():
             page.add_init_script("sessionStorage.setItem('workflow-page', 'plan')")
             page.goto(server.origin)
             send = page.get_by_role("button", name=compile(r"^发\s*送$"))
-            zip_input = page.locator('input[type=file][accept=".zip"]')
-            expect(page.get_by_role("button", name="上传 ZIP", exact=True)).to_be_visible()
+            zip_input = page.get_by_label("上传续聊文件", exact=True)
+            expect(page.get_by_role("button", name="上传文件", exact=True)).to_be_visible()
             expect(page.get_by_role("switch", name="修改后自动 Review", exact=True)).not_to_be_checked()
 
             page.route("**/api/followup-attachments?**", lambda route: route.fulfill(status=400, json={"error": "模拟 ZIP 上传失败"}), times=1)
@@ -74,7 +74,7 @@ def run():
             xml = Tools(state["id"]).call("read_followup_attachment", {"attachment_id": attachment_id, "member_id": "2"})
             assert '类型="电子"' in xml["text"]
             fixture.finish()
-            expect(page.get_by_role("button", name="上传 ZIP", exact=True)).to_be_enabled()
+            expect(page.get_by_role("button", name="上传文件", exact=True)).to_be_enabled()
             history = page.locator(".conversation-feed .attachment").filter(has_text="归档样例.zip")
             expect(history.get_by_role("link", name="归档样例.zip", exact=True)).to_be_visible()
             expect(history.get_by_role("button", name="移除", exact=True)).to_have_count(0)
@@ -88,7 +88,7 @@ def run():
 
             # 新 ZIP 和图片共用上传队列，图片预览保持原有行为。
             zip_input.set_input_files({"name": "再次补充.zip", "mimeType": "application/zip", "buffer": SAMPLE})
-            page.locator("input[type=file][accept*=png]").set_input_files({"name": "补充截图.png", "mimeType": "image/png", "buffer": PNG})
+            page.get_by_label("上传续聊图片", exact=True).set_input_files({"name": "补充截图.png", "mimeType": "image/png", "buffer": PNG})
             expect(page.get_by_alt_text("补充截图.png")).to_be_visible()
             expect(page.get_by_role("link", name="再次补充.zip", exact=True)).to_be_visible()
             expect(send).to_be_enabled()

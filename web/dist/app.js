@@ -246,6 +246,27 @@ function ArtifactPreview({ sessionId, artifact, onClose, source = "artifact" }) 
         h(Button, { disabled: !content.has_next || loading, onClick: () => setPage(page + 1) }, "下一页"))));
 }
 
+function FollowupFiles({ sessionId, entries, editable, disabled, onRemove }) {
+  const [preview, setPreview] = useState(null);
+  return h(React.Fragment, null,
+    h("div", { className: "attachment-grid" }, entries.map(entry => h("div", { className: "attachment", key: entry.id, "data-followup-file": entry.id },
+      h("div", { className: "attachment-name" }, h("a", {
+        href: `/api/followup-attachments?${new URLSearchParams({ session_id: sessionId, attachment_id: entry.id })}`, download: entry.name }, entry.name)),
+      h(Typography.Text, { type: "secondary" }, `${(entry.size / 1024).toFixed(1)} KB · ${!entry.kind ? "只读取目录与 XML" :
+        !entry.readable ? "内容未读取" : entry.kind === "pdf" ? `已准备 ${entry.page_count} 页供 AI 读取` :
+        `${entry.kind === "docx" ? "正文和表格" : "文本"}可读取${entry.images.length ? ` · ${entry.images.length} 张图片` : ""}`}`),
+      entry.issue && h(Typography.Paragraph, { type: "warning" }, entry.issue),
+      !entry.kind && h(Collapse, { ghost: true, items: [{ key: "entries", label: "目录与读取状态", children:
+        entry.entries.length ? entry.entries.map(member => h("div", { className: "attachment-name", key: member.member_id },
+          h("div", null, member.name), h(Typography.Text, { type: member.issue ? "warning" : "secondary" },
+            member.directory ? "目录" : `${member.extension.toUpperCase() || "无扩展名"} · ${member.size} 字节 · ${member.issue || (member.readable ? "XML 可读取" : "仅列出文件信息")}`))) :
+          h(Typography.Text, { type: "secondary" }, "空 ZIP，无目录或文件") }] }),
+      h(Space, { wrap: true }, entry.kind && h(Button, { size: "small", onClick: () => setPreview(entry) }, "预览"),
+        editable && h(Tag, { color: "success" }, "已上传"), editable && h(Button, {
+          size: "small", type: "text", danger: true, disabled, onClick: () => onRemove(entry) }, "移除"))))),
+    preview && h(ArtifactPreview, { key: `${sessionId}:${preview.id}`, sessionId, artifact: preview, source: "followup", onClose: () => setPreview(null) }));
+}
+
 function ArtifactFiles({ sessionId, entries }) {
   const [preview, setPreview] = useState(null);
   if (!entries.length) return null;
@@ -387,7 +408,7 @@ function WorkflowApp() {
           if (task.purpose === "answer" && current.state.pending?.attachment_request_id !== task.answer_request_id) throw new Error("当前问题已经变化，请重新查看问题。");
           const query = new URLSearchParams({ ...viewAddress(id), revision: current.revision, name: task.name,
             ...(task.purpose === "answer" ? { answer_request_id: task.answer_request_id, question_id: task.question_id } : { purpose: task.purpose }) });
-          const payload = await fetch(`/api/${task.purpose === "answer" ? "answer-attachments" : task.purpose === "followup_zip" ? "followup-attachments" : "supplement-images"}?${query}`, { method: "POST", credentials: "same-origin",
+          const payload = await fetch(`/api/${task.purpose === "answer" ? "answer-attachments" : task.purpose === "followup_file" ? "followup-attachments" : "supplement-images"}?${query}`, { method: "POST", credentials: "same-origin",
             headers: { "Content-Type": "application/octet-stream", "X-Workflow-Token": csrf.current }, body: task.file }).then(readResponse);
           if (payload.preview_id) receivePreview(payload);
           else if (modelRef.current.sessions[id]) receiveState(payload);
@@ -399,10 +420,19 @@ function WorkflowApp() {
   }
   function addImages(files, purpose = "supplement") {
     const id = modelRef.current.state?.id;
-    if (!id || !(["followup", "followup_zip"].includes(purpose) ? followupEditable : supplementEditable)) return;
+    if (!id || !(purpose === "followup" ? followupEditable : supplementEditable)) return;
     const queue = imageQueues.current[id] ||= { tasks: [], running: false };
     queue.tasks.push(...Array.from(files, file => ({ uid: crypto.randomUUID(), file, name: file.name,
       status: "waiting", error: "", purpose })));
+    publishImageTransfers();
+    uploadImages(id);
+  }
+  function addFollowupFiles(files) {
+    const id = modelRef.current.state?.id;
+    if (!id || !followupEditable) return;
+    const queue = imageQueues.current[id] ||= { tasks: [], running: false };
+    queue.tasks.push(...Array.from(files, file => ({ uid: crypto.randomUUID(), file, name: file.name,
+      status: "waiting", error: "", purpose: file.type.startsWith("image/") || /\.(png|jpe?g|gif|webp|bmp)$/i.test(file.name) ? "followup" : "followup_file" })));
     publishImageTransfers();
     uploadImages(id);
   }
@@ -452,7 +482,7 @@ function WorkflowApp() {
     finally { setRequestsPending(previous => ({ ...previous, [id]: null })); }
   }
   function pasteImages(event, purpose = "supplement") {
-    const files = Array.from(event.clipboardData.items).filter(item => item.kind === "file" && item.type.startsWith("image/"))
+    const files = Array.from(event.clipboardData.items).filter(item => item.kind === "file" && (purpose === "followup" || item.type.startsWith("image/")))
       .map(item => item.getAsFile()).filter(Boolean);
     if (!files.length) return;
     event.preventDefault();
@@ -463,7 +493,8 @@ function WorkflowApp() {
       changeDraft({ [purpose === "followup" ? "reply" : "supplement"]: input.value.slice(0, start) + text + input.value.slice(end) });
       requestAnimationFrame(() => input.setSelectionRange(start + text.length, start + text.length));
     }
-    addImages(files, purpose);
+    if (purpose === "followup") addFollowupFiles(files);
+    else addImages(files, purpose);
   }
   async function removeImage(image, purpose = "supplement") {
     const id = state.id;
@@ -785,7 +816,7 @@ function WorkflowApp() {
       const images = state.followup_images.filter(image => image.history_index === undefined);
       const attachments = state.followup_attachments.filter(entry => entry.history_index === undefined);
       if (busy || transfers.length) return;
-      if (!draft.reply.trim() && !images.length && !attachments.length) { notice.warning({ message: "请填写消息、添加图片或上传 ZIP" }); return; }
+      if (!draft.reply.trim() && !images.length && !attachments.length) { notice.warning({ message: "请填写消息、添加图片或上传文件" }); return; }
       const id = state.id;
       const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), attachment_ids: attachments.map(entry => entry.id), plan_mode: draft.plan_mode, review_enabled: draft.review_enabled });
       if (result) {
@@ -1138,17 +1169,7 @@ function WorkflowApp() {
   }
 
   function renderFollowupFiles(entries, editable = false) {
-    return h("div", { className: "attachment-grid" }, entries.map(entry => h("div", { className: "attachment", key: entry.id },
-      h("div", { className: "attachment-name" }, h("a", {
-        href: `/api/followup-attachments?${new URLSearchParams({ session_id: state.id, attachment_id: entry.id })}`, download: entry.name }, entry.name)),
-      h(Typography.Text, { type: "secondary" }, `${(entry.size / 1024).toFixed(1)} KB · 只读取目录与 XML`),
-      h(Collapse, { ghost: true, items: [{ key: "entries", label: "目录与读取状态", children:
-        entry.entries.length ? entry.entries.map(member => h("div", { className: "attachment-name", key: member.member_id },
-          h("div", null, member.name), h(Typography.Text, { type: member.issue ? "warning" : "secondary" },
-            member.directory ? "目录" : `${member.extension.toUpperCase() || "无扩展名"} · ${member.size} 字节 · ${member.issue || (member.readable ? "XML 可读取" : "仅列出文件信息")}`))) :
-          h(Typography.Text, { type: "secondary" }, "空 ZIP，无目录或文件") }] }),
-      editable && h("div", { className: "supplement-image-actions" }, h(Tag, { color: "success" }, "已上传"),
-        h(Button, { size: "small", type: "text", danger: true, disabled: !followupEditable, onClick: () => removeFollowupFile(entry) }, "移除")))));
+    return h(FollowupFiles, { key: state.id, sessionId: state.id, entries, editable, disabled: !followupEditable, onRemove: removeFollowupFile });
   }
 
   function renderAnswerFiles(entries, editable = false, showQuestion = false) {
@@ -1177,7 +1198,7 @@ function WorkflowApp() {
   }
 
   function renderFeedbackTransfers() {
-    return renderFileTransfers(transfers.filter(task => ["followup", "followup_zip"].includes(task.purpose)), followupEditable);
+    return renderFileTransfers(transfers.filter(task => ["followup", "followup_file"].includes(task.purpose)), followupEditable);
   }
 
   function renderPlan() {
@@ -1284,7 +1305,7 @@ function WorkflowApp() {
           }),
           h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer,
             onPaste: continuing && followupEditable ? event => pasteImages(event, "followup") : undefined,
-            placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
+            placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片和文件…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
           continuing && h(React.Fragment, null,
             h("div", { className: "action-bar" },
               h(Switch, { checked: draft.plan_mode, disabled: !followupEditable, "aria-label": "计划模式", onChange: checked => changeDraft({ plan_mode: checked }) }),
@@ -1295,15 +1316,16 @@ function WorkflowApp() {
               h(Typography.Text, null, "修改后自动 Review"),
               h(Typography.Text, { type: "secondary" }, draft.review_enabled ? "本轮有代码修改时审查，通过后自动本地提交" : "本轮不自动审查或提交，修改保留在工作区")),
             h("div", { className: "supplement-image-tools" },
-              h("input", { type: "file", ref: followupImageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", onChange: event => {
+              h("input", { type: "file", ref: followupImageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", "aria-label": "上传续聊图片", onChange: event => {
                 addImages(event.target.files, "followup"); event.target.value = "";
               } }),
               h(Button, { disabled: !followupEditable, onClick: () => followupImageInput.current.click() }, "上传图片"),
-              h("input", { type: "file", ref: followupZipInput, hidden: true, multiple: true, accept: ".zip", onChange: event => {
-                addImages(event.target.files, "followup_zip"); event.target.value = "";
+              h("input", { type: "file", ref: followupZipInput, hidden: true, multiple: true,
+                accept: ".pdf,.docx,.txt,.md,.csv,.tsv,.json,.xml,.html,.log,.sql,.zip,.png,.jpg,.jpeg,.gif,.webp,.bmp", "aria-label": "上传续聊文件", onChange: event => {
+                addFollowupFiles(event.target.files); event.target.value = "";
               } }),
-              h(Button, { disabled: !followupEditable, onClick: () => followupZipInput.current.click() }, "上传 ZIP"),
-              h(Typography.Text, { type: "secondary" }, `单个不超过 ${model.settings.max_attachment_mb} MB；ZIP 只读取目录与 XML，OFD 等文件仅列出信息`)),
+              h(Button, { disabled: !followupEditable, onClick: () => followupZipInput.current.click() }, "上传文件"),
+              h(Typography.Text, { type: "secondary" }, `支持 PDF、DOCX、常用文本、图片及 ZIP，多选或粘贴；单个不超过 ${model.settings.max_attachment_mb} MB。ZIP 仍只读取目录与 XML`)),
             renderFeedbackImages(state.followup_images.filter(image => image.history_index === undefined), followupEditable),
             renderFollowupFiles(state.followup_attachments.filter(entry => entry.history_index === undefined), followupEditable),
             renderFeedbackTransfers(),

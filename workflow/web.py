@@ -32,6 +32,7 @@ from workflow.pdf_materials import material_files
 from workflow.answer_attachments import answer_request_id, attachment_file, prepare_answer
 from workflow.artifacts import MIME_TYPES, artifact_file, checked_path, preview_artifact, preview_image
 from workflow.followup_attachments import attachment_file as followup_attachment_file, inspect_zip, prepare_attachments
+from workflow.followup_documents import DOCUMENT_EXTENSIONS, attachment_image, prepare_document, preview_document
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -415,18 +416,40 @@ class WebApplication:
         with self.condition:
             runtime = self._supplement_runtime(session_id, revision, purpose="followup")
             maximum = self.settings["zentao"]["max_attachment_mb"] * 1024 * 1024
-            if (not isinstance(name, str) or not name.strip() or Path(name).suffix.lower() != ".zip"
+            if (not isinstance(name, str) or not name.strip() or Path(name).suffix.lower() not in DOCUMENT_EXTENSIONS | {".zip"}
                     or not 0 < len(data) <= maximum):
-                raise WorkflowError("请选择 ZIP 文件，单个文件大小不能超过配置的附件上限。")
-            entries = inspect_zip(data)
+                raise WorkflowError("请选择 PDF、DOCX、常用文本或 ZIP 文件，单个文件大小不能超过配置的附件上限。")
+            extension = Path(name).suffix.lower()
+            entries = inspect_zip(data) if extension == ".zip" else None
             identifier = uuid4().hex
-            path = runtime.engine.store.directory(session_id) / "attachments" / "followup" / f"{identifier}.zip"
+            root = checked_path(runtime.engine.store.directory(session_id), "attachments/followup")
+            relative = f"{identifier}.zip" if extension == ".zip" else f"{identifier}/source{extension}"
+            path = checked_path(root, relative)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
-            runtime.engine.state.setdefault("followup_attachments", []).append({
-                "id": identifier, "name": name, "size": len(data), "path": str(path), "entries": entries})
-            runtime.engine.save()
-            return self.session_payload(runtime)
+            entry = {"id": identifier, "name": name, "size": len(data), "path": str(path)}
+            if entries is not None:
+                entry["entries"] = entries
+            runtime.uploads += 1
+        try:
+            # 文档准备可能执行 PDF 页图转换，不持有全局会话锁。
+            if extension != ".zip":
+                prepare_document(entry, self.settings)
+            with self.condition:
+                if self.closed or runtime.engine.closed or runtime.deleting:
+                    raise WorkflowError("服务或会话已关闭，附件未登记，请重新上传。")
+                runtime.engine.state.setdefault("followup_attachments", []).append(entry)
+                runtime.engine.save()
+                return self.session_payload(runtime)
+        except Exception:
+            if extension == ".zip":
+                path.unlink(missing_ok=True)
+            else:
+                rmtree(path.parent)
+            raise
+        finally:
+            with self.condition:
+                runtime.uploads -= 1
 
     def remove_followup_attachment(self, session_id, revision, attachment_id):
         with self.condition:
@@ -436,7 +459,11 @@ class WebApplication:
             entry = next((entry for entry in entries if entry["id"] == attachment_id and "history_index" not in entry), None)
             if entry is None:
                 raise WorkflowError("附件不在当前待发送消息中。")
-            followup_attachment_file(runtime.engine.store, state, entry).unlink()
+            path = followup_attachment_file(runtime.engine.store, state, entry)
+            if entry.get("kind"):
+                rmtree(path.parent)
+            else:
+                path.unlink()
             entries.remove(entry)
             runtime.engine.save()
             return self.session_payload(runtime)
@@ -1020,6 +1047,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._answer_attachment(query)
             elif path == "/api/followup-attachments":
                 self._followup_attachment(query)
+            elif path in {"/api/followup-attachments/preview", "/api/followup-attachments/image"}:
+                self._followup_document(query, path.endswith("/image"))
             elif path.startswith("/api/artifacts/"):
                 self._artifact(path, query)
             elif path.startswith("/api/"):
@@ -1227,13 +1256,31 @@ class WebHandler(BaseHTTPRequestHandler):
             raise WorkflowError("附件不在当前会话中。")
         data = followup_attachment_file(runtime.engine.store, state, entry).read_bytes()
         self.send_response(200)
-        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Type", "application/zip" if not entry.get("kind") else "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(entry["name"]))
         self.end_headers()
         self.wfile.write(data)
+
+    def _followup_document(self, query, image=False):
+        runtime = self.server.application.sessions.get(query.get("session_id", [None])[0])
+        state, store = runtime.engine.state, runtime.engine.store
+        entry = next((entry for entry in state.get("followup_attachments", [])
+                      if entry["id"] == query.get("attachment_id", [None])[0]), None)
+        if entry is None or not entry.get("kind"):
+            raise WorkflowError("文档附件不在当前会话中。")
+        if image:
+            page = query.get("page", ["1"])[0]
+            if not page.isdecimal():
+                raise WorkflowError("PDF 页码必须为正整数。")
+            path, content_type = attachment_image(store, state, entry, {"page": int(page), "image_id": query.get("image_id", [None])[0]})
+            data = path.read_bytes()
+            self._headers(200, content_type, len(data))
+            self.wfile.write(data)
+        else:
+            self._json(200, preview_document(store, state, entry, query))
 
     def _supplement_image(self, query):
         application = self.server.application

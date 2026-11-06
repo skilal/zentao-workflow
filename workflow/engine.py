@@ -18,6 +18,7 @@ from workflow.compile_checks import compile_context
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import apply_followup_replacements, validate_review_request
 from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
+from workflow.followup_documents import current_attachment_images
 from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
@@ -742,10 +743,12 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             images += state.get("supplement_images", [])
             images += (state.get("followup") or {}).get("images", [])
             images += [entry for entry in submitted_attachments(state) if entry.get("image")]
+            images += current_attachment_images(self.store, state)
             references = []
             for image in images:
                 digest = sha256(Path(image["path"]).read_bytes()).hexdigest()
-                references.append({"path": image["path"], "content_hash": digest})
+                references.append({"path": image["path"], "content_hash": digest,
+                                   **{key: image[key] for key in ("attachment_id", "image_id", "page") if key in image}})
                 if digest not in image_hashes:
                     image_inputs.append({"type": "localImage", "path": image["path"]})
                     image_hashes.add(digest)

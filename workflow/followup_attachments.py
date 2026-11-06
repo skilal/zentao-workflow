@@ -1,4 +1,4 @@
-"""续聊 ZIP 的目录清单及 XML 只读视图，不解压其他成员。"""
+"""续聊附件的消息归属；ZIP 保留目录及 XML 只读规则。"""
 
 from codecs import BOM_UTF8, BOM_UTF16_BE, BOM_UTF16_LE, BOM_UTF32_BE, BOM_UTF32_LE
 from io import BytesIO
@@ -8,6 +8,7 @@ from zipfile import BadZipFile, ZipFile
 from zlib import error as CompressionError
 
 from workflow.settings import WorkflowError
+from workflow.followup_documents import attachment_file, document_view, read_document
 
 
 def decode_xml(data):
@@ -69,15 +70,9 @@ def inspect_zip(data):
     return entries
 
 
-def attachment_file(store, state, entry):
-    path = Path(entry["path"]).resolve()
-    directory = (store.directory(state["id"]) / "attachments" / "followup").resolve()
-    if not path.is_relative_to(directory) or not path.is_file():
-        raise WorkflowError("续聊附件路径无效或文件已不存在。")
-    return path
-
-
 def attachment_view(entry):
+    if entry.get("kind"):
+        return document_view(entry)
     return {key: entry[key] for key in ("id", "name", "size", "entries")}
 
 
@@ -100,6 +95,10 @@ def read_followup_attachment(store, state, arguments):
                   if entry["id"] == arguments.get("attachment_id") and "history_index" in entry), None)
     if entry is None:
         raise WorkflowError("附件不在当前会话已发送的消息中。")
+    if entry.get("kind"):
+        return read_document(store, state, entry, arguments)
+    if arguments.get("page") is not None or arguments.get("image_id") is not None:
+        raise WorkflowError("ZIP 使用 member_id 读取成员，不支持文档页面或图片编号。")
     member_id = arguments.get("member_id")
     if member_id is None:
         return {"attachment": attachment_view(entry)}
