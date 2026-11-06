@@ -239,7 +239,9 @@ def run():
             expect(page.get_by_text("审查中", exact=True).first).to_be_visible()
             expect(page.locator(".conversation-feed").get_by_text("本轮计划实施已完成，继续处理后续检查。", exact=True).last).to_be_visible()
             expect(page.locator(".conversation-feed").get_by_text("已进入 Review，正在审查本轮代码；无待处理问题后自动本地提交。", exact=True).last).to_be_visible()
-            fixture.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": []}))
+            fixture.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": [],
+                                    "commit_messages": [{"repository": repo["name"], "type": "fix", "scope": "业务", "summary": "完善页面处理"}
+                                                        for repo in state["repos"] if any(key.startswith(repo["name"] + "/") for key in state["review_manifest"])]}))
             expect(send).to_be_enabled()
             expect(review_switch).not_to_be_checked()
             expect(page.get_by_label("本轮执行结果")).to_contain_text("Review 已完成，本地提交已完成")

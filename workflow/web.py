@@ -69,7 +69,7 @@ def public_state(state):
             if entry["role"] != "Codex" or not entry["text"].lstrip().startswith(("{", "```")):
                 continue
             try:
-                raw = parse_review(entry["text"])
+                raw = parse_review(entry["text"], review.get("protocol_version", 1))
             except WorkflowError:
                 continue
             if (raw["summary"] == saved.get("summary")
@@ -85,7 +85,7 @@ def public_state(state):
         if index in reviewed_indices or entry.get("phase") != "review" or entry["role"] != "Codex":
             continue
         try:
-            entry["review_output"] = parse_review(entry["text"])
+            entry["review_output"] = parse_review(entry["text"], entry.get("review_protocol", 1))
         except WorkflowError:
             continue
         entry["review_error"] = (result.get("error") if index == len(result["history"]) - 1 and result["phase"] == "review" else "") or "此结果未通过控制器校验，仅供查看，不能用于修复或提交。"

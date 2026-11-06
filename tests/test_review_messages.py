@@ -17,7 +17,7 @@ def review_result():
         "title": "组合条件遗漏", "category": "业务链路问题", "origin": "原有问题",
         "severity": "P2", "previous_id": "", "repository": "后端", "path": "目录/检索.java", "line": 491,
         "evidence": "分组结果缺少当前条件", "suggestion": "补齐当前条件", "impact": "查询范围不准确"
-    }], "resolved_previous": []}
+    }], "resolved_previous": [], "commit_messages": []}
 
 
 class ReviewMessageChecks(TestCase):
@@ -130,7 +130,7 @@ class ReviewMessageChecks(TestCase):
         source = review_result()
         wrong = deepcopy(source)
         wrong["summary"] = "另一段尚未入库的输出"
-        self.flow.note("Codex", dumps(wrong))
+        self.flow.note("Codex", dumps(wrong), review_protocol=2)
         self.complete(dumps(source))
         first = self.state["reviews"][0]
         first.pop("history_index")

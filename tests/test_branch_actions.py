@@ -164,12 +164,16 @@ class BranchActionChecks(TestCase):
         self.assertEqual(Tools(session_id).call("task_context", {})["items"], items)
 
     def test_joint_delivery_commit_description_identifies_both_tasks(self):
+        expected = {"前端/页面.js": "页面差异", "后端/服务.py": "服务差异"}
         self.state.update(stage="等待修复选择", items=[self.state["item"], {"kind": "task", "id": 8, "title": "前端任务"}],
                           repos=[{"name": "前端", "path": "模拟前端工作区"}, {"name": "后端", "path": "模拟后端工作区"}],
-                          reviews=[{"result": {"findings": []}}], review_manifest={})
-        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit", return_value="模拟提交") as commit:
+                          reviews=[{"number": 1, "protocol_version": 2, "result": {"findings": []}, "manifest": expected,
+                                    "commit_messages": {"前端": "feat(页面): 支持检索\n\n关联工作项: 任务 #7、任务 #8",
+                                                        "后端": "feat(检索): 支持范围比较\n\n关联工作项: 任务 #7、任务 #8"}}], review_manifest=expected)
+        with patch("workflow.engine.manifest", return_value=expected), patch("workflow.engine.commit", return_value="模拟提交") as commit:
             self.runtime.engine.finalize([], "")
         self.assertEqual(commit.call_count, 2)
         for call in commit.call_args_list:
-            self.assertIn("zentao-tasks-7,8", call.args[1])
-            self.assertIn("脱敏工作项；前端任务", call.args[1])
+            self.assertIn("关联工作项: 任务 #7、任务 #8", call.args[1])
+            self.assertNotIn("zentao-tasks", call.args[1])
+        self.assertNotEqual(commit.call_args_list[0].args[1], commit.call_args_list[1].args[1])

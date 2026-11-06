@@ -8,6 +8,8 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
+from review_fixtures import commit_messages
+
 from workflow.approvals import is_controlled_write
 from workflow.engine import FINDING_SCHEMA, Workflow
 from workflow.gitops import commit, git, manifest
@@ -68,7 +70,7 @@ class AutoDeliveryChecks(TestCase):
         self.state.update(phase="review", stage="审查中", review_manifest={}, review_prompt_hash="提示词版本")
         self.flow._start_turn("开始审查")
         return dumps({"summary": "静态审查结论", "findings": findings or [],
-                      "resolved_previous": resolved or []}, ensure_ascii=False)
+                      "resolved_previous": resolved or [], "commit_messages": commit_messages(self.state)}, ensure_ascii=False)
 
     def test_one_turn_without_questions_automatically_authorizes_exact_plan(self):
         self.start_plan()
@@ -410,26 +412,33 @@ class AutoDeliveryChecks(TestCase):
         self.assertNotEqual(self.state["phase"], "complete")
 
     def test_partial_failure_preserves_success_and_only_retries_remaining_repository(self):
-        self.state.update(stage="等待修复选择", phase="review", review_manifest={},
+        expected = {"前端/页面.js": "前端差异", "后端/服务.py": "后端差异"}
+        self.state.update(stage="等待修复选择", phase="review", review_manifest=expected,
                           repos=[{"name": "前端", "path": "frontend"}, {"name": "后端", "path": "backend"}],
-                          reviews=[{"result": {"findings": []}}])
-        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit", side_effect=["first-sha", WorkflowError("提交失败")]) as operation:
+                          reviews=[{"number": 1, "protocol_version": 2, "result": {"findings": []}, "manifest": expected,
+                                    "commit_messages": {"前端": "feat(页面): 支持检索", "后端": "feat(检索): 支持范围比较"}}])
+        def current(repos):
+            return {key: value for key, value in expected.items() if any(key.startswith(repo["name"] + "/") for repo in repos)}
+        with patch("workflow.engine.manifest", side_effect=current), patch("workflow.engine.commit", side_effect=["first-sha", WorkflowError("提交失败")]) as operation:
             with self.assertRaises(WorkflowError):
                 self.flow.finalize([], "", automatic=True)
             self.assertEqual(operation.call_count, 2)
         self.assertEqual(self.state["commits"], {"前端": "first-sha"})
         self.assertEqual(self.state["stage"], "部分提交")
         self.flow.pause()
-        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.git", return_value="first-sha"), patch("workflow.engine.working_paths", return_value=[]), patch("workflow.engine.commit", return_value="second-sha") as operation:
+        with patch("workflow.engine.manifest", side_effect=current), patch("workflow.engine.git", return_value="first-sha"), patch("workflow.engine.working_paths", return_value=[]), patch("workflow.engine.commit", return_value="second-sha") as operation:
             self.flow.finalize([], "")
         self.assertEqual(operation.call_count, 1)
         self.assertEqual(operation.call_args.args[0]["name"], "后端")
         self.assertEqual(self.state["phase"], "complete")
 
     def test_first_commit_failure_stops_without_automatic_retry(self):
-        self.state.update(stage="等待修复选择", phase="review", review_manifest={},
-                          repos=[{"name": "前端", "path": "frontend"}], reviews=[{"result": {"findings": []}}])
-        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit", side_effect=WorkflowError("提交失败")) as operation:
+        expected = {"前端/页面.js": "代码差异"}
+        self.state.update(stage="等待修复选择", phase="review", review_manifest=expected,
+                          repos=[{"name": "前端", "path": "frontend"}], reviews=[{
+                              "number": 1, "protocol_version": 2, "result": {"findings": []}, "manifest": expected,
+                              "commit_messages": {"前端": "feat(页面): 支持检索"}}])
+        with patch("workflow.engine.manifest", return_value=expected), patch("workflow.engine.commit", side_effect=WorkflowError("提交失败")) as operation:
             with self.assertRaises(WorkflowError):
                 self.flow.finalize([], "", automatic=True)
         self.assertEqual(operation.call_count, 1)
@@ -510,7 +519,7 @@ class LocalCommitChecks(TestCase):
         state.update(phase="review", stage="审查中", repos=[self.repository], turn_id="review-turn",
                      review_manifest=manifest([self.repository]), review_prompt_hash="固定版本")
         flow.state = state
-        flow.last_message = dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}, ensure_ascii=False)
+        flow.last_message = dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(state)}, ensure_ascii=False)
         flow._completed({"id": "review-turn", "status": "completed"}, state["id"], flow.connection_epoch)
         self.assertEqual(state["phase"], "complete")
         self.assertEqual(state["commits"]["前端"], git(self.source, "rev-parse", "HEAD"))

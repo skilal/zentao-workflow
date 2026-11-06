@@ -531,7 +531,9 @@ class WorkspaceReuseChecks(TestCase):
         second = {"name": "后端", "source": str(other), "path": str(other), "branch": "主分支",
                   "baseline": git(other, "rev-parse", "HEAD"), "base": "refs/heads/主分支"}
         self.state.update(phase="review", stage="部分提交", repos=[record, second],
-                          commits={"前端": first_commit}, review_manifest={}, reviews=[{"result": {"findings": []}}])
+                          commits={"前端": first_commit}, review_manifest={}, reviews=[{"number": 1, "result": {"findings": []}}],
+                          commit_batch={"delivery_round": 1, "review_number": 1, "manifest": {},
+                                        "messages": {"前端": "feat(业务): 完成任务"}})
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
         flow = Workflow(settings, lambda *args: None, store=self.store)
         self.addCleanup(flow.close)

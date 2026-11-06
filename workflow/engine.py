@@ -17,6 +17,7 @@ from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
 from workflow.compile_checks import compile_context, compile_repositories
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import apply_followup_replacements, validate_review_request
+from workflow.commit_messages import COMMIT_INSTRUCTIONS, COMMIT_MESSAGE_SCHEMA, prepare_commit_messages
 from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
 from workflow.followup_documents import current_attachment_images
 from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
@@ -26,14 +27,14 @@ from workflow.pdf_materials import material_files
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.session_titles import collect_session_title, title_generation_context
-from workflow.store import SessionStore, followup_available, session_title, timestamp
+from workflow.store import SessionStore, followup_available, timestamp
 from workflow.user_input import input_request_path, pending_input
 from workflow.workspace_reuse import WorkspaceReuseFlow
 from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.zentao import ZentaoClient, project_context
 
 
-FINDING_SCHEMA = {"type": "object", "properties": {
+LEGACY_FINDING_SCHEMA = {"type": "object", "properties": {
     "summary": {"type": "string"},
     "findings": {"type": "array", "items": {"type": "object", "properties": {
         "title": {"type": "string"}, "category": {"type": "string", "enum": ["超出最小范围", "业务链路问题"]},
@@ -48,30 +49,36 @@ FINDING_SCHEMA = {"type": "object", "properties": {
     }, "required": ["id", "evidence"], "additionalProperties": False}}
 }, "required": ["summary", "findings", "resolved_previous"], "additionalProperties": False}
 
+FINDING_SCHEMA = deepcopy(LEGACY_FINDING_SCHEMA)
+FINDING_SCHEMA["properties"]["commit_messages"] = COMMIT_MESSAGE_SCHEMA
+FINDING_SCHEMA["required"].append("commit_messages")
+
 ACTIVE = {"识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"}
 COMPLETE = {"已完成（静态审查）", "已完成（未审查）"}
 PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中", "compile_fix": "编译修复中", "compile_analysis": "编译分析中"}
 
 
-def parse_review(text):
+def parse_review(text, protocol_version=2):
     """只接收完整 JSON 或单个代码块，并按固定审查协议校验。"""
     match = fullmatch(r"```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```", text.strip(), IGNORECASE)
     try:
         result = loads(match.group(1) if match else text)
     except JSONDecodeError as error:
-        raise WorkflowError("Review 结果不是完整的 JSON，已停止。") from error
-    pending = [(result, FINDING_SCHEMA)]
+        raise WorkflowError("Review 结果不是完整的 JSON，已停止，请重新 Review。") from error
+    if protocol_version not in (1, 2):
+        raise WorkflowError("不支持该 Review 协议版本，请重新 Review。")
+    pending = [(result, LEGACY_FINDING_SCHEMA if protocol_version == 1 else FINDING_SCHEMA)]
     types = {"object": dict, "array": list, "string": str, "integer": int}
     while pending:
         value, schema = pending.pop()
         kind = schema["type"]
         if not isinstance(value, types[kind]) or (kind == "integer" and isinstance(value, bool)):
-            raise WorkflowError("Review 结果字段类型不符合约定结构，已停止。")
+            raise WorkflowError("Review 结果字段类型不符合约定结构，已停止，请重新 Review。")
         if "enum" in schema and value not in schema["enum"]:
-            raise WorkflowError("Review 结果包含不支持的类别、来源或优先级，已停止。")
+            raise WorkflowError("Review 结果包含不支持的类别、来源、优先级或提交类型，已停止，请重新 Review。")
         if kind == "object":
             if set(value) != set(schema["required"]):
-                raise WorkflowError("Review 结果缺少必要字段或包含未知字段，已停止。")
+                raise WorkflowError("Review 结果缺少必要字段或包含未知字段，已停止，请重新 Review。")
             pending.extend((value[key], child) for key, child in schema["properties"].items())
         elif kind == "array":
             pending.extend((entry, schema["items"]) for entry in value)
@@ -208,7 +215,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                     ("repos", "selections", "plan", "plan_hash", "approved_plan", "approved_hash",
                      "approval_source", "plan_round", "fix_round", "max_fix_rounds", "commits",
                      "acceptance", "review_manifest", "review_prompt", "review_prompt_hash", "followup", "review_enabled", "stage",
-                     "uncommitted_manifest", "review_requested", "commit_message", "delivery_request", "compile_check")}
+                     "uncommitted_manifest", "review_requested", "commit_message", "commit_batch", "delivery_request", "compile_check")}
         archived.update(number=number, completed_at=state["updated_at"], reviews=deepcopy(self.current_reviews()),
                         decisions=deepcopy([entry for entry in state["decisions"] if entry.get("delivery_round", 1) == number]))
         if in_progress:
@@ -242,7 +249,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                      max_fix_rounds=state["max_fix_rounds"] if in_progress else self.settings["review"]["max_fix_rounds"], error="",
                      review_manifest={}, review_prompt="", review_prompt_hash="", acceptance=None,
                      review_start=len(state["reviews"]),
-                     uncommitted_manifest={}, review_requested=False, commit_message="", delivery_request=None,
+                     uncommitted_manifest={}, review_requested=False, commit_message="", commit_batch=None, delivery_request=None,
                      review_enabled=review_enabled, approval_source="" if plan_mode else "followup", followup={"text": text.strip(), "images": images,
                          "attachments": attachment_views,
                          "request_id": request_id, "history_index": history_index, "plan_mode": plan_mode, "in_progress": in_progress,
@@ -293,7 +300,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                          "用户明确要求重新 Review、提交或重新提交时，先调用 workflow.request_review 登记请求，"
                          "引用用户原话；需纳入的历史任务文件从 task_context.previous_task_changes 选择，"
                          "先核对当前差异与本次任务范围；范围明确时直接登记，不因 unchanged 为 false 重复要求确认提交。"
-                         "提交标题按用户要求概括并传入 commit_message，未指定则传空字符串。"
+                         "用户指定提交标题时逐字传入 commit_message，未指定则传空字符串；该参数仅约束后续 Review 生成规范标题，不直接作为最终提交信息。"
                          "此显式请求不受修改后自动 Review 开关限制。模型不要自行审查或提交。\n本轮消息：\n" + state["followup"]["text"])
 
     def _apply_review_request(self):
@@ -691,6 +698,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                      "本轮重新发现的问题按当前差异独立判断，origin 为原有问题不代表可以引用历史编号。")
             text += ("\n本轮已选择不修复的问题编号：" + dumps(sorted(skipped_review_ids(state, state.get("delivery_round", 1)))) +
                      "。这些问题保留原编号和记录，不修改、不要求再次选择或填写原因，也不作为待修复问题；不要另建编号重复报告同一问题。")
+            text += "\n" + COMMIT_INSTRUCTIONS
         for repository in compile_repositories(state):
             ensure_baseline(repository)
         if state.get("pause_requested"):
@@ -727,6 +735,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                    "feishu_links": state["snapshot"]["feishu_links"],
                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
+                   "commit_message": state.get("commit_message", "") if phase == "review" else "",
                    "continuation_context": state.get("continuation_context"),
                    "baseline_change": (state.get("baseline_changes") or [None])[-1],
                    "review_enabled": state.get("review_enabled", True),
@@ -920,6 +929,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         self._guard_compile()
         state.pop("baseline_review_pending", None)
         state["review_manifest"] = manifest(state["repos"])
+        state["commit_batch"] = None
         state["phase"] = "review"
         prompt = (ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip()
         if state.get("review_prompt") and state["review_prompt"] != prompt:
@@ -1002,22 +1012,24 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                     if any(key.startswith(repo["name"] + "/") for repo in pending)}
         if manifest(pending) != expected:
             raise WorkflowError("最后一次 Review 后代码发生改变，不能提交。")
+        batch = state.get("commit_batch")
+        review = self.current_reviews()[-1]
+        if state["commits"] and not batch:
+            raise WorkflowError("历史交付已部分提交，但缺少新规范提交信息，请先人工处理部分提交；不会改写已有 commit 或使用旧标题。")
+        if batch:
+            if (batch["delivery_round"] != state.get("delivery_round", 1) or batch["review_number"] != review["number"]
+                    or batch["manifest"] != state["review_manifest"]):
+                raise WorkflowError("冻结的提交信息与本轮审查不符，已停止，请人工核对部分提交。")
+        else:
+            if (review.get("protocol_version") != 2 or "commit_messages" not in review
+                    or review.get("manifest") != state["review_manifest"]):
+                raise WorkflowError("本轮缺少有效的新规范提交标题，请点击“重新 Review”后再提交。")
+            batch = {"delivery_round": state.get("delivery_round", 1), "review_number": review["number"],
+                     "manifest": deepcopy(state["review_manifest"]), "messages": deepcopy(review["commit_messages"])}
+            state["commit_batch"] = batch
         state["acceptance"] = {"ids": [finding["id"] for finding in findings], "reason": acceptance_note,
                                "source": "auto" if automatic else "manual"}
         self.save()
-        title = session_title(state) if state["item"] is None else str(state["item"]["title"])
-        title = title.replace("\n", " ").replace("\r", " ")[:100]
-        message = (f"feat: {title}" if state["item"] is None else
-                   f"feat(zentao-{state['item']['kind']}-{state['item']['id']}): {title}")
-        items = state.get("items", [state["item"]])
-        if len(items) > 1:
-            ids = ",".join(str(item["id"]) for item in items)
-            title = "；".join(str(item["title"]).replace("\n", " ").replace("\r", " ") for item in items)[:100]
-            message = f"feat(zentao-tasks-{ids}): {title}"
-        if (state["item"] is not None and state["item"]["kind"] == "bug") or state.get("delivery_round", 1) > 1:
-            message = message.replace("feat", "fix", 1)
-        if state.get("commit_message"):
-            message = state["commit_message"]
         for repository in pending:
             if self.closed or state.get("pause_requested"):
                 state["stage"] = "部分提交" if state["commits"] else "等待修复选择"
@@ -1025,7 +1037,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                 return
             own = {key: value for key, value in expected.items() if key.startswith(repository["name"] + "/")}
             try:
-                result = commit(repository, message, own)
+                result = commit(repository, batch["messages"][repository["name"]], own) if own else None
             except Exception:
                 state["stage"] = "部分提交" if state["commits"] else "等待修复选择"
                 self.save()
@@ -1268,7 +1280,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             plan = match.group(1).strip() if match else ""
         history_index = len(state["history"])
         self.note("Codex", f"<proposed_plan>\n{plan}\n</proposed_plan>" if state["phase"] == "plan" and plan else text or self.plan_stream,
-                  turn_id=state.get("turn_id"))
+                  turn_id=state.get("turn_id"), **({"review_protocol": 2} if state["phase"] == "review" else {}))
         self.sync_artifacts()
         if state["phase"] == "plan":
             state["plan"] = plan
@@ -1297,6 +1309,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             if manifest(state["repos"]) != state["review_manifest"]:
                 raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
             result = parse_review(text)
+            commit_messages = prepare_commit_messages(state, result["commit_messages"])
             review_number = len(state["reviews"]) + 1
             reviews = self.current_reviews()
             previous = {finding["id"]: finding for finding in reviews[-1]["result"]["findings"]} if reviews else {}
@@ -1316,6 +1329,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                 if old_id not in seen and old_id not in resolved:
                     result["findings"].append(finding.copy())
             state["reviews"].append({"number": review_number, "fix_round": state["fix_round"],
+                                     "protocol_version": 2, "commit_messages": commit_messages,
                                      "delivery_round": state.get("delivery_round", 1), "history_index": history_index,
                                      "prompt_hash": state["review_prompt_hash"], "result": result,
                                      "manifest": state["review_manifest"].copy()})

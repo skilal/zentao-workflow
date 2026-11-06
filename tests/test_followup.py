@@ -12,6 +12,8 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
+from review_fixtures import commit_messages
+
 from workflow.approvals import is_controlled_write
 from workflow.engine import Workflow
 from workflow.gitops import cleanup_workspaces, commit, git, prepare, worktrees
@@ -104,7 +106,7 @@ class FollowupChecks(TestCase):
     def finish(self):
         self.complete("已修复并完成静态检查")
         if self.state["phase"] == "review":
-            self.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": []}))
+            self.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
 
     def request(self, **changes):
         return {"action": "followup", "data": {"text": "测试反馈", "image_ids": [], "review_enabled": True},
@@ -170,7 +172,7 @@ class FollowupChecks(TestCase):
         self.assertEqual(self.state["phase"], "review")
         self.assertEqual(set(self.state["review_manifest"]), {"前端/说明.txt"})
         self.assertIn((ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(), self.calls[-1][1]["input"][0]["text"])
-        self.complete(dumps({"summary": "无问题", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "无问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "已完成（静态审查）")
         self.assertEqual(git(path, "show", "HEAD:业务.txt"), "首轮交付")
         self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "未审查的修改\n")
@@ -194,7 +196,7 @@ class FollowupChecks(TestCase):
         self.assertTrue(any(entry["role"] == "系统" and "计划实施已完成" in entry["text"]
                             for entry in self.state["history"]))
         self.assertIn("已进入 Review", self.state["history"][-1]["display_text"])
-        self.complete(dumps({"summary": "本轮审查通过", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "本轮审查通过", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual((self.state["phase"], self.state["stage"]), ("complete", "已完成（静态审查）"))
         self.assertEqual(len(self.engine.current_reviews()), 1)
         self.assertEqual(git(self.state["repos"][0]["path"], "show", "HEAD:业务.txt"), "本轮规则调整")
@@ -269,7 +271,7 @@ class FollowupChecks(TestCase):
         self.complete("已完成合并修改")
         self.assertEqual(self.state["phase"], "review")
         self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt", "前端/补充.txt"})
-        self.complete(dumps({"summary": "合并审查通过", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "合并审查通过", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "已完成（静态审查）")
         path = repos[0]["path"]
         self.assertEqual(git(path, "show", "HEAD:业务.txt"), "原任务已有代码")
@@ -391,9 +393,9 @@ class FollowupChecks(TestCase):
         self.assertEqual(self.state["phase"], "review")
         self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
         self.assertIn("本机.txt", self.state["repos"][0]["preserved_paths"])
-        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "已完成（静态审查）")
-        self.assertEqual(git(path, "log", "-1", "--format=%s"), "完善保存提示")
+        self.assertEqual(git(path, "log", "-1", "--format=%s"), "fix(业务): 完善保存提示")
         self.assertEqual(git(path, "show", "HEAD:业务.txt"), "上轮未提交代码")
         self.assertEqual(git(path, "diff", "--cached", binary=True), original_index)
         self.assertEqual(git(path, "show", "HEAD:本机.txt"), "本机初始内容")
@@ -459,10 +461,10 @@ class FollowupChecks(TestCase):
         self.complete("已修复并登记请求。")
         self.assertEqual(self.state["phase"], "review")
         self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
-        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         path = Path(self.state["repos"][0]["path"])
         self.assertEqual(git(path, "show", "HEAD:业务.txt"), "上轮正确代码")
-        self.assertEqual(git(path, "log", "-1", "--format=%s"), "修复历史代码")
+        self.assertEqual(git(path, "log", "-1", "--format=%s"), "fix(业务): 修复历史代码")
 
     def test_rolled_back_delivery_can_be_reviewed_and_recommitted(self):
         for mode in ("--mixed", "--soft"):
@@ -484,9 +486,9 @@ class FollowupChecks(TestCase):
                 self.complete("已登记请求。")
                 self.assertEqual(self.state["phase"], "review")
                 self.assertEqual(len(self.state["review_manifest"]), 2)
-                self.complete(dumps({"summary": "重新审查无遗留问题", "findings": [], "resolved_previous": []}))
+                self.complete(dumps({"summary": "重新审查无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
                 for repo in self.state["repos"]:
-                    self.assertEqual(git(repo["path"], "log", "-1", "--format=%s"), "完善业务处理")
+                    self.assertEqual(git(repo["path"], "log", "-1", "--format=%s"), "fix(业务): 完善业务处理")
                     self.assertEqual(git(repo["path"], "show", "HEAD:业务.txt"), f"需要重新交付的代码 {mode}")
                     self.assertFalse(git(repo["path"], "status", "--porcelain"))
 
@@ -555,9 +557,9 @@ class FollowupChecks(TestCase):
         self.complete("已按本轮要求登记请求。")
         self.assertEqual(self.state["phase"], "review")
         self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
-        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "已完成（静态审查）")
-        self.assertEqual(git(path, "log", "-1", "--format=%s"), "完善提示")
+        self.assertEqual(git(path, "log", "-1", "--format=%s"), "fix(业务): 完善提示")
         self.assertEqual(git(path, "show", "HEAD:业务.txt"), "人工调整后的任务改动")
         self.assertEqual(git(path, "show", "HEAD:本机.txt"), "本机初始内容")
         self.assertEqual((path / "本机.txt").read_text(encoding="utf-8"), "无关的本机改动\n")
@@ -602,7 +604,7 @@ class FollowupChecks(TestCase):
         self.engine.rereview()
         self.assertEqual(self.state["phase"], "review")
         self.assertEqual(set(self.state["review_manifest"]), {"前端/业务.txt"})
-        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+        self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "已完成（静态审查）")
 
     def test_requested_review_findings_still_require_user_selection(self):
@@ -611,6 +613,7 @@ class FollowupChecks(TestCase):
         self.complete("已登记请求。")
         result = deepcopy(self.state["reviews"][0]["result"])
         result["findings"][0].pop("id")
+        result["commit_messages"] = commit_messages(self.state)
         with patch("workflow.engine.commit") as committing:
             self.complete(dumps(result))
         committing.assert_not_called()
@@ -653,9 +656,9 @@ class FollowupChecks(TestCase):
             Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": f"第 {number} 轮修复\n"})
             self.complete("已修复")
             self.assertIn("上轮审查：null", self.calls[-1][1]["input"][0]["text"])
-            self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": []}))
+            self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
             self.assertEqual(self.state["phase"], "complete")
-            self.assertTrue(git(path, "log", "-1", "--format=%s").startswith("fix(zentao-story-7):"))
+            self.assertTrue(git(path, "log", "-1", "--format=%s").startswith("fix(业务):"))
             self.assertEqual(self.state["commits"]["后端"], "无代码修改")
             self.assertEqual(self.state["reviews"][0]["result"]["findings"][0]["id"], "R01-01")
         self.assertEqual(self.state["deliveries"][0]["commits"], original)
@@ -763,7 +766,7 @@ class FollowupChecks(TestCase):
             committed.append(repo["name"])
             return commit(repo, message, expected)
         with patch("workflow.engine.commit", side_effect=partial), self.assertRaises(WorkflowError):
-            self.complete(dumps({"summary": "无问题", "findings": [], "resolved_previous": []}))
+            self.complete(dumps({"summary": "无问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "部分提交")
         first = self.state["commits"]["前端"]
         self.engine.finalize([], "")

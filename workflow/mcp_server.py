@@ -147,7 +147,7 @@ class Tools:
             if type(include) is not bool:
                 raise WorkflowError("include_materials 必须为布尔值。")
             snapshot = requirement_context(state)
-            return {**{key: state.get(key) for key in ("item", "items", "project", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage")},
+            return {**{key: state.get(key) for key in ("item", "items", "project", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage", "commit_message")},
                     "snapshot": snapshot if include else {key: snapshot[key] for key in ("blockers", "feishu_links")},
                     "materials_revision": context_hash(snapshot), "materials_included": include,
                     "session_title_generation": title_generation_context(state),

@@ -72,7 +72,14 @@ def run():
                 runtime.engine.last_message = dumps(source, ensure_ascii=False)
                 runtime.engine._completed({"status": "completed"}, state["id"], runtime.engine.connection_epoch)
                 # 历史轮次没有关联字段，必须通过旧记录的内容恢复。
-                state["reviews"][0].pop("history_index")
+                index = state["reviews"][0].pop("history_index")
+                state["reviews"][0].pop("protocol_version")
+                state["reviews"][0].pop("commit_messages")
+                state["reviews"][0]["result"].pop("commit_messages")
+                legacy = deepcopy(source)
+                legacy.pop("commit_messages")
+                state["history"][index]["text"] = dumps(legacy, ensure_ascii=False)
+                state["history"][index].pop("review_protocol")
                 source["findings"][0]["previous_id"] = "R01-01"
                 another = deepcopy(source["findings"][0])
                 another.update(title="边界条件遗漏", previous_id="", severity="P1", origin="本次引入", line=510)
@@ -214,7 +221,7 @@ def run():
                 first.engine.state.update(phase="review", stage="已停止", error="Review 引用了本轮交付中不存在的旧问题 R01-01，请重新 Review。")
                 failed = review_result()
                 failed["findings"][0]["previous_id"] = "R01-01"
-                first.engine.note("Codex", dumps(failed, ensure_ascii=False))
+                first.engine.note("Codex", dumps(failed, ensure_ascii=False), review_protocol=2)
                 invalid = page.get_by_role("region", name="未通过校验的 Review", exact=True)
                 expect(invalid).to_be_visible()
                 expect(invalid.locator(".finding-card")).to_have_count(1)
