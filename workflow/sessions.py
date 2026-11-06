@@ -44,6 +44,10 @@ class SessionManager:
             changed = settle_progress(state, "waiting" if question else "interrupted") or changed
             changed = collect_artifacts(self.store, state) or changed
             changed = collect_session_title(self.store, state) or changed
+            handoff = state.get("workspace_handoff_request")
+            if handoff and handoff.get("started") and handoff["status"] == "working":
+                handoff.update(status="interrupted", error="上次交接中断，请核对目录和备份后明确继续，或恢复原状后取消。")
+                changed = True
             state["rpc_connected"] = False
             if question:
                 state.update(stage="等待人工回答", pause_requested=False,

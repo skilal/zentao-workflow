@@ -29,6 +29,7 @@ from workflow.session_titles import collect_session_title, title_generation_cont
 from workflow.store import SessionStore, followup_available, session_title, timestamp
 from workflow.user_input import input_request_path, pending_input
 from workflow.workspace_reuse import WorkspaceReuseFlow
+from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.zentao import ZentaoClient, project_context
 
 
@@ -94,7 +95,7 @@ def skipped_review_ids(state, delivery_round):
     return skipped
 
 
-class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
+class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
         self.settings = settings
         self.emit = emit
@@ -197,6 +198,8 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         return [deepcopy(available[value]) for value in image_ids]
 
     def followup(self, text, images, request_id, review_enabled, plan_mode=False, attachments=(), compile_check_enabled=None):
+        if self.state.get("workspace_handoff_request"):
+            raise WorkflowError("请先完成或取消本地开发目录交接，再继续原会话。")
         state = self.state
         apply_followup_replacements(self.store, state)
         in_progress = state["phase"] != "complete"
@@ -1066,6 +1069,8 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         self.emit("history", self.state["history"])
 
     def resume(self):
+        if self.state.get("workspace_handoff_request"):
+            raise WorkflowError("请先完成或取消本地开发目录交接。")
         state = self.require_state("已暂停", "已停止")
         if state.get("workspace_reuse_request"):
             raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")

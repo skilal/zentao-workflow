@@ -175,10 +175,16 @@ def prepare(repository, destination, branch, base, create, track=False):
 
 
 def workspace_claims(sessions, excluded_session):
-    return {str(Path(repository["path"]).resolve()).casefold(): session["id"]
+    claims = {str(Path(repository["path"]).resolve()).casefold(): session["id"]
             for session in sessions if session["id"] != excluded_session and session["phase"] != "complete"
             for repository in [*session["repos"], *(repo for repo in session.get("retired_repos", [])
                                                    if repo.get("workspace_owned", True))]}
+    for session in sessions:
+        request = session.get("workspace_handoff_request")
+        if session["id"] != excluded_session and request and request.get("started"):
+            for path in (request["source"], request["target"]):
+                claims[str(Path(path).resolve()).casefold()] = session["id"]
+    return claims
 
 
 def switch_branch(path, selection, baseline):
@@ -454,6 +460,8 @@ def commit(repository, message, expected_manifest):
 
 def cleanup_workspaces(store, state, repositories):
     """全部预检后逐个移除；每次成功都保存进度，不强制清理代码。"""
+    if state.get("workspace_handoff_request"):
+        raise WorkflowError("请先完成或取消本地开发目录交接，再删除会话。")
     directory = store.directory(state["id"])
     workspace = directory / "workspace"
     if not state["repos"] and not state.get("selections") and not workspace.exists():

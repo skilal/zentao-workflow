@@ -27,6 +27,8 @@ class CompileFlow:
         return manifest([repo for repo in compile_repositories(self.state) if repo["role"] == "backend"])
 
     def compile_now(self, request_id):
+        if self.state.get("workspace_handoff_request"):
+            raise WorkflowError("请先完成或取消本地开发目录交接，再执行独立检查。")
         state = self.require_state("已暂停", "已停止", "等待修复选择",
                                    "等待编译选择", "已完成（静态审查）", "已完成（未审查）")
         if state.get("pending") or not state.get("prepare_complete") or not state.get("thread_id"):
@@ -52,7 +54,7 @@ class CompileFlow:
                 raise WorkflowError("当前目录正被其他未完成会话使用，不能启动独立编译检查。")
             head = git(repo["path"], "rev-parse", "HEAD")
             committed = state.get("commits", {}).get(repo["name"]) if state["phase"] == "complete" else None
-            expected = repo["baseline"] if committed in {None, "无代码修改"} else committed
+            expected = repo.get("handoff_head") or (repo["baseline"] if committed in {None, "无代码修改"} else committed)
             if head != expected or git(repo["path"], "branch", "--show-current") != repo["branch"]:
                 raise WorkflowError("工作区 HEAD 或分支已变化，请先变更目录与审查基线。")
             heads[repo["name"]] = head

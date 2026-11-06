@@ -108,6 +108,7 @@ function Field(props) { return h("div", null, h("label", { className: "field-lab
 function mergeHistory(history, state) {
   if (!state) return history || [];
   const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
+  summary.handoff_pending = Boolean(state.workspace_handoff_request);
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
 function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", plan_mode: false, review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
@@ -284,6 +285,50 @@ function ArtifactFiles({ sessionId, entries }) {
     preview && h(ArtifactPreview, { key: `${sessionId}:${preview.id}`, sessionId, artifact: preview, onClose: () => setPreview(null) }));
 }
 
+function WorkspaceHandoff({ state, repository, defaultTarget, busy, onAction, onClose }) {
+  const request = state.workspace_handoff_request;
+  const [target, setTarget] = useState(request?.target || defaultTarget);
+  const [paths, setPaths] = useState(request?.selected_paths || []);
+  useEffect(() => { setPaths(request?.selected_paths || []); }, [request?.token]);
+  useEffect(() => { if (request && !busy && !state.error) setTarget(request.target); }, [request?.token, busy, state.error]);
+  const started = Boolean(request?.started);
+  const matches = request && request.target === target;
+  const cancel = async () => {
+    if (!request || await onAction("cancel_workspace_handoff", { token: request.token })) onClose();
+  };
+  return h(Modal, { title: `交接到本地开发目录 · ${repository.name}`, open: true, width: "min(800px, calc(100vw - 32px))",
+    centered: true, styles: { body: { maxHeight: "60vh", overflow: "auto" } }, maskClosable: false,
+    closable: !started, keyboard: !started, onCancel: cancel,
+    footer: h(Space, { wrap: true }, h(Button, { disabled: busy, onClick: cancel }, started ? "已恢复原状，取消交接" : "取消"),
+      !started && h(Button, { disabled: busy || !target.trim(), onClick: () => onAction("preview_workspace_handoff", { repository: repository.name, path: target.trim() }) }, request ? "重新预览" : "预览交接"),
+      request && h(Button, { type: "primary", disabled: busy || !matches || request.already_here,
+        onClick: () => onAction("confirm_workspace_handoff", { token: request.token, ...(started ? {} : { paths }) }) }, started ? "核对并继续交接" : "确认交接")) },
+    h(Alert, { type: "info", showIcon: true, message: "保留会话，交接已提交的需求代码", description:
+      "源目录会释放目标分支，原会话继续使用开发目录。勾选文件先备份；未勾选改动及 Git 忽略文件原地保留。同文件覆盖须先人工处理，交接不触发编译运行。" }),
+    h(Form, { layout: "vertical", style: { marginTop: 16 } },
+      h(Form.Item, { label: "本地开发目录" }, h(Input, { value: target, disabled: busy || started, "aria-label": "本地开发目录",
+        onChange: event => setTarget(event.target.value) }))),
+    (request?.error || state.error) && h(Alert, { type: "error", showIcon: true, message: "交接已停止", description: request?.error || state.error }),
+    matches && h(React.Fragment, null,
+      request.already_here && h(Alert, { type: "success", message: "已在该开发目录，无需交接。", showIcon: true }),
+      h(Descriptions, { column: 1, size: "small", style: { marginTop: 16 }, items: [
+        { key: "source", label: "源工作目录", children: h(Typography.Text, { copyable: true }, request.source) },
+        { key: "target", label: "目标开发目录", children: h(Typography.Text, { copyable: true }, request.target) },
+        { key: "old_branch", label: "开发目录原分支", children: request.target_branch || "分离 HEAD" },
+        { key: "branch", label: "交接目标分支", children: request.branch },
+        { key: "head", label: "交接提交", children: h(Typography.Text, { code: true, copyable: { text: request.source_head } }, request.source_head.slice(0, 12)) },
+        ...(started ? [{ key: "progress", label: "交接进度", children: ({ backup: "备份本机文件", detach: "释放源分支", switch: "切换开发目录", verify: "核对文件与目录绑定" })[request.step] },
+          { key: "backup", label: "备份位置", children: h(Typography.Text, { copyable: true }, request.backup) }] : []),
+        ...(request.actual ? [{ key: "completed", label: "已完成步骤", children: request.completed_steps.length ? request.completed_steps.join("；") : "尚无已完成步骤" },
+          ...["source", "target"].map(side => ({ key: side, label: side === "source" ? "停止时源目录状态" : "停止时开发目录状态",
+            children: request.actual[side].head ? `${request.actual[side].branch === "HEAD" ? "分离 HEAD" : request.actual[side].branch} · ${request.actual[side].head.slice(0, 12)}` : "无法读取，请人工核对目录" }))] : [])] }),
+      h(Typography.Paragraph, { style: { marginTop: 16 } }, "选择需要备份携带的本机改动（均不纳入需求提交）："),
+      request.target_snapshot.paths.length ? h(Space, { direction: "vertical", style: { maxWidth: "100%" } }, request.target_snapshot.paths.map(path =>
+        h(Checkbox, { key: path, checked: paths.includes(path), disabled: busy || started, style: { overflowWrap: "anywhere" },
+          onChange: event => setPaths(event.target.checked ? [...paths, path] : paths.filter(value => value !== path)) }, path))) :
+        h(Typography.Text, { type: "secondary" }, "目标目录没有本机改动。")));
+}
+
 function WorkflowApp() {
   const [model, setModel] = useState(null);
   const [navCollapsed, setNavCollapsed] = useState(true);
@@ -324,6 +369,7 @@ function WorkflowApp() {
   const [planDetailsOpen, setPlanDetailsOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
   const [baselineDirectoriesOpen, setBaselineDirectoriesOpen] = useState(false);
+  const [handoffRepository, setHandoffRepository] = useState(null);
   const [diffs, setDiffs] = useState(null);
   const [settingsForm] = Form.useForm();
   const settingsModel = Form.useWatch("model", settingsForm);
@@ -703,6 +749,7 @@ function WorkflowApp() {
   }, []);
 
   useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
+  useEffect(() => { setHandoffRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_handoffs?.length]);
 
   const state = model?.state;
   const stage = state?.stage || "";
@@ -1111,7 +1158,11 @@ function WorkflowApp() {
           entry?.candidates.length > 0 && h("p", { className: "muted" }, `AI 候选：${entry.candidates.join("、")}`),
           entry?.refresh_state && h("p", { className: "muted" }, { running: "正在核对远程分支清单…", done: "已核对远程分支清单", failed: "远程分支清单核对失败，修复连接后可恢复当前阶段" }[entry.refresh_state]),
           entry?.fetch_state && h("p", { className: "muted" }, `${{ running: "正在拉取目标分支", done: "已拉取目标分支", failed: "目标分支拉取失败" }[entry.fetch_state]}：${entry.fetch_branch}`),
-          workspace && h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : []), ...(workspace.checkout_backup ? [{ key: "checkout_backup", label: "本机改动备份", children: h(Typography.Text, { copyable: true }, workspace.checkout_backup) }] : [])] }));
+          workspace && h(React.Fragment, null,
+            h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : []), ...(workspace.checkout_backup ? [{ key: "checkout_backup", label: "本机改动备份", children: h(Typography.Text, { copyable: true }, workspace.checkout_backup) }] : [])] }),
+            h(Tooltip, { title: state.handoff_reason || "将已完成需求交接到原 IDEA 开发目录，保留本机改动" }, h("span", null,
+              h(Button, { size: "small", disabled: busy || model.working || Boolean(state.handoff_reason) || Boolean(state.workspace_handoff_request),
+                onClick: () => setHandoffRepository(workspace.name) }, "交接到本地开发目录")))));
       })),
       (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&
         h(CardBox, { title: state.item === null ? "输入需求与验收标准" : "补充需求与验收标准" },
@@ -1547,7 +1598,7 @@ function WorkflowApp() {
               children: h(List, { dataSource: project.rows, locale: { emptyText: "暂无会话，可移入未启动的会话" }, renderItem: entry => {
                 const selected = model.selectedSessionId === entry.id;
                 const canMove = entry.can_move_project && !stopped && !requestsPending[entry.id];
-                const cannotDelete = stopped || entry.working || entry.busy || ACTIVE.has(entry.stage) || entry.stage === "等待人工回答" || entry.stage === "资料读取中";
+                const cannotDelete = stopped || entry.working || entry.busy || entry.handoff_pending || ACTIVE.has(entry.stage) || entry.stage === "等待人工回答" || entry.stage === "资料读取中";
                 const open = () => selectSession(entry.id, ["资料已读取", "资料读取失败"].includes(entry.stage) ? "items" : "plan");
                 return h(List.Item, { key: entry.id, className: `session-entry${selected ? " selected" : ""}`, onClick: open, draggable: Boolean(canMove),
                   title: entry.project_move_reason || "可拖动到其他项目分区",
@@ -1587,6 +1638,8 @@ function WorkflowApp() {
     (state.codex || ["资料已读取", "资料读取失败"].includes(stage)) && state.phase !== "branch" && (state.repos.length > 0 || state.followup);
   const showImplementationPlan = hasImplementationPlan && !implementationPlanHidden;
   const showSidebar = showProjectInfo || showImplementationPlan;
+  const handoffName = state?.workspace_handoff_request?.repository || handoffRepository;
+  const handoffWorkspace = state?.repos.find(repo => repo.name === handoffName);
   return h(ConfigProvider, { locale: antd.locales.zh_CN, theme: { token: { colorPrimary: "rgb(27, 143, 255)", borderRadius: 6, fontSize: 14,
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif' }, components: { Button: { colorLink: "rgb(27, 143, 255)", defaultColor: "rgb(27, 143, 255)", defaultHoverColor: "rgb(27, 143, 255)" } } } },
     noticeHolder, modalHolder,
@@ -1632,6 +1685,8 @@ function WorkflowApp() {
         h(Space, { wrap: true, style: { marginBottom: 16 } }, ...sessionItems(state).map(item =>
           h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
         renderWorkItemMaterials(state.snapshot, { session: state.id }))),
+    handoffWorkspace && h(WorkspaceHandoff, { key: `${state.id}:${handoffName}`, state, repository: handoffWorkspace,
+      defaultTarget: state.handoff_targets[handoffName] ?? "", busy: busy || model.working, onAction: act, onClose: () => setHandoffRepository(null) }),
     h(Modal, { title: `${implementationPlanTitle}详情`, className: "implementation-plan-details", centered: true,
       width: "min(1200px, calc(100vw - 32px))", open: Boolean(planDetailsOpen && hasImplementationPlan && state.plan),
       onCancel: () => setPlanDetailsOpen(false), footer: h(Button, { onClick: () => setPlanDetailsOpen(false) }, "关闭"), destroyOnClose: true },

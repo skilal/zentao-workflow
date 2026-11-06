@@ -17,6 +17,8 @@ BASELINE_STAGES = {"已暂停", "已停止", "等待计划确认", "等待计划
 
 class BaselineFlow:
     def change_baseline(self, token=None, paths=None):
+        if self.state.get("workspace_handoff_request"):
+            raise WorkflowError("请先完成或取消本地开发目录交接，再变更目录与审查基线。")
         state = self.require_state(*BASELINE_STAGES)
         if state.get("manual_compile"):
             raise WorkflowError("请先处理完当前独立编译检查，再变更目录与审查基线。")

@@ -33,6 +33,7 @@ from workflow.answer_attachments import answer_request_id, attachment_file, prep
 from workflow.artifacts import MIME_TYPES, artifact_file, checked_path, preview_artifact, preview_image
 from workflow.followup_attachments import attachment_file as followup_attachment_file, inspect_zip, prepare_attachments
 from workflow.followup_documents import DOCUMENT_EXTENSIONS, attachment_image, prepare_document, preview_document
+from workflow.workspace_handoff import handoff_reason
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -95,6 +96,7 @@ def public_state(state):
 
 def history_summary(state):
     return {**{key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")},
+            "handoff_pending": bool(state.get("workspace_handoff_request")),
             "project": session_project(state), "title": session_title(state)}
 
 
@@ -146,6 +148,10 @@ class WebApplication:
     def session_payload(self, runtime):
         state = public_state(runtime.engine.state)
         state["title"] = session_title(runtime.engine.state)
+        state["handoff_reason"] = handoff_reason(state)
+        state["handoff_targets"] = {repo["name"]: entry["path"] for repo in state["repos"]
+                                    for entry in self.settings["repositories"]
+                                    if "name" in repo and entry["role"] == repo.get("role")}
         repositories = session_repositories(state)
         state["can_edit"] = runtime.engine.editable() and not runtime.engine.closed and not state.get("cleanup", {}).get("finalizing")
         state["project"] = session_project(state)
@@ -677,6 +683,8 @@ class WebApplication:
             if self.busy == "settings" or (global_action and self.busy):
                 raise WorkflowError("全局操作尚未完成，请等待。")
             if runtime:
+                if state.get("workspace_handoff_request") and action not in {"preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff"}:
+                    raise WorkflowError("请先完成或取消本地开发目录交接，再执行其他操作。")
                 if runtime.uploads and action != "pause":
                     raise WorkflowError("该会话正在上传附件，请等待上传完成后再操作。")
                 if runtime.busy and action != "pause":
@@ -685,7 +693,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
@@ -799,6 +807,12 @@ class WebApplication:
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
                 if compile_enabled is not None:
                     arguments = (*arguments, compile_enabled)
+            elif action == "preview_workspace_handoff":
+                operation, arguments = engine.preview_workspace_handoff, (data.get("repository"), data.get("path"))
+            elif action == "confirm_workspace_handoff":
+                operation, arguments = engine.confirm_workspace_handoff, (data.get("token"), data.get("paths"))
+            elif action == "cancel_workspace_handoff":
+                operation, arguments = engine.cancel_workspace_handoff, (data.get("token"),)
             elif action == "preview_workspace_reuse":
                 repository = data.get("repository")
                 if not isinstance(repository, str) or not repository.strip():

@@ -79,7 +79,7 @@ def write_authorized(state):
 
 
 def followup_available(state):
-    if state.get("manual_compile"):
+    if state.get("manual_compile") or state.get("workspace_handoff_request"):
         return False
     phase, stage = state.get("phase"), state.get("stage")
     completed = phase == "complete" and stage in {"已完成（静态审查）", "已完成（未审查）"}
