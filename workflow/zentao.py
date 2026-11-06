@@ -30,6 +30,7 @@ class DescriptionParser(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.images = []
+        self.image_positions = []
         self.links = []
         self.hidden = 0
 
@@ -39,8 +40,9 @@ class DescriptionParser(HTMLParser):
             self.hidden += 1
         if tag in ("p", "div", "br", "li", "tr", "h1", "h2", "h3"):
             self.parts.append("\n")
-        if tag == "img" and values.get("src"):
+        if tag == "img" and values.get("src") and not self.hidden:
             self.images.append(values["src"])
+            self.image_positions.append(len(self.parts))
         if tag == "a" and values.get("href"):
             self.links.append(values["href"])
 
@@ -60,6 +62,35 @@ def parse_description(value):
     parser = DescriptionParser()
     parser.feed(str(value or ""))
     return parser
+
+
+def description_content(data):
+    """保留每次图片引用在原字段正文中的位置，下载去重不影响引用。"""
+    content, locations, parsers = [], [], []
+    for field in ("spec", "verify", "desc", "steps", "bugSteps"):
+        if not data.get(field):
+            continue
+        parsed = parse_description(data[field])
+        parsers.append(parsed)
+        parts, previous = [], 0
+        for index, (url, position) in enumerate(zip(parsed.images, parsed.image_positions), 1):
+            query = parse_qs(urlparse(url).query)
+            file_id = identifier(query["fileID"][0]) if "fileID" in query else None
+            reference = f"；fileID={file_id}" if file_id is not None else ""
+            marker = f"【正文图片：{field}:{index}{reference}】"
+            location = {"marker": marker, "field": field, "index": index,
+                        "file_id": file_id,
+                        "context_before": "".join(parsed.parts[:position]).strip()[-240:],
+                        "context_after": "".join(parsed.parts[position:]).strip()[:240]}
+            locations.append(location)
+            parts.extend(parsed.parts[previous:position])
+            parts.append("\n" + marker + "\n")
+            previous = position
+        parts.extend(parsed.parts[previous:])
+        text = sub(r"\n[ \t]*\n+", "\n\n", "".join(parts)).strip()
+        if text:
+            content.append(f"【{field}】\n{text}")
+    return "\n\n".join(content), locations, parsers
 
 
 def account_of(value):
@@ -289,18 +320,13 @@ class ZentaoClient:
         materials, sources, blockers, feishu, seen = {}, [], [], [], set()
         for document in documents:
             data = document["data"]
-            content = []
-            parsers = []
-            for key in ("spec", "verify", "desc", "steps", "bugSteps"):
-                if data.get(key):
-                    parsed = parse_description(data[key])
-                    parsers.append(parsed)
-                    if items[0]["kind"] != "task" or parsed.text() or parsed.images:
-                        content.append(f"【{key}】\n{parsed.text()}")
+            content, image_locations, parsers = description_content(data)
             source = {"kind": document["kind"], "id": data["id"],
                       "title": data.get("title", data.get("name", "")),
-                      "content": "\n\n".join(content), "raw": data, "selected": document.get("selected", False),
+                      "content": content, "raw": data, "selected": document.get("selected", False),
                       "material_ids": []}
+            if image_locations:
+                source["image_locations"] = image_locations
             if document.get("origin") == "task":
                 source.update(origin="task", version=document["version"], note="来自任务详情的关联需求资料")
             image_urls = {unescape(url) for parser in parsers for url in parser.images}
