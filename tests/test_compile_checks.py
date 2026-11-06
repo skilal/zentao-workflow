@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from workflow.approvals import is_controlled_write
-from workflow.compile_checks import CompileRunner, backend_modules, classify, compile_context, redact, source_snapshot
+from workflow.compile_checks import CompileRunner, DiagnosticOutput, backend_modules, classify, compile_context, redact, source_snapshot
 from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
@@ -181,6 +181,7 @@ class CompileChecks(TestCase):
         self.start([self.code_error()])
         self.assertEqual(self.state["phase"], "compile_fix")
         self.assertEqual(self.state["fix_round"], 2)
+        self.change("档案服务/业务.java", "class 业务 { int 值 = 仍有错误; }\n")
         with patch.object(CompileRunner, "check", return_value=self.code_error()) as check:
             self.flow._compile_repaired()
         self.assertFalse(check.call_args.args[2])
@@ -264,6 +265,37 @@ class CompileChecks(TestCase):
     def test_unrelated_plugin_failure_does_not_turn_java_warning_into_repair(self):
         output = f"[WARNING] {self.repo['path']}/档案服务/业务.java:[1,12] deprecated\n[ERROR] unknown plugin failure"
         self.assertEqual(classify(self.repo, 1, output)["status"], "blocked")
+
+    def test_repeated_and_javac_diagnostics_keep_code_repair_evidence(self):
+        path = self.repo["path"].replace("\\", "/") + "/档案服务/业务.java"
+        message = f"[ERROR] {path}:[1,12] cannot find symbol\n[ERROR] symbol: method 缺少的方法()"
+        result = classify(self.repo, 1, message + "\n" + message)
+        self.assertEqual(result["status"], "code_error")
+        self.assertEqual(len(result["diagnostics"]), 1)
+        result = classify(self.repo, 1, f"{path}:1: error: cannot find symbol")
+        self.assertEqual(result["status"], "code_error")
+
+    def test_unchanged_caller_keeps_diagnostics_for_causal_analysis(self):
+        path = Path(self.repo["path"]) / "技术组件" / "调用方.java"
+        path.write_text("class 调用方 { int 值 = 1; }\n", encoding="utf-8")
+        git(self.repo["path"], "add", "--", "技术组件/调用方.java")
+        git(self.repo["path"], "commit", "-m", "记录原调用方")
+        output = f"[ERROR] {path}:[1,12] cannot find symbol\n[ERROR] symbol: method 已变更的方法()"
+        result = classify(self.repo, 1, output)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["diagnostics"], [])
+        self.assertEqual(result["compiler_diagnostics"][0]["path"], "技术组件/调用方.java")
+        self.assertTrue(result["diagnostics_complete"])
+
+    def test_early_diagnostic_survives_long_following_output(self):
+        capture = DiagnosticOutput()
+        capture.append(f"\x1b[31m[ERROR]\x1b[0m {self.repo['path']}/档案服务/业务.java:[1,12] cannot find symbol\n".encode())
+        capture.append("[ERROR] symbol: method 缺少的方法()\n".encode())
+        for _ in range(100):
+            capture.append(b"progress " * 256 + b"\n")
+        result = classify(self.repo, 1, capture.text())
+        self.assertEqual(result["status"], "code_error")
+        self.assertIn("缺少的方法", result["diagnostics"][0]["message"])
 
     def test_unprefixed_environment_error_and_truncated_location_are_not_lost(self):
         result = classify(self.repo, 1, "The JAVA_HOME environment variable is not defined correctly")

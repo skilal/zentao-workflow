@@ -51,7 +51,9 @@ ZIP 附件的 `archive_entries` 按包内原路径列出文件，`text` 为已�
 
 模型不执行任何命令、编译、构建、测试、运行验证或安装依赖，不替换为其他命令工具。模型只做基础语法、定义合法性、逻辑分支及空值边界的静态检查。会话开启 compile_check.enabled 时，由控制器在实施或修复后按模块执行后端编译检查；前端不构建、不准备依赖，继续参与 Review。离线依赖不足时等待人工明确选择，模型不能代替用户授权下载。上下文 compile_checks 仅提供当前交付的状态、模块及必要诊断；文件哈希和人工授权明细由控制器本地保留。
 
-控制器进入 compile_fix / 编译修复中阶段时，先阅读 task_context 最新 compile_checks 的脱敏诊断、repair_repository 和 repair_paths。仅修复这些文件内由本轮改动引入的编译错误，文件工具会限制范围；不得顺手修改原有问题、依赖或环境。证据不足、规则不清时调用 `workflow.ask_user` 后结束回合；需要扩大范围时以 [需要重做计划] 开头结束回合。完成后由控制器重新检查，修复轮次与 Review 独立计数，达到上限由用户选择。
+控制器进入 compile_analysis / 编译分析中且 automatic_analysis=true 时，按提供的 Schema 只读分析并返回结构化结论。结合 compiler_diagnostics、failure_reasons、task_paths、当前源码与基线核实因果；报错在未修改行不代表与任务无关，须检查本轮修改是否影响了调用方。task_code 的每项修复须提供当前文件逐字 source_excerpt、task_paths 中的 related_path 及因果 reason；无关原有问题、依赖下载、环境变更和证据不足不得登记修复文件。输出格式不匹配会停止，不改用其他协议。
+
+控制器进入 compile_fix / 编译修复中阶段时，先阅读 task_context 最新 compile_checks 的脱敏诊断、analysis、repair_repository 和 repair_paths。自动修复这些文件内与本轮任务有关的编译错误，包括已确认受本轮改动影响的调用方。导入、类型、方法签名、字段名等范围内技术修复直接决定并实施，不再逐项要求人工选择；不得顺手修改无关原有问题、依赖、环境及本机保留文件。仅业务规则或必要资料缺失、证据不足或需要扩大范围时调用 `workflow.ask_user` 后结束回合。独立检查的授权与当前 HEAD 由控制器维护，不能借此扩大代码范围。完成后由控制器重新检查，修复轮次与 Review 独立计数；空转或达到上限时由用户处理，不自行 Review、提交或执行命令。
 
 执行中出现需要业务决策的问题时提出并停止，等待人工回复；扩大范围时先重新计划，由控制器按新一轮记录判断授权方式。
 

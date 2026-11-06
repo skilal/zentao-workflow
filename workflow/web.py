@@ -685,7 +685,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "answer"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
@@ -784,6 +784,9 @@ class WebApplication:
                     raise WorkflowError("请明确确认页面展示的新基准提交。")
                 operation, arguments = engine.checkout_resolved, (baseline,)
             elif action == "followup":
+                compile_enabled = data.get("followup_compile_enabled")
+                if "followup_compile_enabled" in data and type(compile_enabled) is not bool:
+                    raise WorkflowError("本轮编译检查开关必须是布尔值。")
                 plan_mode = data.get("plan_mode", False)
                 if not isinstance(plan_mode, bool):
                     raise WorkflowError("计划模式开关必须为布尔值。")
@@ -794,6 +797,8 @@ class WebApplication:
                 attachments = prepare_attachments(state, data.get("attachment_ids", []))
                 images = engine.validate_followup(text, data.get("image_ids", []), attachments)
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
+                if compile_enabled is not None:
+                    arguments = (*arguments, compile_enabled)
             elif action == "preview_workspace_reuse":
                 repository = data.get("repository")
                 if not isinstance(repository, str) or not repository.strip():
@@ -834,6 +839,8 @@ class WebApplication:
                 if any(not isinstance(data.get(key), str) or not data[key] for key in ("batch_id", "repository", "decision")):
                     raise WorkflowError("请选择当前编译检查及有效操作。")
                 operation, arguments = engine.compile_decision, (data["batch_id"], data["repository"], data["decision"])
+            elif action == "compile_now":
+                operation, arguments = engine.compile_now, (request_id,)
             elif action == "finalize":
                 ids = self._ids(data)
                 operation, arguments = engine.finalize, (ids, str(data.get("note", "")))

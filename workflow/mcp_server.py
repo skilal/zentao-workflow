@@ -7,7 +7,7 @@ from os import scandir
 from pathlib import Path
 from sys import stdin, stdout
 
-from workflow.compile_checks import compile_context
+from workflow.compile_checks import compile_context, compile_repositories
 from workflow.artifacts import ARTIFACT_TOOLS, create_artifact, manifests
 from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
@@ -162,6 +162,7 @@ class Tools:
                     "review_enabled": state.get("review_enabled", True),
                     "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
                     "compile_check": state.get("compile_check", {"enabled": False}),
+                    "repos": compile_repositories(state),
                     "compile_checks": compile_context(state)}
         if name == "set_session_title":
             return register_session_title(self.store, state, arguments.get("title"))
@@ -180,7 +181,7 @@ class Tools:
             temporary.write_text(dumps(request, ensure_ascii=False), encoding="utf-8")
             temporary.replace(path)
             return "审查提交请求已登记。回合结束后由控制器核对文件范围并重新 Review，无遗留问题后执行本地提交。"
-        repositories = {repository["name"]: repository for repository in state["repos"]}
+        repositories = {repository["name"]: repository for repository in compile_repositories(state)}
         if name == "read_files":
             requests = arguments.get("files")
             if not isinstance(requests, list) or not 1 <= len(requests) <= 10:
@@ -233,7 +234,7 @@ class Tools:
             raise WorkflowError("不允许访问依赖、Git 或工作流配置目录。")
         if name not in ("write_file", "replace_text", "delete_file"):
             raise WorkflowError("未知 MCP 工具。")
-        authorized = write_authorized(state) if state.get("approval_source") == "followup" else state.get("approved_hash")
+        authorized = write_authorized(state) if state.get("approval_source") == "followup" or state.get("manual_compile") else state.get("approved_hash")
         if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not authorized:
             raise WorkflowError("当前阶段禁止修改文件，必须等待计划确认或修复选择。")
         if state["stage"] == "编译修复中":

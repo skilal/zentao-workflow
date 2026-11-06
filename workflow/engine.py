@@ -13,8 +13,8 @@ from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
 from workflow.baseline import BaselineFlow
-from workflow.compile_flow import CompileFlow
-from workflow.compile_checks import compile_context
+from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
+from workflow.compile_checks import compile_context, compile_repositories
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import apply_followup_replacements, validate_review_request
 from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
@@ -178,6 +178,8 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
                 and index >= self.state.get("review_start", 0)]
 
     def validate_followup(self, text, image_ids, attachments=()):
+        if self.state.get("manual_compile"):
+            raise WorkflowError("请先在编译检查记录中处理完当前独立检查，再开始新一轮续聊。")
         state = self.state
         if state.get("pending") or pending_input(self.store, state):
             raise WorkflowError("仍有问题等待明确答复，请先从暂停点继续并回答。")
@@ -194,7 +196,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             raise WorkflowError("请填写消息、添加图片或上传 ZIP。")
         return [deepcopy(available[value]) for value in image_ids]
 
-    def followup(self, text, images, request_id, review_enabled, plan_mode=False, attachments=()):
+    def followup(self, text, images, request_id, review_enabled, plan_mode=False, attachments=(), compile_check_enabled=None):
         state = self.state
         apply_followup_replacements(self.store, state)
         in_progress = state["phase"] != "complete"
@@ -203,7 +205,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
                     ("repos", "selections", "plan", "plan_hash", "approved_plan", "approved_hash",
                      "approval_source", "plan_round", "fix_round", "max_fix_rounds", "commits",
                      "acceptance", "review_manifest", "review_prompt", "review_prompt_hash", "followup", "review_enabled", "stage",
-                     "uncommitted_manifest", "review_requested", "commit_message", "delivery_request")}
+                     "uncommitted_manifest", "review_requested", "commit_message", "delivery_request", "compile_check")}
         archived.update(number=number, completed_at=state["updated_at"], reviews=deepcopy(self.current_reviews()),
                         decisions=deepcopy([entry for entry in state["decisions"] if entry.get("delivery_round", 1) == number]))
         if in_progress:
@@ -247,7 +249,10 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         request_path.unlink(missing_ok=True)
         replacement_path = self.store.directory(state["id"]) / f"followup-replacements-{state['delivery_round']}.json"
         replacement_path.unlink(missing_ok=True)
-        self.note("用户", text.strip(), images=images, followup_attachments=attachment_views, request_id=request_id, review_enabled=review_enabled, plan_mode=plan_mode)
+        if compile_check_enabled is not None:
+            state["compile_check"] = {"enabled": compile_check_enabled}
+        self.note("用户", text.strip(), images=images, followup_attachments=attachment_views, request_id=request_id,
+                  review_enabled=review_enabled, plan_mode=plan_mode, compile_check_enabled=state.get("compile_check", {}).get("enabled", False))
         self._prepare_followup()
 
     def _prepare_followup(self):
@@ -683,7 +688,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
                      "本轮重新发现的问题按当前差异独立判断，origin 为原有问题不代表可以引用历史编号。")
             text += ("\n本轮已选择不修复的问题编号：" + dumps(sorted(skipped_review_ids(state, state.get("delivery_round", 1)))) +
                      "。这些问题保留原编号和记录，不修改、不要求再次选择或填写原因，也不作为待修复问题；不要另建编号重复报告同一问题。")
-        for repository in state["repos"]:
+        for repository in compile_repositories(state):
             ensure_baseline(repository)
         if state.get("pause_requested"):
             state["stage"] = "已暂停"
@@ -715,7 +720,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
                    "followup_attachments": submitted_followup_attachments(state),
                    "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
                    "answer_attachments": submitted_attachments(state),
-                   "phase": phase, "repositories": state["repos"], "blockers": state["snapshot"]["blockers"],
+                   "phase": phase, "repositories": compile_repositories(state), "blockers": state["snapshot"]["blockers"],
                    "feishu_links": state["snapshot"]["feishu_links"],
                    "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                    "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
@@ -904,7 +909,8 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             if state["stage"] == "等待计划确认":
                 self._new_plan_round()
             self._start_turn("用户已补充信息：\n" + reply + "\n请从上次暂停点继续；若在计划阶段，输出最终 proposed_plan，由控制器判断是否需要人工确认。",
-                             FINDING_SCHEMA if state["phase"] == "review" else None)
+                             FINDING_SCHEMA if state["phase"] == "review" else COMPILE_ANALYSIS_SCHEMA
+                             if state["phase"] == "compile_analysis" and self._compile_batch().get("automatic_analysis") else None)
 
     def _begin_review(self):
         state = self.state
@@ -1082,7 +1088,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         if state["phase"] == "compile_analysis":
             batch = self._compile_batch()
             entry = next(entry for entry in batch["repositories"] if entry["name"] == batch["analysis_repository"])
-            self._analyze_compile(entry)
+            self._analyze_compile(entry, automatic=batch.get("automatic_analysis", False))
             return
         if state["phase"] == "compile_fix":
             batch = self._compile_batch()

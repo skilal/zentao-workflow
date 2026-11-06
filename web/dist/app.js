@@ -111,6 +111,7 @@ function mergeHistory(history, state) {
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
 }
 function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", plan_mode: false, review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
+  followup_compile_enabled: Boolean(state?.compile_check?.enabled ?? settings?.compile_check_enabled),
   compile_check_enabled: state?.plan_started_at ? Boolean(state.compile_check?.enabled) : Boolean(settings?.compile_check_enabled),
   codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
 const EFFORT_NAMES = { none: "无", minimal: "最低", low: "低", medium: "中", high: "高", xhigh: "很高", max: "最大", ultra: "超高" };
@@ -818,7 +819,8 @@ function WorkflowApp() {
       if (busy || transfers.length) return;
       if (!draft.reply.trim() && !images.length && !attachments.length) { notice.warning({ message: "请填写消息、添加图片或上传文件" }); return; }
       const id = state.id;
-      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), attachment_ids: attachments.map(entry => entry.id), plan_mode: draft.plan_mode, review_enabled: draft.review_enabled });
+      const result = await act("followup", { text: draft.reply, image_ids: images.map(image => image.id), attachment_ids: attachments.map(entry => entry.id), plan_mode: draft.plan_mode, review_enabled: draft.review_enabled,
+        followup_compile_enabled: draft.followup_compile_enabled });
       if (result) {
         if (modelRef.current.selectedSessionId === id) changeDraft({ reply: "", answers: {}, plan_mode: false, review_enabled: false });
         else {
@@ -1262,7 +1264,8 @@ function WorkflowApp() {
               h("div", { className: "chat-meta" }, h("strong", null, entry.role === "控制器" ? "系统" : entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
                 typeof entry.plan_mode === "boolean" && h(Tag, null, `计划模式：${entry.plan_mode ? "开启" : "关闭"}`),
-                typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`)),
+                typeof entry.review_enabled === "boolean" && h(Tag, null, `修改后自动 Review：${entry.review_enabled ? "开启" : "关闭"}`),
+                typeof entry.compile_check_enabled === "boolean" && h(Tag, null, `后端编译检查：${entry.compile_check_enabled ? "开启" : "关闭"}`)),
               h("div", { className: `chat-body${reviewsByMessage.has(entry.index) || entry.review_output ? " review-message" : ""}` },
                 reviewsByMessage.has(entry.index) ? renderReview(reviewsByMessage.get(entry.index), entry.text) :
                   entry.phase === "review" && entry.role === "Codex" ?
@@ -1315,6 +1318,10 @@ function WorkflowApp() {
               h(Switch, { checked: draft.review_enabled, disabled: !followupEditable, "aria-label": "修改后自动 Review", onChange: checked => changeDraft({ review_enabled: checked }) }),
               h(Typography.Text, null, "修改后自动 Review"),
               h(Typography.Text, { type: "secondary" }, draft.review_enabled ? "本轮有代码修改时审查，通过后自动本地提交" : "本轮不自动审查或提交，修改保留在工作区")),
+            h("div", { className: "action-bar" },
+              h(Switch, { checked: draft.followup_compile_enabled, disabled: !followupEditable, "aria-label": "本轮后端编译检查", onChange: checked => changeDraft({ followup_compile_enabled: checked }) }),
+              h(Typography.Text, null, "本轮后端编译检查"),
+              h(Typography.Text, { type: "secondary" }, "修改后自动检查、分析并修复任务相关代码问题；沿用本会话上轮选择")),
             h("div", { className: "supplement-image-tools" },
               h("input", { type: "file", ref: followupImageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", "aria-label": "上传续聊图片", onChange: event => {
                 addImages(event.target.files, "followup"); event.target.value = "";
@@ -1334,7 +1341,11 @@ function WorkflowApp() {
         h(CardBox, { title: "流程操作" }, h(Space, { wrap: true },
           h(Button, { disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
-          h(Button, { disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Object.keys(state.commits || {}).length > 0 ||
+          h(Button, { disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Boolean(state.manual_compile) ||
+            !state.repos.some(repo => repo.role === "backend") || ["plan", "branch", "compile_fix", "compile_analysis"].includes(state.phase) ||
+            !["已暂停", "已停止", "等待修复选择", "等待编译选择", "已完成（静态审查）", "已完成（未审查）"].includes(stage),
+            onClick: () => act("compile_now") }, "立即编译检查"),
+          h(Button, { disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Boolean(state.manual_compile) || Object.keys(state.commits || {}).length > 0 ||
             !["已暂停", "已停止", "等待计划确认", "等待计划补充", "等待修复选择", "等待编译选择"].includes(stage),
             onClick: () => setBaselineDirectoriesOpen(true) }, "变更目录与审查基线"),
           h(Button, { disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
@@ -1374,11 +1385,12 @@ function WorkflowApp() {
     const checks = state.compile_checks || [];
     const latest = checks.at(-1);
     const statusNames = { pending: "等待检查", running: "正在检查", passed: "通过", skipped: "人工跳过",
-      dependencies: "缺少依赖", blocked: "需要人工处理", code_error: "代码错误", excluded: "不再检查",
+      dependencies: "缺少依赖", blocked: "检查未通过", code_error: "代码错误", excluded: "不再检查",
       waiting: "等待处理", repairing: "正在修复", analyzing: "正在分析", complete: "检查完成", invalidated: "结论已失效" };
     const items = checks.map((batch, index) => ({
           key: batch.id, label: h(Space, { size: "small", wrap: true },
             `第 ${index + 1} 次检查 · 第 ${batch.delivery_round} 轮交付 · 自动修复 ${batch.fix_round}/${batch.limit}`,
+            batch.manual_request_id && h(Tag, null, "独立检查"),
             h(Tag, null, statusNames[batch.status])),
           children: h(Space, { direction: "vertical", style: { width: "100%" } }, batch.repositories.length === 0 && "没有需要编译的后端任务改动，前端仍按原流程参与 Review。",
             batch.repositories.map(entry => {

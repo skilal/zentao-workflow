@@ -62,6 +62,11 @@ def session_title(state):
 
 
 def write_authorized(state):
+    manual = state.get("manual_compile")
+    checks = state.get("compile_checks", [])
+    if (manual and state.get("phase") == "compile_fix" and checks and checks[-1]["status"] == "repairing"
+            and checks[-1].get("manual_request_id") == manual["request_id"]):
+        return True
     if state.get("approval_source") == "followup":
         feedback = state["followup"]
         scope = dumps([feedback["text"], [image["id"] for image in feedback["images"]]], ensure_ascii=False)
@@ -74,6 +79,8 @@ def write_authorized(state):
 
 
 def followup_available(state):
+    if state.get("manual_compile"):
+        return False
     phase, stage = state.get("phase"), state.get("stage")
     completed = phase == "complete" and stage in {"已完成（静态审查）", "已完成（未审查）"}
     paused = (stage == "已暂停" and state.get("prepare_complete") and not state.get("commits")

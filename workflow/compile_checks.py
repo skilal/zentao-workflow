@@ -6,7 +6,7 @@ from hashlib import sha256
 from json import dumps
 from os import environ
 from pathlib import Path
-from re import IGNORECASE, escape, finditer, search, sub
+from re import IGNORECASE, finditer, search, sub
 from shutil import which
 from subprocess import CREATE_NO_WINDOW, DEVNULL, PIPE, Popen, TimeoutExpired
 from threading import Event, Lock, Thread
@@ -98,14 +98,23 @@ def compile_context(state):
     backend_names = {repo["name"] for repo in state["repos"] if repo["role"] == "backend"}
     result = {key: batch[key] for key in ("status", "fix_round", "limit")}
     result["repositories"] = [{key: entry[key] for key in
-                               ("name", "status", "modules", "summary", "diagnostics", "failure_reasons", "analysis")
+                               ("name", "status", "modules", "summary", "diagnostics", "failure_reasons", "analysis",
+                                "compiler_diagnostics", "diagnostics_complete")
                                if key in entry}
                               for entry in batch["repositories"] if entry["name"] in backend_names]
     if batch.get("analysis_repository") in backend_names:
         result["analysis_repository"] = batch["analysis_repository"]
+        result["automatic_analysis"] = batch.get("automatic_analysis", False)
+        result["task_paths"] = batch.get("task_paths", {})
     if batch.get("repair_repository") in backend_names:
         result.update(repair_repository=batch["repair_repository"], repair_paths=batch["repair_paths"])
     return [result]
+
+
+def compile_repositories(state):
+    """独立检查使用点击时的 HEAD，不改写会话原审查基线。"""
+    manual = state.get("manual_compile")
+    return [{**repo, "baseline": manual["heads"][repo["name"]]} for repo in state["repos"]] if manual else state["repos"]
 
 
 def source_snapshot(repository):
@@ -186,48 +195,65 @@ def backend_modules(repository):
     return sorted(modules)
 
 
-def code_diagnostics(repository, output):
-    """只把明确位于本次新增/修改行的编译诊断判为可自动修复。"""
-    paths = working_paths(repository)
-    evidence = []
-    for relative in paths:
-        if not relative.endswith(".java"):
+def compiler_diagnostics(repository, output):
+    """保留编译器位置证据；支持 Maven 和 javac 的明确错误格式并去重。"""
+    normalized = sub(r"\x1b\[[0-9;]*[A-Za-z]", "", output).replace("\\", "/")
+    root = Path(repository["path"]).resolve().as_posix()
+    diagnostics, locations, complete = {}, 0, True
+    lines = normalized.splitlines()
+    pattern = (r"^(?P<path>.+?\.java)\s*(?:[:\s]*\[(?P<bracket>\d+)(?:[,：:]\d+)?\]"
+               r"|\((?P<paren>\d+)(?:,\d+)?\)|:(?P<colon>\d+)(?::\d+)?):?\s*(?P<message>.*)$")
+    for index, raw in enumerate(lines):
+        error_prefix = bool(search(r"^\s*\[ERROR\]", raw))
+        line = sub(r"^\s*\[ERROR\]\s*", "", raw).strip()
+        match = search(pattern, line)
+        if not match or (not error_prefix and not search(r"^(?:error|错误)\s*[:：]", match["message"], IGNORECASE)):
             continue
-        path = safe_file(repository, relative)
-        if not path.is_file():
+        locations += 1
+        filename = match["path"].strip()
+        relative = filename[len(root) + 1:] if filename.casefold().startswith(root.casefold() + "/") else filename
+        try:
+            path = safe_file(repository, relative)
+        except WorkflowError:
+            complete = False
             continue
-        filename = relative.replace("\\", "/")
-        normalized = output.replace("\\", "/")
-        pattern = r"(?:" + escape(filename) + r")[\s:]*[\[(:]\s*(\d+)(?:[,：:]\d+)?[\])]?"
-        matches = list(finditer(pattern, normalized))
-        if not matches:
+        number = int(match["bracket"] or match["paren"] or match["colon"])
+        message = match["message"].strip()
+        if number < 1 or not path.is_file() or not message:
+            complete = False
             continue
-        tracked = git(repository["path"], "ls-files", "--error-unmatch", "--", relative, optional=True)
-        ranges = []
-        if tracked:
-            patch = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "HEAD", "--", relative)
-            for hunk in finditer(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch):
-                start, count = int(hunk[1]), int(hunk[2] or 1)
-                ranges.append((start, start + count))
-        for match in matches:
-            line = int(match[1])
-            if tracked and not any(start <= line < end for start, end in ranges):
-                return []
-            lines = normalized[match.end():].split("\n")
-            message = lines[0].strip()
-            if not message:
-                return []
-            for continuation in lines[1:4]:
-                continuation = sub(r"^\s*\[ERROR\]\s*", "", continuation).strip()
-                if not search(r"^(?:symbol|location|符号|位置)\s*[:：]", continuation, IGNORECASE):
-                    break
-                message += "；" + continuation
-            evidence.append({"path": relative, "line": line, "message": redact(message)[:600]})
-    # 诊断指向其他文件时，不能仅凭部分证据自动修复。
-    all_locations = list(finditer(r"[^\s\[\]():]+\.java[:\s]*[\[(:]\d+", output.replace("\\", "/")))
-    if not evidence or len(all_locations) > len(evidence):
+        for continuation in lines[index + 1:index + 4]:
+            continuation = sub(r"^\s*\[ERROR\]\s*", "", continuation).strip()
+            if not search(r"^(?:symbol|location|符号|位置)\s*[:：]", continuation, IGNORECASE):
+                break
+            message += "；" + continuation
+        relative = path.relative_to(Path(repository["path"]).resolve()).as_posix()
+        entry = {"path": relative, "line": number, "message": redact(message)[:600]}
+        diagnostics[(relative, number, entry["message"])] = entry
+    return {"items": list(diagnostics.values())[:24], "complete": complete and locations > 0 and len(diagnostics) <= 24}
+
+
+def code_diagnostics(repository, output, parsed=None):
+    """直接自动修复仍限本轮变更行，其他位置交给后续因果分析。"""
+    parsed = compiler_diagnostics(repository, output) if parsed is None else parsed
+    if not parsed["complete"] or not parsed["items"]:
         return []
-    return list({(item["path"], item["line"], item["message"]): item for item in evidence}.values())[:12]
+    changed = set(working_paths(repository))
+    ranges = {}
+    for item in parsed["items"]:
+        relative = item["path"]
+        if relative not in changed:
+            return []
+        if relative not in ranges:
+            tracked = git(repository["path"], "ls-files", "--error-unmatch", "--", relative, optional=True)
+            ranges[relative] = None
+            if tracked:
+                patch = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--unified=0", "HEAD", "--", relative)
+                ranges[relative] = [(int(hunk[1]), int(hunk[1]) + int(hunk[2] or 1)) for hunk in
+                                    finditer(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch)]
+        if ranges[relative] is not None and not any(start <= item["line"] < end for start, end in ranges[relative]):
+            return []
+    return parsed["items"]
 
 
 def failure_reasons(repository, output):
@@ -258,19 +284,57 @@ def classify(repository, returncode, output):
     reasons = failure_reasons(repository, output)
     if any(marker in lower for marker in ENVIRONMENT_ERRORS):
         return {"status": "blocked", "summary": "环境、网络或工具配置异常，具体原因见下方；处理后可重新检查。",
-                "diagnostics": [], "failure_reasons": reasons}
+                "diagnostics": [], "failure_reasons": reasons, "failure_kind": "environment"}
     if any(marker in lower for marker in DEPENDENCY_ERRORS) or (
             "offline" in lower and any(marker in lower for marker in ("cannot access", "cannot resolve"))):
         return {"status": "dependencies", "summary": "本机缺少依赖或 Maven 插件，可选择补齐依赖并重新检查；下载须明确授权。",
-                "diagnostics": [], "failure_reasons": reasons}
+                "diagnostics": [], "failure_reasons": reasons, "failure_kind": "dependencies"}
     has_code_error = any(marker in lower for marker in CODE_ERRORS) or search(
         r"(?m)^\s*\[ERROR\][^\r\n]*\.java[:\s]*[\[(:]\d+", output.replace("\\", "/"))
-    evidence = code_diagnostics(repository, output) if has_code_error else []
+    parsed = compiler_diagnostics(repository, output)
+    has_code_error = has_code_error or bool(parsed["items"])
+    evidence = code_diagnostics(repository, output, parsed) if has_code_error else []
     if evidence:
         return {"status": "code_error", "summary": "编译诊断明确指向本轮修改的代码。", "diagnostics": evidence,
                 "failure_reasons": reasons}
     return {"status": "blocked", "summary": "检查未通过，尚不能确认属于本次引入的代码错误，可先分析失败原因。",
-            "diagnostics": [], "failure_reasons": reasons}
+            "diagnostics": [], "failure_reasons": reasons,
+            "compiler_diagnostics": parsed["items"], "diagnostics_complete": parsed["complete"],
+            "analysis_required": bool(reasons or parsed["items"]), "failure_kind": "code" if has_code_error else "unknown"}
+
+
+class DiagnosticOutput:
+    """每个输出流保留诊断块和末尾摘要，避免后续进度挤掉前面的错误。"""
+
+    def __init__(self):
+        self.tail = deque(maxlen=32)
+        self.errors = []
+        self.error_bytes = 0
+        self.remaining = b""
+        self.context = 0
+
+    def append(self, chunk):
+        self.tail.append(chunk)
+        lines = (self.remaining + chunk).split(b"\n")
+        self.remaining = lines.pop()
+        for line in lines:
+            self.capture(line)
+
+    def capture(self, line):
+        text = sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line.decode("utf-8", errors="replace"))
+        error = bool(search(r"^\s*\[(?:ERROR|FATAL)\]|\.java[:(].*\berror\s*:", text, IGNORECASE))
+        if error:
+            self.context = 4
+        if (error or self.context) and self.error_bytes + len(line) < 128 * 1024:
+            self.errors.append(line)
+            self.error_bytes += len(line) + 1
+        self.context = max(0, self.context - 1)
+
+    def text(self):
+        if self.remaining:
+            self.capture(self.remaining)
+            self.remaining = b""
+        return (b"\n".join(self.errors) + b"\n" + b"".join(self.tail)).decode("utf-8", errors="replace")
 
 
 class CompileRunner:
@@ -294,7 +358,7 @@ class CompileRunner:
             raise WorkflowError("编译工具路径或参数包含不支持的命令字符，请人工处理。")
         environment = dict(environ)
         environment["CI"] = "true"
-        chunks = deque(maxlen=32)
+        streams = [DiagnosticOutput(), DiagnosticOutput()]
         with self.lock:
             if self.cancelled.is_set():
                 raise WorkflowError("编译检查已暂停。")
@@ -309,12 +373,13 @@ class CompileRunner:
                 self.tree = None
                 raise
 
-        def collect(stream):
+        def collect(stream, output):
             while chunk := stream.read(2048):
-                chunks.append(chunk)
+                output.append(chunk)
             stream.close()
 
-        readers = [Thread(target=collect, args=(stream,), daemon=True) for stream in (process.stdout, process.stderr)]
+        readers = [Thread(target=collect, args=(stream, output), daemon=True)
+                   for stream, output in zip((process.stdout, process.stderr), streams)]
         for reader in readers:
             reader.start()
         while process.poll() is None:
@@ -330,7 +395,7 @@ class CompileRunner:
             reader.join()
         if self.cancelled.is_set():
             raise WorkflowError("编译检查已暂停。")
-        return process.returncode, b"".join(chunks).decode("utf-8", errors="replace")
+        return process.returncode, "\n".join(output.text() for output in streams)
 
     def check(self, repository, modules, download=False):
         if repository["role"] != "backend":
