@@ -8,12 +8,13 @@ from pathlib import Path
 from sys import stdin, stdout
 
 from workflow.compile_checks import compile_context
+from workflow.artifacts import ARTIFACT_TOOLS, create_artifact, manifests
 from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
 from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
 from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, safe_file
-from workflow.settings import WorkflowError
+from workflow.settings import WorkflowError, load_settings
 from workflow.session_titles import register_session_title, title_generation_context
 from workflow.store import SessionStore, write_authorized
 from workflow.user_input import pending_input, register_input
@@ -28,6 +29,13 @@ FILE_ARGS = {"repository": STRING, "path": STRING}
 LINE_ARGS = {"start_line": {"type": "integer", "minimum": 1},
              "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}
 TOOLS = [
+    ("create_artifact", "生成独立会话成果，不修改业务仓库。text 的 content 为 UTF-8 字符串；docx/pdf 为 {blocks:[{type:heading,text,level?}|{type:paragraph,text}|{type:list,items,ordered?}|{type:table,rows:二维字符串数组}]}；xlsx 为 {sheets:[{name,rows:二维单元格数组,column_widths?:数字数组}]}，单元格为字符串/数字/布尔/null 或 {value,bold?,number_format?} 或 {formula:以等号开头的字符串,bold?,number_format?}。普通字符串始终按文本保存。", schema({
+        "name": STRING, "format": {"type": "string", "enum": ["text", "docx", "xlsx", "pdf"]},
+        "content": {"anyOf": [{"type": "string"}, {"type": "object"}]}
+    }, ("name", "format", "content"))),
+    ("publish_artifact", "将当前会话工作区内已有的普通文件复制为独立成果，提供预览和下载；name 为展示及下载文件名，不修改源文件。", schema({
+        **FILE_ARGS, "name": STRING
+    }, ("repository", "path", "name"))),
     ("read_followup_attachment", "只读已发送的续聊 ZIP；不指定成员编号时返回目录清单，指定 member_id 时按行读取 XML，其他格式仅列出信息。", schema({"attachment_id": STRING, "member_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("read_answer_attachment", "按编号只读已提交的问题附件；图片返回图片内容，文本按行分页，无法解析时明确返回限制。", schema({"attachment_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
@@ -145,6 +153,7 @@ class Tools:
                     "supplement_images": state.get("supplement_images", []),
                     "answer_attachments": submitted_attachments(state),
                     "followup_attachments": submitted_followup_attachments(state),
+                    "artifacts": manifests(self.store, state),
                     "delivery_round": state.get("delivery_round", 1), "followup": state.get("followup"),
                     "continuation_context": state.get("continuation_context"),
                     "baseline_change": (state.get("baseline_changes") or [None])[-1],
@@ -160,6 +169,8 @@ class Tools:
             return read_answer_attachment(self.store, state, arguments)
         if name == "read_followup_attachment":
             return read_followup_attachment(self.store, state, arguments)
+        if name in ARTIFACT_TOOLS:
+            return create_artifact(self.store, state, arguments, load_settings(), SKIP)
         if name == "request_review":
             request = validate_review_request(state, arguments)
             path = self.store.directory(self.session_id) / f"review-request-{state['delivery_round']}.json"
@@ -325,7 +336,7 @@ def serve(session_id):
                           "capabilities": {"tools": {}}, "serverInfo": {"name": "workflow", "version": "0.1.0"}}
             elif method == "tools/list":
                 result = {"tools": [{"name": name, "description": description, "inputSchema": definition,
-                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title"),
+                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", *ARTIFACT_TOOLS),
                                                      "openWorldHint": False}} for name, description, definition in TOOLS]}
             elif method == "tools/call":
                 try:

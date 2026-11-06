@@ -8,6 +8,7 @@ TOOL_LABELS = {
     "read_files": "批量读取文件", "baseline_file": "读取基线文件", "search_text": "搜索代码",
     "changes": "查看代码差异", "write_file": "写入文件", "replace_text": "修改文件",
     "delete_file": "删除文件", "ask_user": "等待你的回答", "request_review": "登记审查请求",
+    "create_artifact": "生成成果文件", "publish_artifact": "返回成果文件",
     "set_session_title": "生成会话名称",
 }
 ITEM_LABELS = {"reasoning": "模型正在思考中", "agentMessage": "生成回复", "plan": "生成计划",

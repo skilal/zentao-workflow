@@ -79,6 +79,9 @@ button, input, textarea { font: inherit; }
 .markdown-body th, .markdown-body td { padding: 8px 12px; border: 1px solid #e7ebf1; min-width: 90px; text-align: left; }
 .markdown-body th { background: #f6f8fb; color: #25354b; font-weight: 600; }
 .markdown-body hr { margin: 18px 0; border: 0; border-top: 1px solid #e7ebf1; }
+.artifact-files { margin-top: 12px; }
+.artifact-toolbar { margin: 12px 0; }
+.artifact-text { white-space: pre-wrap; overflow-wrap: anywhere; font-family: Consolas, "Microsoft YaHei", monospace; }
 .source-block + .source-block { margin-top: 22px; padding-top: 20px; border-top: 1px solid #edf0f5; }
 .source-heading { margin-bottom: 12px; display: flex; align-items: center; gap: 7px; }
 .materials-drawer .source-heading { flex-wrap: wrap; overflow-wrap: anywhere; }

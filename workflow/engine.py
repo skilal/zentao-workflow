@@ -9,6 +9,7 @@ from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
 
 from workflow.approvals import is_controlled_write
+from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
 from workflow.baseline import BaselineFlow
@@ -164,6 +165,11 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
     def note(self, role, text, **metadata):
         self.store.append(self.state, role, text, **metadata)
         self.emit("message", {"role": role, "text": text})
+
+    def sync_artifacts(self):
+        with self.lock:
+            if collect_artifacts(self.store, self.state):
+                self.save()
 
     def current_reviews(self):
         return [entry for index, entry in enumerate(self.state["reviews"])
@@ -1030,6 +1036,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             self.compile_runner.stop()
         state["stage"] = "部分提交" if state["commits"] else "已暂停"
         self.set_progress_status("interrupted")
+        self.sync_artifacts()
         state["last_output"] = self.last_message or "\n\n".join(self.output.values())
         self.save()
         if self.rpc and state.get("turn_id") and was_active and state["phase"] != "compile":
@@ -1042,6 +1049,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         self._close_rpc()
         self.state = self.store.load(session_id)
         settle_progress(self.state, "interrupted")
+        collect_artifacts(self.store, self.state)
         self.state["rpc_connected"] = False
         if self.state["stage"] in ACTIVE:
             self.state["stage"] = "已暂停"
@@ -1157,6 +1165,8 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
                 self.completed_plan = item["text"].strip()
             elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") == "ask_user":
                 self.submit(self._wait_for_user_input, self.state["id"], epoch, control=True)
+            elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") in ARTIFACT_TOOLS:
+                self.sync_artifacts()
             elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") == "set_session_title":
                 self.save()
         elif method == "turn/started":
@@ -1188,6 +1198,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             with self.lock:
                 if self.state:
                     self.state["rpc_connected"] = False
+                    self.sync_artifacts()
                     if self._capture_user_input():
                         self.state["pending"]["turn_completed"] = True
                     elif self.state["stage"] in ACTIVE:
@@ -1205,6 +1216,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         apply_followup_replacements(self.store, state)
         self.set_progress_status("waiting" if state.get("pending") else
                              {"completed": "completed", "interrupted": "interrupted"}.get(turn.get("status"), "failed"))
+        self.sync_artifacts()
         if state.get("pause_requested"):
             state["stage"] = "已暂停"
             self.save()
@@ -1241,7 +1253,9 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             match = search(r"<proposed_plan>([\s\S]*?)</proposed_plan>", text)
             plan = match.group(1).strip() if match else ""
         history_index = len(state["history"])
-        self.note("Codex", f"<proposed_plan>\n{plan}\n</proposed_plan>" if state["phase"] == "plan" and plan else text or self.plan_stream)
+        self.note("Codex", f"<proposed_plan>\n{plan}\n</proposed_plan>" if state["phase"] == "plan" and plan else text or self.plan_stream,
+                  turn_id=state.get("turn_id"))
+        self.sync_artifacts()
         if state["phase"] == "plan":
             state["plan"] = plan
             state["plan_hash"] = sha256(plan.encode("utf-8")).hexdigest() if plan else ""
@@ -1321,6 +1335,7 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
             self.control_executor.shutdown(wait=True, cancel_futures=True)
             if self.state:
                 self.state["rpc_connected"] = False
+                collect_artifacts(self.store, self.state)
                 if self.state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}:
                     self.state["stage"] = "已暂停"
                     self.state["pause_requested"] = True

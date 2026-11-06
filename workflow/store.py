@@ -93,7 +93,7 @@ def initial_state(item, record_id):
         "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
         "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],
         "plan_round": None, "approval_source": "",
-        "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [],
+        "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [], "artifacts": [],
         "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
         "delivery_round": 1, "deliveries": [], "followup_images": [], "followup_attachments": [], "answer_attachments": [],
     }

@@ -193,6 +193,75 @@ function ZentaoProjectSelect({ candidates, ...props }) {
     error && h(Typography.Text, { type: "danger" }, error));
 }
 
+function ArtifactPreview({ sessionId, artifact, onClose, source = "artifact" }) {
+  const [page, setPage] = useState(1);
+  const [sheet, setSheet] = useState("");
+  const [content, setContent] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [imageError, setImageError] = useState(false);
+  const base = source === "followup" ? "/api/followup-attachments" : "/api/artifacts";
+  const address = { session_id: sessionId, [source === "followup" ? "attachment_id" : "artifact_id"]: artifact.id };
+  const downloadUrl = `${base}${source === "followup" ? "" : "/download"}?${new URLSearchParams(address)}`;
+  useEffect(() => {
+    const controller = new AbortController();
+    setLoading(true); setError(""); setContent(null); setImageError(false);
+    const query = new URLSearchParams({ ...address, page, ...(sheet ? { sheet } : {}) });
+    fetch(`${base}/preview?${query}`, { credentials: "same-origin", cache: "no-store", signal: controller.signal })
+      .then(readResponse).then(setContent)
+      .catch(error => { if (error.name !== "AbortError") setError(error.message); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [sessionId, artifact.id, page, sheet, source]);
+  const imageUrl = `${base}/image?${new URLSearchParams({ ...address, page })}`;
+  const renderTable = (rows, key) => h("div", { className: "markdown-body", key }, h("table", null,
+    h("tbody", null, rows.map((row, index) => h("tr", { key: index }, row.map((cell, column) =>
+      h("td", { key: column }, cell === null ? "" : String(cell))))))));
+  return h(Drawer, { title: `文件预览 · ${artifact.name}`, open: true, width: "min(100vw, 960px)", onClose,
+    extra: h(Button, { href: downloadUrl, download: artifact.name }, "下载原文件") },
+    loading && h(Spin, { tip: "正在读取预览…" }),
+    error && h(Alert, { type: "error", showIcon: true, message: "预览失败", description: error }),
+    content && h(React.Fragment, null,
+      content.kind === "unsupported" && h(Alert, { type: "info", message: content.issue, showIcon: true }),
+      content.issue && content.kind !== "unsupported" && h(Alert, { type: "warning", message: "部分内容未读取", description: content.issue, showIcon: true }),
+      content.kind === "xlsx" && h(Space, { className: "artifact-toolbar", wrap: true },
+        h(Select, { value: content.sheet, options: content.sheets.map(value => ({ value, label: value })),
+          onChange: value => { setSheet(value); setPage(1); }, style: { minWidth: 180 } }),
+        h(Typography.Text, { type: "secondary" }, "公式显示原文，下载后由 Excel 计算。")),
+      ["text", "markdown"].includes(content.kind) && (content.kind === "markdown" ?
+        h(Markdown, { text: content.items.join("\n") }) : h("pre", { className: "artifact-text" }, content.items.join("\n"))),
+      content.kind === "docx" && content.items.map((block, index) => block.type === "table" ? renderTable(block.rows, index) :
+        block.type === "image" ? h("div", { className: "attachment", key: index },
+          h(Image, { src: `${base}/image?${new URLSearchParams({ ...address, image_id: block.image_id })}`,
+            alt: `Word 图片 ${block.image_id}`, preview: { mask: "放大查看" } }), h("div", { className: "attachment-name" }, `图片 ${block.image_id}`)) :
+        block.type === "list" ? h(block.ordered ? "ol" : "ul", { key: index }, block.items.map((text, item) => h("li", { key: item }, text))) :
+        /^Heading [1-6]$/.test(block.style) ? h(`h${block.style.slice(-1)}`, { key: index }, block.text) :
+          h("p", { key: index }, block.text)),
+      content.kind === "xlsx" && renderTable(content.items, "cells"),
+      ["image", "pdf"].includes(content.kind) && (imageError ? h(Alert, { type: "error", message: "图片预览失败，请下载原文件查看。" }) :
+        h(Image, { src: imageUrl, alt: artifact.name, width: "100%", onError: () => setImageError(true), preview: { mask: "放大查看" } })),
+      content.page && h(Space, { className: "artifact-toolbar", wrap: true },
+        h(Button, { disabled: page <= 1 || loading, onClick: () => setPage(page - 1) }, "上一页"),
+        h("span", null, content.kind === "pdf" ? `第 ${page} / ${content.total} 页` : `第 ${page} 页 · 共 ${content.total} ${content.kind === "docx" ? "段内容" : "行"}`),
+        h(Button, { disabled: !content.has_next || loading, onClick: () => setPage(page + 1) }, "下一页"))));
+}
+
+function ArtifactFiles({ sessionId, entries }) {
+  const [preview, setPreview] = useState(null);
+  if (!entries.length) return null;
+  return h("div", { className: "artifact-files" }, h(Typography.Text, { strong: true }, "生成文件"),
+    h("div", { className: "attachment-grid" }, entries.map(entry => {
+      const query = new URLSearchParams({ session_id: sessionId, artifact_id: entry.id });
+      return h("div", { className: "attachment", key: entry.id, "data-artifact-id": entry.id },
+        h("div", { className: "attachment-name" }, entry.name),
+        h(Typography.Text, { type: "secondary" }, `${entry.size.toLocaleString()} 字节`),
+        entry.turn_status !== "completed" && h(Tag, null, `所属回合：${PROCESS_STATUS[entry.turn_status] || entry.turn_status}`),
+        h(Space, { wrap: true }, h(Button, { size: "small", onClick: () => setPreview(entry) }, "预览"),
+          h(Button, { size: "small", href: `/api/artifacts/download?${query}`, download: entry.name }, "下载")));
+    })),
+    preview && h(ArtifactPreview, { key: `${sessionId}:${preview.id}`, sessionId, artifact: preview, onClose: () => setPreview(null) }));
+}
+
 function WorkflowApp() {
   const [model, setModel] = useState(null);
   const [navCollapsed, setNavCollapsed] = useState(true);
@@ -1181,7 +1250,11 @@ function WorkflowApp() {
                     entry.role === "Codex" ? h(Markdown, { text: entry.text }) : entry.display_text || entry.text,
                 entry.images?.length > 0 && renderFeedbackImages(entry.images, false, entry.image_purpose || "followup"),
                 entry.followup_attachments?.length > 0 && renderFollowupFiles(entry.followup_attachments),
-                entry.attachments?.length > 0 && renderAnswerFiles(entry.attachments, false, true)))),
+                entry.attachments?.length > 0 && renderAnswerFiles(entry.attachments, false, true),
+                h(ArtifactFiles, { key: `${state.id}:${entry.index}`, sessionId: state.id,
+                  entries: (state.artifacts || []).filter(file => file.history_index === entry.index) })))),
+            h(ArtifactFiles, { key: `${state.id}:unattached`, sessionId: state.id,
+              entries: (state.artifacts || []).filter(file => file.history_index === undefined) }),
             !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中", "编译分析中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
                 stage === "准备工作区中" ? " 正在准备工作区…" : " 模型正在处理中…"),

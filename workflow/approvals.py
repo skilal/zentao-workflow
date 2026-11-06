@@ -3,6 +3,7 @@
 from pathlib import Path
 
 from workflow.delivery import previous_task_changes
+from workflow.artifacts import ARTIFACT_TOOLS, artifact_authorized
 from workflow.gitops import safe_file
 from workflow.mcp_server import SKIP, TOOLS
 from workflow.settings import WorkflowError
@@ -12,7 +13,7 @@ from workflow.user_input import INPUT_STAGES
 
 
 CONTROL_TOOL_DESCRIPTIONS = {description: (name, definition) for name, description, definition in TOOLS
-                            if name in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title")}
+                            if name in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", *ARTIFACT_TOOLS)}
 
 
 def is_controlled_write(state, params):
@@ -31,6 +32,9 @@ def is_controlled_write(state, params):
         return state["stage"] in INPUT_STAGES
     if tool[0] == "set_session_title":
         return title_tool_authorized(state)
+    if tool[0] in ARTIFACT_TOOLS:
+        # 成果通道仅写会话目录，独立于业务代码的计划授权。
+        return artifact_authorized(state)
     if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not write_authorized(state):
         return False
     if tool[0] == "request_review":

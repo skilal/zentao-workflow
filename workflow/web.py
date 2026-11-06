@@ -30,6 +30,7 @@ from workflow.zentao import KINDS, ZentaoClient, identifier
 from workflow.user_input import pending_input
 from workflow.pdf_materials import material_files
 from workflow.answer_attachments import answer_request_id, attachment_file, prepare_answer
+from workflow.artifacts import MIME_TYPES, artifact_file, checked_path, preview_artifact, preview_image
 from workflow.followup_attachments import attachment_file as followup_attachment_file, inspect_zip, prepare_attachments
 
 
@@ -45,6 +46,7 @@ def public_state(state):
     result.setdefault("followup_images", [])
     result.setdefault("followup_attachments", [])
     result.setdefault("answer_attachments", [])
+    result.setdefault("artifacts", [])
     if result.get("pending"):
         result["pending"]["attachment_request_id"] = answer_request_id(state)
     result.setdefault("delivery_round", 1)
@@ -1018,6 +1020,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._answer_attachment(query)
             elif path == "/api/followup-attachments":
                 self._followup_attachment(query)
+            elif path.startswith("/api/artifacts/"):
+                self._artifact(path, query)
             elif path.startswith("/api/"):
                 self._json(404, {"error": "接口不存在。"})
             else:
@@ -1157,6 +1161,41 @@ class WebHandler(BaseHTTPRequestHandler):
                 title += path.suffix
             self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(title))
         self.end_headers()
+        self.wfile.write(data)
+
+    def _artifact(self, route, query):
+        runtime = self.server.application.sessions.get(query.get("session_id", [None])[0])
+        state, store = runtime.engine.state, runtime.engine.store
+        identifier = query.get("artifact_id", [None])[0]
+        if route == "/api/artifacts/preview":
+            # 同一文件的 PDF 页图缓存只由一个请求生成。
+            with runtime.engine.lock:
+                try:
+                    value = preview_artifact(store, state, identifier, query, self.server.application.settings)
+                except WorkflowError:
+                    raise
+                except Exception as error:
+                    # 文档解析库的格式错误统一转换为可见的预览失败。
+                    raise WorkflowError(f"成果文件预览失败：{error}。请下载原文件查看。") from error
+            self._json(200, value)
+            return
+        if route == "/api/artifacts/image":
+            path, content_type = preview_image(store, state, identifier, query)
+            data = path.read_bytes()
+            self._headers(200, content_type, len(data))
+        elif route == "/api/artifacts/download":
+            entry, path = artifact_file(store, state, identifier)
+            data = path.read_bytes()
+            # 所有原文件强制下载，HTML 等文件不在工作流源下执行。
+            self.send_response(200)
+            self.send_header("Content-Type", MIME_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + quote(entry["name"]))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+        else:
+            raise WorkflowError("成果文件接口不存在。")
         self.wfile.write(data)
 
     def _answer_attachment(self, query):

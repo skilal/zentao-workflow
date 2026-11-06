@@ -13,6 +13,14 @@ class CompileFlow:
         return manifest([repo for repo in self.state["repos"] if repo["role"] == "backend"])
 
     def _before_review(self):
+        state = self.state
+        if (state["phase"] == "implement"
+                and any(entry["delivery_round"] == state.get("delivery_round", 1) for entry in state.get("artifacts", []))
+                and not manifest(state["repos"])):
+            state.update(phase="complete", stage="已完成（未审查）", uncommitted_manifest={})
+            self.save()
+            self.note("系统", "本轮仅生成成果文件，无业务代码修改，未执行编译检查、自动 Review 或本地提交。")
+            return
         if self.state.get("compile_check", {}).get("enabled", False):
             self._begin_compile()
         else:
