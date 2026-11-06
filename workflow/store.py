@@ -50,6 +50,10 @@ def timestamp():
 def session_title(state):
     if state.get("custom_title"):
         return state["custom_title"]
+    if state.get("auto_title"):
+        return state["auto_title"]
+    if state.get("title_pending"):
+        return "待命名会话"
     if state["item"] is None:
         return state.get("conversation_title", "新会话")
     names = {"story": "需求", "task": "任务", "bug": "Bug"}
@@ -93,7 +97,9 @@ def initial_state(item, record_id):
         "fix_round": 0, "commits": {}, "error": "", "rpc_connected": False,
         "delivery_round": 1, "deliveries": [], "followup_images": [], "followup_attachments": [], "answer_attachments": [],
     }
-    if item is None:
+    if item is not None:
+        state.update(auto_title="", title_pending=True)
+    else:
         state["project"] = {"id": 0, "name": "", "candidates": []}
         state["snapshot"] = {"items": [], "sources": [], "materials": [], "blockers": [], "feishu_links": [],
                              "project": dict(state["project"])}

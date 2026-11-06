@@ -23,6 +23,7 @@ from workflow.progress import ProgressFlow, settle_progress
 from workflow.pdf_materials import material_files
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
+from workflow.session_titles import collect_session_title, title_generation_context
 from workflow.store import SessionStore, followup_available, session_title, timestamp
 from workflow.user_input import input_request_path, pending_input
 from workflow.workspace_reuse import WorkspaceReuseFlow
@@ -155,7 +156,9 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
 
     def save(self):
         if self.state:
-            self.store.save(self.state)
+            with self.store.lock:
+                collect_session_title(self.store, self.state)
+                self.store.save(self.state)
             self.emit("state", loads(dumps(self.state, ensure_ascii=False)))
 
     def note(self, role, text, **metadata):
@@ -747,6 +750,14 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
         material_instruction = ("资料首次读取或版本已变更，先调用 workflow.task_context(include_materials=true)。"
                                 if "materials_revision" in changed else
                                 "先调用 workflow.task_context 获取当前授权；原需求资料沿用本线程，需核对时再设置 include_materials=true。")
+        naming = title_generation_context(state) if phase == "plan" else None
+        if naming:
+            material_instruction = ("先调用 workflow.task_context(include_materials=true) 阅读完整工作项资料。"
+                                    "结合工作项标题、描述、关联资料、图片及补充说明，用简体中文概括首个工作项的实际目标，"
+                                    "生成建议 6～12 字的简短会话名称，不带任务/Bug/需求类型、编号、引号或解释；"
+                                    f"最多 {naming['max_length']} 个字符。随后调用 workflow.set_session_title(title) 登记名称，"
+                                    f"只传概括标题，控制器会自动追加后缀 {dumps(naming['suffix'], ensure_ascii=False)}。"
+                                    "命名完成后继续正常分析所有工作项；命名未成功不阻塞计划，不单独增加回合或循环重试。")
         prompt = ("当前阶段：" + phase + "。" + scope + "\n" + text + "\n" + material_instruction +
                   "需要人工选择或确认时调用 workflow.ask_user，立即结束回合，不得 sleep 或轮询。"
                   "以下只包含变化字段，未出现的字段沿用本线程上次值。"
@@ -1146,6 +1157,8 @@ class Workflow(WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
                 self.completed_plan = item["text"].strip()
             elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") == "ask_user":
                 self.submit(self._wait_for_user_input, self.state["id"], epoch, control=True)
+            elif item.get("type") == "mcpToolCall" and item.get("server") == "workflow" and item.get("tool") == "set_session_title":
+                self.save()
         elif method == "turn/started":
             if any(turn["id"] == params["turn"]["id"] and turn["status"] != "running"
                    for turn in self.state.get("progress_turns", [])):

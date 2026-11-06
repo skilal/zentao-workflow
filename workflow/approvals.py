@@ -6,12 +6,13 @@ from workflow.delivery import previous_task_changes
 from workflow.gitops import safe_file
 from workflow.mcp_server import SKIP, TOOLS
 from workflow.settings import WorkflowError
+from workflow.session_titles import title_tool_authorized
 from workflow.store import write_authorized
 from workflow.user_input import INPUT_STAGES
 
 
 CONTROL_TOOL_DESCRIPTIONS = {description: (name, definition) for name, description, definition in TOOLS
-                            if name in ("write_file", "replace_text", "delete_file", "request_review", "ask_user")}
+                            if name in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title")}
 
 
 def is_controlled_write(state, params):
@@ -28,6 +29,8 @@ def is_controlled_write(state, params):
         return False
     if tool[0] == "ask_user":
         return state["stage"] in INPUT_STAGES
+    if tool[0] == "set_session_title":
+        return title_tool_authorized(state)
     if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not write_authorized(state):
         return False
     if tool[0] == "request_review":

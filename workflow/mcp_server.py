@@ -14,6 +14,7 @@ from workflow.followup_attachments import read_followup_attachment, submitted_at
 from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, safe_file
 from workflow.settings import WorkflowError
+from workflow.session_titles import register_session_title, title_generation_context
 from workflow.store import SessionStore, write_authorized
 from workflow.user_input import pending_input, register_input
 
@@ -30,6 +31,7 @@ TOOLS = [
     ("read_followup_attachment", "只读已发送的续聊 ZIP；不指定成员编号时返回目录清单，指定 member_id 时按行读取 XML，其他格式仅列出信息。", schema({"attachment_id": STRING, "member_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("read_answer_attachment", "按编号只读已提交的问题附件；图片返回图片内容，文本按行分页，无法解析时明确返回限制。", schema({"attachment_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
+    ("set_session_title", "结合已读资料为新建工作项会话登记简短中文概括名称；只传首个工作项的概括标题，多任务后缀由控制器添加。仅计划分析阶段可用，不修改业务文件或人工名称。", schema({"title": STRING}, ("title",))),
     ("list_files", "列出指定仓库的文件；pattern 为 glob；不访问依赖、Git 和输出目录。", schema({"repository": STRING, "pattern": STRING}, ("repository",))),
     ("read_file", "读取当前 UTF-8 文件；默认 200 行，最多 500 行；next_line 指明续读位置。多文件优先使用 read_files。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
     ("read_files", "一次读取多个当前或基线文件片段；最多 10 项、合计 2000 行；每项 baseline=true 表示基线。", schema({
@@ -138,6 +140,7 @@ class Tools:
             return {**{key: state.get(key) for key in ("item", "items", "project", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage")},
                     "snapshot": snapshot if include else {key: snapshot[key] for key in ("blockers", "feishu_links")},
                     "materials_revision": context_hash(snapshot), "materials_included": include,
+                    "session_title_generation": title_generation_context(state),
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
                     "answer_attachments": submitted_attachments(state),
@@ -149,6 +152,8 @@ class Tools:
                     "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
                     "compile_check": state.get("compile_check", {"enabled": False}),
                     "compile_checks": compile_context(state)}
+        if name == "set_session_title":
+            return register_session_title(self.store, state, arguments.get("title"))
         if name == "ask_user":
             return register_input(self.store, state, arguments.get("questions"))
         if name == "read_answer_attachment":
@@ -320,7 +325,7 @@ def serve(session_id):
                           "capabilities": {"tools": {}}, "serverInfo": {"name": "workflow", "version": "0.1.0"}}
             elif method == "tools/list":
                 result = {"tools": [{"name": name, "description": description, "inputSchema": definition,
-                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user"),
+                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title"),
                                                      "openWorldHint": False}} for name, description, definition in TOOLS]}
             elif method == "tools/call":
                 try:

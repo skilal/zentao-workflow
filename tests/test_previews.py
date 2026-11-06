@@ -129,6 +129,8 @@ class PreviewChecks(TestCase):
         state = created.engine.state
         self.assertEqual(state["items"], self.items)
         self.assertEqual(state["supplement"], "补充验收要求")
+        self.assertTrue(state["title_pending"])
+        self.assertEqual(state["auto_title"], "")
         self.assertIn("created_at", state)
         directory = self.application.sessions.store.directory(state["id"])
         transferred = state["snapshot"]["materials"][0]["archive_entries"][0]
