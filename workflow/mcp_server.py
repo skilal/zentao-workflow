@@ -234,8 +234,7 @@ class Tools:
             raise WorkflowError("不允许访问依赖、Git 或工作流配置目录。")
         if name not in ("write_file", "replace_text", "delete_file"):
             raise WorkflowError("未知 MCP 工具。")
-        authorized = write_authorized(state) if state.get("approval_source") == "followup" or state.get("manual_compile") else state.get("approved_hash")
-        if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not authorized:
+        if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not write_authorized(state):
             raise WorkflowError("当前阶段禁止修改文件，必须等待计划确认或修复选择。")
         if state["stage"] == "编译修复中":
             checks = state.get("compile_checks", [])

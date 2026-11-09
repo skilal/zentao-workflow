@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from review_fixtures import commit_messages
 
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.engine import FINDING_SCHEMA, Workflow
 from workflow.gitops import commit, git, manifest
 from workflow.mcp_server import Tools, TOOLS
@@ -250,11 +250,17 @@ class AutoDeliveryChecks(TestCase):
         description = next(description for name, description, definition in TOOLS if name == "write_file")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": {"repository": "前端", "path": "页面.js", "content": "内容"}}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         self.state["stage"] = "审查中"
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
+        self.flow.save()
+        with self.assertRaisesRegex(WorkflowError, "当前阶段禁止修改文件"):
+            Tools(self.state["id"]).call("write_file", params["_meta"]["tool_params"])
         self.state.update(stage="实施中", approved_hash="错误版本")
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
+        self.flow.save()
+        with self.assertRaisesRegex(WorkflowError, "当前阶段禁止修改文件"):
+            Tools(self.state["id"]).call("write_file", params["_meta"]["tool_params"])
 
     def test_first_review_without_findings_automatically_uses_local_finalize(self):
         text = self.review()

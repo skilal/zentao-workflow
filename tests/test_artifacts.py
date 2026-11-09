@@ -11,7 +11,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 from test_supplement_images import PNG, SupplementImageFixture
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.artifacts import artifact_file, dependency, preview_artifact, preview_image
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
@@ -154,13 +154,13 @@ class ArtifactChecks(ArtifactFixture):
         description = next(description for name, description, _ in TOOLS if name == "create_artifact")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": {"name": "说明.txt", "format": "text", "content": "内容"}}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         with self.assertRaisesRegex(WorkflowError, "禁止修改"):
             Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "不能写入"})
         for stage in ("审查中", "编译修复中", "等待人工回答", "已暂停"):
             self.state["stage"] = stage
             self.engine.save()
-            self.assertFalse(is_controlled_write(self.state, params))
+            self.assertTrue(is_workflow_tool_call(params))
             with self.assertRaises(WorkflowError):
                 self.create()
         self.state["stage"] = "计划中"

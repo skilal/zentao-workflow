@@ -8,7 +8,7 @@ from pathlib import Path
 from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
 
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
@@ -1159,13 +1159,13 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             self.emit("questions", params.get("questions", []))
             return
         if "id" in message:
-            # 命令、权限提升及其他外部动作一律拒绝，不以“自动审批”绕过执行约束。
+            # 已登记的工作流 MCP 调用直接允许，具体业务限制由工具返回原因。
             if "requestApproval" in method and "commandExecution" in method:
                 self.rpc.respond(message["id"], {"decision": "decline"})
             elif "permissions" in method:
                 self.rpc.respond(message["id"], {"permissions": {}})
             elif method == "mcpServer/elicitation/request":
-                allowed = is_controlled_write(self.state, params)
+                allowed = is_workflow_tool_call(params)
                 self.rpc.respond(message["id"], {"action": "accept" if allowed else "decline", "content": {} if allowed else None})
             elif "fileChange" in method:
                 self.rpc.respond(message["id"], {"decision": "decline"})

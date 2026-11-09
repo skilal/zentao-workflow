@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.engine import Workflow
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
@@ -325,9 +325,12 @@ class ControllerInputChecks(PerformanceFixture):
         description = next(description for name, description, _ in TOOLS if name == "ask_user")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": {"questions": QUESTIONS}}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         self.state["stage"] = "等待人工回答"
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
+        self.flow.save()
+        with self.assertRaises(WorkflowError):
+            self.register()
 
     def test_invalid_questions_do_not_create_waiting_request(self):
         for questions in ([], QUESTIONS * 2, [{**QUESTIONS[0], "default": "纳入"}],

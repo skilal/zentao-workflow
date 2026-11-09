@@ -12,7 +12,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.mcp_server import TOOLS, Tools
 from workflow.rpc import thread_parameters
 from workflow.settings import ROOT, WorkflowError
@@ -280,11 +280,11 @@ class GeneratedSessionTitleChecks(SessionTitleFixture):
         self.assertNotIn("title_pending", state)
         self.assertEqual(session_title(state), "任务 #7 · 原任务文本")
 
-    def test_only_plan_naming_tool_is_auto_authorized_and_business_writes_remain_forbidden(self):
+    def test_naming_call_is_accepted_and_tool_enforces_plan_authorization(self):
         description = next(description for name, description, _ in TOOLS if name == "set_session_title")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": {"title": "范围检索改进"}}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         with self.assertRaises(WorkflowError):
             Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "不能写入"})
         for changes in ({"phase": "branch", "stage": "识别分支中"}, {"phase": "implement", "stage": "实施中"},
@@ -292,7 +292,7 @@ class GeneratedSessionTitleChecks(SessionTitleFixture):
                         {"phase": "plan", "stage": "计划中", "followup": {"text": "续聊"}}):
             self.state.update(changes)
             self.engine.save()
-            self.assertFalse(is_controlled_write(self.state, params))
+            self.assertTrue(is_workflow_tool_call(params))
             with self.assertRaises(WorkflowError):
                 self.register()
 

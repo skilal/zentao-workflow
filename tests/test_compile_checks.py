@@ -10,7 +10,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.compile_checks import CompileRunner, DiagnosticOutput, backend_modules, classify, compile_context, redact, source_snapshot
 from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import git
@@ -476,10 +476,15 @@ class CompileChecks(TestCase):
         description = next(description for name, description, _ in TOOLS if name == "write_file")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": {"repository": "后端", "path": "档案服务/业务.java", "content": "修复"}}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
+        tools.call("read_file", {"repository": "后端", "path": "档案服务/业务.java"})
+        params["_meta"]["tool_params"]["expected_version"] = sha256(
+            (Path(self.repo["path"]) / "档案服务/业务.java").read_bytes()).hexdigest()
         tools.call("write_file", params["_meta"]["tool_params"])
         params["_meta"]["tool_params"]["path"] = "保留.txt"
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
+        with self.assertRaisesRegex(WorkflowError, "编译修复只能修改"):
+            tools.call("write_file", params["_meta"]["tool_params"])
 
     def test_redaction_and_cancelled_runner(self):
         secret = "password=明文 token=敏感 Bearer abc https://user:pass@example.invalid/?token=密钥"

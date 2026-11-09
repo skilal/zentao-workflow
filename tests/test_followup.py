@@ -14,7 +14,7 @@ from uuid import uuid4
 
 from review_fixtures import commit_messages
 
-from workflow.approvals import is_controlled_write
+from workflow.approvals import is_workflow_tool_call
 from workflow.engine import Workflow
 from workflow.gitops import cleanup_workspaces, commit, git, prepare, worktrees
 from workflow.mcp_server import TOOLS, Tools
@@ -416,7 +416,7 @@ class FollowupChecks(TestCase):
         description = next(description for name, description, _ in TOOLS if name == "replace_text")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": arguments}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         tools.call("replace_text", arguments)
         # 控制器保存内存状态之后，MCP 的独立替换记录仍支持同文件的下一次替换。
         self.engine.save()
@@ -444,7 +444,7 @@ class FollowupChecks(TestCase):
         description = next(description for name, description, _ in TOOLS if name == "replace_text")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
                   "tool_description": description, "tool_params": arguments}}
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         with self.assertRaisesRegex(WorkflowError, "本机保留改动"):
             tools.call("replace_text", arguments)
         self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "外部修改后的代码\n")
@@ -518,7 +518,7 @@ class FollowupChecks(TestCase):
         description = next(description for name, description, _ in TOOLS if name == "request_review")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
             "tool_description": description, "tool_params": args}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         tools = Tools(self.state["id"])
         for invalid in ({**args, "instruction": "用户未说过的话"}, {**args, "commit_message": "标题\n第二行"},
                         {**args, "include_paths": "全部文件"}, {**args, "commit_message": None}):
@@ -528,7 +528,7 @@ class FollowupChecks(TestCase):
         self.engine.save()
         with self.assertRaises(WorkflowError):
             tools.call("request_review", args)
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
 
     def test_changed_historical_task_file_uses_existing_delivery_instruction(self):
         self.send("修改提示", review_enabled=False)
@@ -571,12 +571,15 @@ class FollowupChecks(TestCase):
         description = next(description for name, description, _ in TOOLS if name == "request_review")
         params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
             "tool_description": description, "tool_params": args}}
-        self.assertTrue(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
         with self.assertRaisesRegex(WorkflowError, "不能提交本机保留改动"):
             Tools(self.state["id"]).call("request_review", args)
         self.assertFalse(self.state["review_requested"])
         self.state["followup"]["text"] = "已撤回的请求"
-        self.assertFalse(is_controlled_write(self.state, params))
+        self.assertTrue(is_workflow_tool_call(params))
+        self.engine.save()
+        with self.assertRaises(WorkflowError):
+            Tools(self.state["id"]).call("request_review", args)
 
     def test_review_request_waits_for_answers_and_survives_restart(self):
         self.send("重新 Review 并提交", review_enabled=False)
@@ -800,10 +803,13 @@ class FollowupChecks(TestCase):
         approval = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
             "tool_description": description, "tool_params": {"repository": "前端", "path": "业务.txt", "content": "修复"}}}
         self.assertTrue(write_authorized(self.state))
-        self.assertTrue(is_controlled_write(self.state, approval))
+        self.assertTrue(is_workflow_tool_call(approval))
         self.state["followup"]["text"] = "未授权的新反馈"
         self.assertFalse(write_authorized(self.state))
-        self.assertFalse(is_controlled_write(self.state, approval))
+        self.assertTrue(is_workflow_tool_call(approval))
+        self.engine.save()
+        with self.assertRaisesRegex(WorkflowError, "当前阶段禁止修改文件"):
+            Tools(self.state["id"]).call("write_file", approval["_meta"]["tool_params"])
         self.engine._new_plan_round()
         self.assertFalse(write_authorized(self.state))
 

@@ -1,70 +1,14 @@
-"""只承接已确认阶段、已选仓库的本地 MCP 文件写入授权。"""
+"""允许已登记的工作流 MCP 调用；业务授权统一由工具入口校验。"""
 
-from pathlib import Path
-
-from workflow.delivery import previous_task_changes
-from workflow.artifacts import ARTIFACT_TOOLS, artifact_authorized
-from workflow.gitops import safe_file
-from workflow.mcp_server import SKIP, TOOLS
-from workflow.settings import WorkflowError
-from workflow.session_titles import title_tool_authorized
-from workflow.store import write_authorized
-from workflow.user_input import INPUT_STAGES
+from workflow.mcp_server import TOOLS
 
 
-CONTROL_TOOL_DESCRIPTIONS = {description: (name, definition) for name, description, definition in TOOLS
-                            if name in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", *ARTIFACT_TOOLS)}
+WORKFLOW_TOOL_DESCRIPTIONS = {description for _, description, _ in TOOLS}
 
 
-def is_controlled_write(state, params):
+def is_workflow_tool_call(params):
     if params.get("serverName") != "workflow" or params.get("mode") != "form":
         return False
     metadata = params.get("_meta") or {}
-    if metadata.get("codex_approval_kind") != "mcp_tool_call":
-        return False
-    tool = CONTROL_TOOL_DESCRIPTIONS.get(metadata.get("tool_description"))
-    if not tool:
-        return False
-    arguments = metadata.get("tool_params")
-    if not isinstance(arguments, dict) or any(key not in arguments for key in tool[1]["required"]):
-        return False
-    if tool[0] == "ask_user":
-        return state["stage"] in INPUT_STAGES
-    if tool[0] == "set_session_title":
-        return title_tool_authorized(state)
-    if tool[0] in ARTIFACT_TOOLS:
-        # 成果通道仅写会话目录，独立于业务代码的计划授权。
-        return artifact_authorized(state)
-    if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not write_authorized(state):
-        return False
-    if tool[0] == "request_review":
-        # 此工具只登记请求。范围校验由 MCP 返回具体错误，不能转成“用户拒绝”。
-        return state["phase"] == "followup" and state["stage"] == "续聊处理中"
-    if any(not isinstance(value, str) for value in arguments.values()):
-        return False
-    repository = next((repository for repository in state["repos"] if repository["name"] == arguments.get("repository")), None)
-    if repository is None:
-        return False
-    relative = arguments.get("path", "")
-    if state["stage"] == "编译修复中":
-        checks = state.get("compile_checks", [])
-        if (repository["role"] != "backend" or not state.get("compile_check", {}).get("enabled")
-                or not checks or checks[-1]["status"] != "repairing"
-                or arguments.get("repository") != checks[-1].get("repair_repository")
-                or Path(relative).as_posix() not in checks[-1].get("repair_paths", [])):
-            return False
-    if not relative or any(part.casefold() in SKIP for part in Path(relative).parts):
-        return False
-    if Path(relative).name.casefold() in ("agents.md", "claude.md", "qwen.md"):
-        return False
-    try:
-        path = safe_file(repository, relative)
-    except WorkflowError:
-        return False
-    relative = path.relative_to(Path(repository["path"]).resolve()).as_posix()
-    if relative.casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
-        return (tool[0] == "replace_text" and state["phase"] == "followup"
-                and state.get("approval_source") == "followup"
-                and any(entry["repository"] == repository["name"] and entry["path"] == relative
-                        for entry in previous_task_changes(state)))
-    return True
+    return (metadata.get("codex_approval_kind") == "mcp_tool_call"
+            and metadata.get("tool_description") in WORKFLOW_TOOL_DESCRIPTIONS)
