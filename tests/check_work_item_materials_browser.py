@@ -76,7 +76,7 @@ def run():
             page.on("request", lambda request: actions.append(request.post_data_json) if request.url.endswith("/api/actions") else None)
             page.add_init_script("sessionStorage.setItem('workflow-page', 'plan')")
             page.goto(server.origin)
-            button = page.locator(".workspace-main .ant-card-extra").get_by_role("button", name="工作项资料", exact=True)
+            button = page.locator(".app-card").filter(has=page.get_by_role("textbox")).locator(".ant-card-extra").get_by_role("button", name="工作项资料", exact=True)
             drawer = page.get_by_role("dialog", name="工作项资料", exact=True)
             reply = page.get_by_placeholder("输入问题、需要获取的信息或修改要求，可粘贴图片和文件…")
             reply.fill("保留未发送的草稿")
@@ -132,6 +132,9 @@ def run():
             page.keyboard.press("Escape")
             for runtime in (empty, missing):
                 page.locator(".session-entry").filter(has_text=runtime.engine.state["item"]["title"]).click()
+                if runtime is missing:
+                    expect(page.get_by_role("button", name="工作项资料", exact=True)).to_have_count(0)
+                    continue
                 button.click()
                 expect(drawer.get_by_text("本会话暂无已保存的工作项资料", exact=True)).to_be_visible()
                 page.keyboard.press("Escape")

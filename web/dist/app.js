@@ -1292,12 +1292,7 @@ function WorkflowApp() {
   }
 
   function renderPlan() {
-    const conversationExtra = h(Space, { size: "small", wrap: true }, stageTag(stage),
-      hasWorkItemMaterials && h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
-        onClick: () => setMaterialsOpen(true) }, "工作项资料"));
-    if (!state || !selectionMatches) return h(CardBox, {
-      title: hasWorkItemMaterials && "工作流会话", extra: hasWorkItemMaterials && conversationExtra
-    }, h(Empty, { description: "点击新建会话输入需求，或选择工作项并等待读取完成" }));
+    if (!state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "点击新建会话输入需求，或选择工作项并等待读取完成" }));
     if (!model.selectedSessionId) return renderBranches();
     if (!state.codex && !["资料已读取", "资料读取失败"].includes(stage)) return h(CardBox, { title: "确认历史会话的模型配置" },
       h(Typography.Paragraph, null, "该历史会话未保存模型与推理强度。请选择一次，保存后按原阶段继续。"),
@@ -1342,7 +1337,7 @@ function WorkflowApp() {
             h(Input, { "aria-label": `${repo.name}仓库目录`, disabled: busy,
               value: draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path,
               onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) }))))),
-        h(CardBox, { title: "工作流会话", extra: conversationExtra },
+        h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
             message: `第 ${state.delivery_round} 轮已完成`, "aria-label": "本轮执行结果", style: { marginBottom: 16 },
@@ -1379,7 +1374,9 @@ function WorkflowApp() {
               model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream })))),
           h(ChangedFiles, { key: state.id, sessionId: state.id, revision: model.revision,
             running: !stopped && (model.working || Boolean(model.busy) || ACTIVE.has(stage)) })),
-        h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复" },
+        h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复",
+          extra: hasWorkItemMaterials && h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
+            onClick: () => setMaterialsOpen(true) }, "工作项资料") },
           questions.map(question => {
             const key = `${state.pending.id}:${question.id}:${question.question}`;
             const value = draft.answers[key] || {};
