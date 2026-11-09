@@ -100,6 +100,10 @@ button, input, textarea { font: inherit; }
 .full-width { width: 100%; }
 .action-bar { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
 .conversation-layout > * { min-width: 0; }
+.changed-files { margin-top: 16px; }
+.changed-files-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; max-height: 180px; overflow: auto; }
+.changed-files-repository { min-width: 0; }
+.changed-files .repo-path { margin: 4px 0 0; }
 .conversation-feed { height: 640px; overflow: auto; padding-right: 5px; }
 .chat-entry { margin-bottom: 20px; }
 .chat-meta { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; color: #8a94a6; font-size: 11px; margin-bottom: 7px; }

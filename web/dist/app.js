@@ -104,6 +104,43 @@ function ProgressTurn({ turn }) {
         h(Typography.Text, { type: "secondary" }, active ? "模型正在处理中，等待可展示的过程内容。" : "本回合没有返回可展示的过程内容。") }]
   }));
 }
+function ChangedFiles({ sessionId, revision, running }) {
+  const [files, setFiles] = useState(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    let disposed = false;
+    let timer;
+    async function refresh() {
+      try {
+        const result = await fetch(`/api/changed-files?session_id=${encodeURIComponent(sessionId)}`,
+          { signal: controller.signal, cache: "no-store" }).then(readResponse);
+        if (!disposed) {
+          setFiles(result);
+          setFailed(false);
+        }
+      } catch (error) {
+        if (!disposed) setFailed(true);
+      } finally {
+        if (!disposed && running) timer = setTimeout(refresh, 3000);
+      }
+    }
+    refresh();
+    return () => { disposed = true; controller.abort(); clearTimeout(timer); };
+  }, [sessionId, revision, running]);
+  return h(Collapse, { className: "changed-files", size: "small", defaultActiveKey: ["files"],
+    items: [{ key: "files", label: `改动文件${files && !failed ? ` · ${files.total}` : ""}`,
+      children: failed ? h(Typography.Text, { type: "secondary", role: "status" }, "文件清单读取失败") :
+        files === null ? h(Typography.Text, { type: "secondary", role: "status" }, "正在读取文件清单…") :
+          files.total === 0 ? h(Typography.Text, { type: "secondary" }, "暂无改动文件") :
+            h("div", { className: "changed-files-list" }, [...files.repositories]
+              .sort((left, right) => Number(right.name === "后端") - Number(left.name === "后端")).map(repo =>
+              h("div", { className: "changed-files-repository", key: repo.name,
+                style: { gridColumn: { "后端": 1, "前端": 2 }[repo.name] } },
+                h(Typography.Text, { strong: true }, repo.name),
+                repo.paths.map(path => h("div", { className: "repo-path", key: path }, path))))) }]
+  });
+}
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
@@ -1255,7 +1292,12 @@ function WorkflowApp() {
   }
 
   function renderPlan() {
-    if (!state || !selectionMatches) return h(CardBox, null, h(Empty, { description: "点击新建会话输入需求，或选择工作项并等待读取完成" }));
+    const conversationExtra = h(Space, { size: "small", wrap: true }, stageTag(stage),
+      hasWorkItemMaterials && h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
+        onClick: () => setMaterialsOpen(true) }, "工作项资料"));
+    if (!state || !selectionMatches) return h(CardBox, {
+      title: hasWorkItemMaterials && "工作流会话", extra: hasWorkItemMaterials && conversationExtra
+    }, h(Empty, { description: "点击新建会话输入需求，或选择工作项并等待读取完成" }));
     if (!model.selectedSessionId) return renderBranches();
     if (!state.codex && !["资料已读取", "资料读取失败"].includes(stage)) return h(CardBox, { title: "确认历史会话的模型配置" },
       h(Typography.Paragraph, null, "该历史会话未保存模型与推理强度。请选择一次，保存后按原阶段继续。"),
@@ -1300,7 +1342,7 @@ function WorkflowApp() {
             h(Input, { "aria-label": `${repo.name}仓库目录`, disabled: busy,
               value: draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path,
               onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) }))))),
-        h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
+        h(CardBox, { title: "工作流会话", extra: conversationExtra },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
             message: `第 ${state.delivery_round} 轮已完成`, "aria-label": "本轮执行结果", style: { marginBottom: 16 },
@@ -1334,7 +1376,9 @@ function WorkflowApp() {
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
                 stage === "准备工作区中" ? " 正在准备工作区…" : " 模型正在处理中…"),
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
-              model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream }))))),
+              model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream })))),
+          h(ChangedFiles, { key: state.id, sessionId: state.id, revision: model.revision,
+            running: !stopped && (model.working || Boolean(model.busy) || ACTIVE.has(stage)) })),
         h(CardBox, { title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复" },
           questions.map(question => {
             const key = `${state.pending.id}:${question.id}:${question.question}`;
@@ -1663,9 +1707,7 @@ function WorkflowApp() {
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h("div", { className: page === "settings" ? "" : "session-workspace" }, page !== "settings" && renderSessions(), h("div", { className: "session-content" },
           page !== "settings" && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
-            h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasWorkItemMaterials &&
-              h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
-                onClick: () => setMaterialsOpen(true) }, "工作项资料"), hasProjectInfo && projectInfoHidden &&
+            h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasProjectInfo && projectInfoHidden &&
               h(Button, { size: "small", "aria-controls": "project-info", "aria-expanded": false, onClick: () => {
                 setProjectInfoHidden(false); sessionStorage.setItem("workflow-project-info-hidden", "false");
               } }, "项目信息"), hasImplementationPlan && implementationPlanHidden &&

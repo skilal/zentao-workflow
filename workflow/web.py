@@ -22,7 +22,7 @@ from workflow.projects import ProjectPartitions, assign_project, project_move_er
 from workflow.context import normalized_sources
 from workflow.store import followup_available, session_repositories, session_title, timestamp
 from workflow.engine import ACTIVE, COMPLETE, parse_review, skipped_review_ids
-from workflow.gitops import branches, cleanup_workspaces, differences, safe_file
+from workflow.gitops import branches, changed_paths, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
@@ -948,6 +948,28 @@ class WebApplication:
             raise WorkflowError("问题编号清单无效。")
         return ids
 
+    def changed_files(self, session_id):
+        with self.lock:
+            state = deepcopy(self.sessions.get(session_id).engine.state)
+        grouped = {repo["name"]: set() for repo in state["repos"]}
+        for delivery in [*state.get("deliveries", []), state]:
+            historical = delivery is not state
+            snapshots = {**(delivery.get("review_manifest") or {}),
+                         **(delivery.get("uncommitted_manifest") or {})}
+            for repository in delivery["repos"]:
+                name = repository["name"]
+                paths = grouped.setdefault(name, set())
+                if historical or delivery["phase"] == "complete" or name in delivery.get("commits", {}):
+                    prefix = name + "/"
+                    preserved = set() if repository.get("change_record") else {path.casefold() for path in repository.get("preserved_paths", [])}
+                    paths.update(key[len(prefix):] for key in snapshots
+                                 if key.startswith(prefix) and key[len(prefix):].casefold() not in preserved)
+                else:
+                    paths.update(changed_paths(repository))
+        repositories = [{"name": name, "paths": sorted(paths)} for name, paths in grouped.items() if paths]
+        return {"session_id": state["id"], "repositories": repositories,
+                "total": sum(len(repo["paths"]) for repo in repositories)}
+
     def diff(self, session_id):
         with self.lock:
             state = deepcopy(self.sessions.get(session_id).engine.state)
@@ -1060,6 +1082,8 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._json(200, branches(repository["path"]))
             elif path == "/api/diff":
                 self._json(200, application.diff(query.get("session_id", [""])[0]))
+            elif path == "/api/changed-files":
+                self._json(200, application.changed_files(query.get("session_id", [""])[0]))
             elif path == "/api/material":
                 self._material(query)
             elif path == "/api/supplement-images":

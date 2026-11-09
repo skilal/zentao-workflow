@@ -76,7 +76,7 @@ def run():
             page.on("request", lambda request: actions.append(request.post_data_json) if request.url.endswith("/api/actions") else None)
             page.add_init_script("sessionStorage.setItem('workflow-page', 'plan')")
             page.goto(server.origin)
-            button = page.locator(".workflow-strip-actions").get_by_role("button", name="工作项资料", exact=True)
+            button = page.locator(".workspace-main .ant-card-extra").get_by_role("button", name="工作项资料", exact=True)
             drawer = page.get_by_role("dialog", name="工作项资料", exact=True)
             reply = page.get_by_placeholder("输入问题、需要获取的信息或修改要求，可粘贴图片和文件…")
             reply.fill("保留未发送的草稿")
