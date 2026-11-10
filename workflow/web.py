@@ -28,6 +28,7 @@ from workflow.sessions import SessionManager
 from workflow.rpc import AppServer, validate_selection
 from workflow.settings import LOCAL, ROOT, WorkflowError, load_settings, save_password, save_settings
 from workflow.zentao import KINDS, ZentaoClient, identifier
+from workflow.prompt_catalog import prompt_catalog
 from workflow.user_input import pending_input
 from workflow.pdf_materials import material_files
 from workflow.answer_attachments import answer_request_id, attachment_file, prepare_answer
@@ -1080,6 +1081,12 @@ class WebHandler(BaseHTTPRequestHandler):
             application = self.server.application
             if path == "/api/bootstrap":
                 self._json(200, {**application.snapshot(), "csrf_token": application.csrf_token})
+            elif path == "/api/prompts":
+                if parsed.query:
+                    raise WorkflowError("提示词目录不接受查询参数。")
+                with application.sessions.settings_lock:
+                    catalog = prompt_catalog(application.settings)
+                self._json(200, catalog)
             elif path == "/api/events":
                 self._events(query)
             elif path == "/api/session":

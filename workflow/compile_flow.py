@@ -1,5 +1,7 @@
 """编译检查的持久暂停点、下载授权及有限次数代码修复。"""
 
+from workflow import prompts
+
 from copy import deepcopy
 from hashlib import sha256
 from json import dumps, loads
@@ -251,11 +253,7 @@ class CompileFlow:
         batch["status"] = "repairing"
         batch["repair_source_hash"] = entry["source_hash"]
         self.state["phase"] = "compile_fix"
-        self._start_turn("控制器授权自动修复本轮任务相关的编译错误，包括已确认受本轮改动影响的调用方。只修改 compile_checks 最新记录中 "
-                         "repair_repository 的 repair_paths，保持需求范围。不得修改依赖、环境或原有问题，不执行命令。"
-                         "先对照 baseline_file、changes、diagnostics 和 analysis 核实因果。修正导入、类型、方法签名、字段名等技术问题由你直接决定，"
-                         "不要把范围内可自行判断的代码修复再次交给用户。仅业务规则缺失、涉及无关原有问题或需要越过授权范围时提问。"
-                         "禁止空转或仅声称已修复。完成后由控制器重新检查；不自行 Review 或提交。")
+        self._start_turn(prompts.COMPILE_FIX)
 
     def _compile_repaired(self):
         batch = self._compile_batch()
@@ -282,23 +280,10 @@ class CompileFlow:
         batch.update(status="analyzing", analysis_repository=entry["name"], automatic_analysis=automatic)
         self.state["phase"] = "compile_analysis"
         if automatic:
-            self._start_turn("控制器自动分析编译失败。本回合只读，不修改文件、不执行命令、不安装依赖。"
-                             "读取 task_context 的 compile_checks；结合 compiler_diagnostics、failure_reasons、task_paths、changes、baseline_file 及当前源码判断因果。"
-                             "不要仅因报错行不在差异中就交给人工；检查是否为本轮类名、方法签名、类型、字段或导入变更影响了调用方。"
-                             "有源码证据且与 task_paths 中本轮任务文件有关时，category=task_code，repairs 指定需要修复的 Java 文件。"
-                             "每项 source_excerpt 必须逐字摘录该文件当前源码，related_path 必须是 task_paths 中与该错误有因果关系的任务文件，reason 说明关联。"
-                             "仅选择诊断指向文件或任务已有变更文件，不触碰 preserved_paths。"
-                             "明确无关原有问题用 original_code，依赖下载用 dependencies，环境变更用 environment，证据不足用 unknown；这些类别 repairs 必须为空。"
-                             "技术层面的判断自行完成，只在缺少业务规则或必要资料时提问。仅输出符合 Schema 的 JSON，summary 用中文说明结论与阻碍。",
+            self._start_turn(prompts.COMPILE_ANALYSIS,
                              COMPILE_ANALYSIS_SCHEMA)
             return
-        self._start_turn("用户选择分析后端编译失败原因。本回合只读，不修改文件、不执行任何命令、不安装或下载依赖。"
-                         "读取 task_context 最新 compile_checks 的 analysis_repository、failure_reasons、diagnostics，"
-                         "结合 changes、baseline_file 和当前文件定位原因，说明缺少的具体类、方法、依赖、插件或环境条件及处理办法。"
-                         "区分本轮新增错误、原有问题与证据不足，不得猜测或把缺少符号直接当作需要下载依赖。"
-                         "历史记录没有具体原因时必须说明无法还原当时失败，建议用户重新检查以取得诊断。"
-                         "需要人工提供资料时调用 workflow.ask_user 后立即结束回合；其他情况用简体中文给出分析结论。"
-                         "分析结束后仍等待人工选择，不自动进入 Review 或提交。")
+        self._start_turn(prompts.COMPILE_MANUAL_ANALYSIS)
 
     def _compile_analyzed(self, text):
         batch = self._compile_batch()

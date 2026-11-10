@@ -11,14 +11,10 @@ COMMIT_MESSAGE_SCHEMA = {"type": "array", "items": {"type": "object", "propertie
     "scope": {"type": "string"}, "summary": {"type": "string"}},
     "required": ["repository", "type", "scope", "summary"], "additionalProperties": False}}
 COMMIT_INSTRUCTIONS = (
-    "同时在 commit_messages 中为本轮有代码改动的每个仓库分别生成提交标题字段 repository、type、scope、summary；"
-    "无改动仓库不填写。根据本轮授权及该仓库实际累计差异概括，不拼接工作项原标题。"
-    "type 只能为 feat、fix、refactor、perf、docs、test、chore，按实际变化判断，续聊不等于 fix。"
-    "scope 使用实际业务或技术模块，可用中文或已有英文模块名，不能使用工作项编号、zentao-task 等编号前缀或前后端角色。"
-    "summary 用简短中文描述改动结果，不带工作项编号、前端开发或后端开发后缀。"
-    "完整 type(scope): summary 标题建议不超过 50 个字符，最多 72 个字符，不截断。"
-    "上下文 commit_message 为人工指定内容：若已符合完整规范则保持原样；否则逐字保留为 summary，并补全 type 和 scope。"
-    "工作项关联行由控制器添加，不写入标题。仅返回结构化结果，不执行 Git，不单独增加命名回合。"
+    "commit_messages 逐仓库对应实际纳入的差异，无改动不填；返回 repository/type/scope/summary。"
+    "标题 type(实际模块): 简短中文摘要，最多 72 字符；类型按实际变化选择，续聊不等于 fix。"
+    "模块、摘要不带工作项编号或前后端角色，不照搬任务标题。人工 commit_message 已规范则原样保留，否则逐字保留摘要并补全格式。"
+    "关联工作项由控制器加入正文；不单独命名、不执行 Git。"
 )
 
 

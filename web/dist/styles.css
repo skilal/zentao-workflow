@@ -57,6 +57,12 @@ button, input, textarea { font: inherit; }
 .muted { color: #8a94a6; font-size: 12px; }
 .number-text { font-variant-numeric: tabular-nums; }
 .description-text { margin: 0; white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.9; color: #425066; }
+.prompt-stages > .ant-tabs-content-holder { min-width: 0; }
+.prompt-text-block { border: 1px solid #edf0f4; border-radius: 6px; background: #fafbfd; }
+.prompt-copy { display: flex; justify-content: flex-end; padding: 10px 16px 0; }
+.prompt-text { padding: 12px 16px 16px; overflow-wrap: anywhere; }
+.prompt-variant { width: 100%; max-width: 360px; }
+.prompt-loading { padding: 48px 0; text-align: center; color: #7a8597; }
 .markdown-body { min-width: 0; white-space: normal; overflow-wrap: anywhere; line-height: 1.85; color: #425066; }
 .markdown-body > :first-child { margin-top: 0; }
 .markdown-body > :last-child { margin-bottom: 0; }

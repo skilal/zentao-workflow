@@ -3,7 +3,7 @@
 const { useState, useEffect, useLayoutEffect, useRef } = React;
 const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Checkbox,
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
-  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown, Switch } = antd;
+  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown, Switch, Tabs, Grid } = antd;
 const h = React.createElement;
 DOMPurify.addHook("afterSanitizeAttributes", node => {
   if (node.nodeName === "INPUT") {
@@ -18,6 +18,7 @@ const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查�
 const PAGES = {
   items: ["工作项与资料", "可从指派给你的需求、任务和 Bug 中选择处理对象，也可新建会话直接输入需求。"],
   plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
+  prompts: ["内置提示词", "查看各阶段提示词原文、组装模板和生效条件。"],
   settings: ["工作流设置", "管理禅道账号、后端编译检查、固定 Review 提示词和默认修复轮次。"]
 };
 
@@ -395,6 +396,66 @@ function WorkspaceHandoff({ state, repository, defaultTarget, busy, onAction, on
         h(Checkbox, { key: path, checked: paths.includes(path), disabled: busy || started, style: { overflowWrap: "anywhere" },
           onChange: event => setPaths(event.target.checked ? [...paths, path] : paths.filter(value => value !== path)) }, path))) :
         h(Typography.Text, { type: "secondary" }, "目标目录没有本机改动。")));
+}
+
+function PromptText({ text }) {
+  return h("div", { className: "prompt-text-block" },
+    h("div", { className: "prompt-copy" }, h(Typography.Text, { copyable: { text, tooltips: ["复制全文", "已复制"] } }, "复制全文")),
+    h("pre", { className: "description-text prompt-text" }, text));
+}
+
+function PromptStage({ stage }) {
+  const [view, setView] = useState("templates");
+  const [variantId, setVariantId] = useState(stage.templates[0]?.id);
+  const variant = stage.templates.find(entry => entry.id === variantId);
+  return h("div", { className: "card-stack" },
+    h("div", null, h(Typography.Title, { level: 4, style: { marginTop: 0 } }, stage.title),
+      h(Typography.Paragraph, null, stage.description),
+      stage.controller && h(Tag, null, "控制器执行"),
+      stage.id !== "common" && h(Typography.Text, { type: "secondary" }, `线程级规则：${stage.thread_rule}，原文见${stage.id === "branch" ? "本阶段模板" : "“通用规则”"}`)),
+    stage.notes && h(Alert, { type: "info", showIcon: true, message: stage.notes }),
+    h(Tabs, { activeKey: view, onChange: setView, items: [
+      { key: "templates", label: "组装模板", children: h("div", { className: "card-stack" },
+        stage.templates.length > 1 && h(Select, { "aria-label": "选择模板变体", value: variantId,
+          options: stage.templates.map(entry => ({ value: entry.id, label: entry.title })), onChange: setVariantId, className: "prompt-variant" }),
+        variant ? h("div", null,
+          h(Space, { wrap: true, style: { marginBottom: 12 } }, h(Tag, { color: "blue" }, variant.layer), h(Typography.Text, { type: "secondary" }, variant.condition)),
+          h(PromptText, { text: variant.content })) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "由控制器执行，无独立模型提示词" })) },
+      { key: "fragments", label: "组成片段", children: stage.fragments.length ? h(Collapse, { items: stage.fragments.map(entry => ({
+        key: entry.id, label: entry.title, children: h("div", null,
+          h(Typography.Paragraph, null, h(Typography.Text, { strong: true }, "生效条件："), entry.condition),
+          h(Typography.Paragraph, { type: "secondary" }, "来源：", h(Typography.Text, { code: true }, entry.source)),
+          h(PromptText, { text: entry.content })) })) }) : h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: "此阶段没有独立模型提示词片段" }) }
+    ] }));
+}
+
+function PromptCatalogPage() {
+  const [catalog, setCatalog] = useState(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [refresh, setRefresh] = useState(0);
+  const [stageId, setStageId] = useState("plan");
+  const screens = Grid.useBreakpoint();
+  useEffect(() => {
+    let active = true;
+    setLoading(true); setError(""); setCatalog(null);
+    fetch("/api/prompts", { credentials: "same-origin", cache: "no-store" }).then(readResponse)
+      .then(value => { if (active) setCatalog(value); })
+      .catch(reason => { if (active) setError(reason.message); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [refresh]);
+  return h(CardBox, { title: h(Space, null, "工作流提示词", h(Tag, { color: "blue" }, "只读展示")),
+    extra: h(Button, { onClick: () => setRefresh(value => value + 1), loading, disabled: loading }, "刷新") },
+    h(Typography.Paragraph, { type: "secondary" }, "展示当前服务的固定原文与组装模板。占位符代表运行时数据；本页不读取具体会话资料。"),
+    loading && h("div", { className: "prompt-loading" }, h(Spin, null), " 正在读取提示词…"),
+    error && h(Alert, { type: "error", showIcon: true, message: "提示词读取失败", description: error,
+      action: h(Button, { onClick: () => setRefresh(value => value + 1) }, "重新读取") }),
+    catalog && h(React.Fragment, null,
+      h(Tabs, { className: "prompt-stages", tabPosition: screens.lg ? "left" : "top", activeKey: stageId, onChange: setStageId,
+        items: catalog.stages.map(stage => ({ key: stage.id, label: stage.title, children: h(PromptStage, { key: stage.id, stage }) })) }),
+      h(Divider), h(Collapse, { items: [{ key: "placeholders", label: "占位符说明", children: h(List, { size: "small", dataSource: catalog.placeholders,
+        renderItem: entry => h(List.Item, null, h("div", null, h(Typography.Text, { strong: true }, entry.name), h("div", { className: "muted" }, entry.description))) }) }] })));
 }
 
 function WorkflowApp() {
@@ -1729,10 +1790,11 @@ function WorkflowApp() {
   if (fatal) return h("div", { style: { maxWidth: 650, margin: "100px auto" } }, h(Alert, { type: "error", showIcon: true, message: "无法连接本地网页服务", description: fatal, action: h(Button, { onClick: () => location.reload() }, "重新打开") }));
   if (!model) return h("div", { className: "initial-loading" }, h(Spin, null), " 正在加载工作流…");
   const heading = PAGES[page];
-  const renderers = { items: renderItems, plan: renderPlan, settings: renderSettings };
-  const menuIcons = ["▦", "☷", "⚙"];
-  const hasWorkItemMaterials = page !== "settings" && model.selectedSessionId && state?.id === model.selectedSessionId && sessionItems(state).length > 0;
-  const hasProjectInfo = page !== "settings" && selectionMatches;
+  const renderers = { items: renderItems, plan: renderPlan, prompts: () => h(PromptCatalogPage), settings: renderSettings };
+  const menuIcons = ["▦", "☷", "▤", "⚙"];
+  const workPage = page === "items" || page === "plan";
+  const hasWorkItemMaterials = workPage && model.selectedSessionId && state?.id === model.selectedSessionId && sessionItems(state).length > 0;
+  const hasProjectInfo = workPage && selectionMatches;
   const showProjectInfo = hasProjectInfo && !projectInfoHidden;
   const implementationPlanTitle = state?.approval_source === "followup" ? "原需求实施计划" : "实施计划";
   const hasImplementationPlan = page === "plan" && model.selectedSessionId && selectionMatches &&
@@ -1760,10 +1822,10 @@ function WorkflowApp() {
             h(Button, { onClick: () => act("connect"), disabled: busy, loading: model.busy === "connect" }, model.connected ? "重新连接" : "连接禅道"))),
         h(Layout.Content, { className: "page-content" },
           !online && h(Alert, { className: "offline-banner", type: stopped ? "info" : "warning", showIcon: true, message: stopped ? "本地服务已停止" : "与本地服务的实时连接暂时中断", description: stopped ? "会话记录已保留。需要继续时，重新运行启动脚本后刷新页面。" : "页面会尝试恢复事件连接；如果服务已重启，请刷新页面。", action: h(Button, { onClick: () => location.reload() }, "刷新页面") }),
-          state?.error && stage !== "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
+          workPage && state?.error && stage !== "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
-          h("div", { className: page === "settings" ? "" : "session-workspace" }, page !== "settings" && renderSessions(), h("div", { className: "session-content" },
-          page !== "settings" && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
+          h("div", { className: workPage ? "session-workspace" : "" }, workPage && renderSessions(), h("div", { className: "session-content" },
+          workPage && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
             h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasProjectInfo && projectInfoHidden &&
               h(Button, { size: "small", "aria-controls": "project-info", "aria-expanded": false, onClick: () => {
                 setProjectInfoHidden(false); sessionStorage.setItem("workflow-project-info-hidden", "false");

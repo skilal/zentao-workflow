@@ -141,7 +141,7 @@ class FollowupChecks(TestCase):
             context = Tools(self.state["id"]).call("task_context", {})
             self.assertIs(context["review_enabled"], enabled)
             prompt = self.calls[-1][1]["input"][0]["text"]
-            self.assertIn("获取信息、解释或查询时只读取资料并回答", prompt)
+            self.assertIn("查询只读", prompt)
             with patch.object(self.engine, "_begin_review") as review, patch("workflow.engine.commit") as committing:
                 self.complete("保存功能会先检查输入，然后写入数据。")
             review.assert_not_called()
@@ -546,7 +546,7 @@ class FollowupChecks(TestCase):
         self.send("重新 Review 并提交，简单概括改动", review_enabled=False)
         self.assertEqual(Tools(self.state["id"]).call("task_context", {})["previous_task_changes"], [
             {"repository": "前端", "path": "业务.txt", "unchanged": False}])
-        self.assertIn("不因 unchanged 为 false 重复要求确认提交", self.calls[-1][1]["input"][0]["text"])
+        self.assertIn("request_review 登记", self.calls[-1][1]["input"][0]["text"])
         args = {"instruction": "重新 Review 并提交", "commit_message": "完善提示",
                 "include_paths": [{"repository": "前端", "path": "业务.txt"}]}
         description = next(description for name, description, _ in TOOLS if name == "request_review")

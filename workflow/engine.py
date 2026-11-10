@@ -1,6 +1,8 @@
 """显式暂停点、原生计划模式、修复轮次与本地提交控制。"""
 
 from concurrent.futures import ThreadPoolExecutor
+from workflow import prompts
+from workflow import prompt_templates
 from copy import deepcopy
 from hashlib import sha256
 from json import JSONDecodeError, dumps, loads
@@ -286,23 +288,9 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         state["prepare_complete"] = True
         self.save()
         if state["followup"].get("plan_mode") and state["phase"] == "plan":
-            self._start_turn("请以原生计划模式分析 followup 中本次补充需求。先读取 workflow.task_context 和当前代码。"
-                             "未完成会话须结合 continuation_context，保留原需求目标，将剩余工作与本次补充合并规划，已有代码保留。"
-                             "已完成会话以历史交付为背景，只规划本次补充需求。资料不足或影响方案时必须提问并等待。"
-                             "只生成计划，不修改业务文件；最终使用 <proposed_plan>...</proposed_plan> 输出中文计划。")
+            self._start_turn(prompts.PLAN + prompts.FOLLOWUP_PLAN)
             return
-        self._start_turn("先读取 workflow.task_context 和当前代码，按 followup 中本轮消息的实际意图处理。"
-                         "获取信息、解释或查询时只读取资料并回答；用户明确要求修改时，才授权对应范围的修改。"
-                         "未完成会话须结合 continuation_context，继续完成原目标及本次补充，保留已有代码。"
-                         "本次计划模式已关闭，不自行切换计划模式；范围不明确或需要重新计划时提问等待用户决定。"
-                         "本轮首次修改不占用 Review 后修复次数。Review 是否执行由控制器根据 review_enabled 和代码差异决定，"
-                         "用户要求修复上轮代码时，可用 replace_text 修改 previous_task_changes 中 unchanged=true 的任务文件，"
-                         "控制器会将实际替换文件纳入本轮；其他本机保留文件仍禁止修改。"
-                         "用户明确要求重新 Review、提交或重新提交时，先调用 workflow.request_review 登记请求，"
-                         "引用用户原话；需纳入的历史任务文件从 task_context.previous_task_changes 选择，"
-                         "先核对当前差异与本次任务范围；范围明确时直接登记，不因 unchanged 为 false 重复要求确认提交。"
-                         "用户指定提交标题时逐字传入 commit_message，未指定则传空字符串；该参数仅约束后续 Review 生成规范标题，不直接作为最终提交信息。"
-                         "此显式请求不受修改后自动 Review 开关限制。模型不要自行审查或提交。\n本轮消息：\n" + state["followup"]["text"])
+        self._start_turn(prompts.FOLLOWUP)
 
     def _apply_review_request(self):
         state = self.state
@@ -625,8 +613,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             raise WorkflowError("不能移除已创建的工作区，请保留原选择。")
         state["prepare_complete"] = True
         self._new_plan_round()
-        self._start_turn("请以原生计划模式分析本次需求。先调用 workflow.task_context，阅读选定代码。资料不足或问题影响方案时必须提问并等待。"
-                         "只生成计划，不修改业务文件。最终使用 <proposed_plan>...</proposed_plan> 输出中文计划；没有该计划块不能进入实施。")
+        self._start_turn(prompts.PLAN)
 
     def _new_plan_round(self):
         state = self.state
@@ -696,12 +683,9 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                 resolved_schema["items"]["properties"]["id"]["enum"] = previous_ids
             else:
                 resolved_schema["maxItems"] = 0
-            text += (f"\n本次是第 {state.get('delivery_round', 1)} 轮交付，允许引用的旧问题编号：" + dumps(previous_ids, ensure_ascii=False) +
-                     "。previous_id 只能填写上述编号或空字符串；没有可引用编号时，所有问题的 previous_id 必须为空，resolved_previous 必须为空数组。"
-                     "此前其他交付轮次的问题及接受记录仅作背景，不能沿用其编号或自动列为本轮遗留问题。"
-                     "本轮重新发现的问题按当前差异独立判断，origin 为原有问题不代表可以引用历史编号。")
-            text += ("\n本轮已选择不修复的问题编号：" + dumps(sorted(skipped_review_ids(state, state.get("delivery_round", 1)))) +
-                     "。这些问题保留原编号和记录，不修改、不要求再次选择或填写原因，也不作为待修复问题；不要另建编号重复报告同一问题。")
+            text += prompt_templates.REVIEW_IDS.format(delivery_round=state.get("delivery_round", 1),
+                                                       previous_ids=dumps(previous_ids, ensure_ascii=False))
+            text += prompt_templates.REVIEW_SKIPPED.format(skipped_ids=dumps(sorted(skipped_review_ids(state, state.get("delivery_round", 1)))))
             text += "\n" + COMMIT_INSTRUCTIONS
         for repository in compile_repositories(state):
             ensure_baseline(repository)
@@ -746,14 +730,13 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                    "compile_check": state.get("compile_check", {"enabled": False}),
                    "compile_checks": compile_context(state),
                    "materials_revision": context_hash(requirement_context(state))}
-        scope = ("本次续接未完成任务，结合 continuation_context、原需求和 followup 消息完成本轮剩余工作；已有代码保留。"
+        scope = (prompt_templates.SCOPE_CONTINUATION
                  if (state.get("followup") or {}).get("in_progress") else
-                 "原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
-                 "获取信息时只读取并回答；明确要求修改时才处理对应修改。是否自动 Review 由控制器决定。"
+                 prompt_templates.SCOPE_FOLLOWUP
                  if state.get("followup") else
-                 "本次未关联禅道工作项，以 supplement 中的首条消息和 supplement_images 为需求资料，按当前阶段和控制器授权处理。"
+                 prompt_templates.SCOPE_CONVERSATION
                  if state["item"] is None else
-                 "本次选中的所有工作项属于同一次交付，须逐项分析并统一规划前后端实现，不得遗漏任务。")
+                 prompt_templates.SCOPE_ITEMS)
         previous_input = state.get("thread_input", {})
         if previous_input.get("thread_id") != state["thread_id"]:
             previous_input = {}
@@ -777,28 +760,21 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         hashes = {key: context_hash(value) for key, value in context.items()}
         changed = {key: value for key, value in context.items()
                    if hashes[key] != previous_input.get("context_hashes", {}).get(key)}
-        material_instruction = ("资料首次读取或版本已变更，先调用 workflow.task_context(include_materials=true)。"
+        material_instruction = (prompt_templates.MATERIAL_CHANGED
                                 if "materials_revision" in changed else
-                                "先调用 workflow.task_context 获取当前授权；原需求资料沿用本线程，需核对时再设置 include_materials=true。")
+                                prompt_templates.MATERIAL_CACHED)
         naming = title_generation_context(state) if phase == "plan" else None
         if naming:
-            material_instruction = ("先调用 workflow.task_context(include_materials=true) 阅读完整工作项资料。"
-                                    "结合工作项标题、描述、关联资料、图片及补充说明，用简体中文概括首个工作项的实际目标，"
-                                    "生成建议 6～12 字的简短会话名称，不带任务/Bug/需求类型、编号、引号或解释；"
-                                    f"最多 {naming['max_length']} 个字符。随后调用 workflow.set_session_title(title) 登记名称，"
-                                    f"只传概括标题，控制器会自动追加后缀 {dumps(naming['suffix'], ensure_ascii=False)}。"
-                                    "命名完成后继续正常分析所有工作项；命名未成功不阻塞计划，不单独增加回合或循环重试。")
-        prompt = ("当前阶段：" + phase + "。" + scope + "\n" + text + "\n" + material_instruction +
-                  "需要人工选择或确认时调用 workflow.ask_user，立即结束回合，不得 sleep 或轮询。"
-                  "以下只包含变化字段，未出现的字段沿用本线程上次值。"
-                  "\n工作流上下文：\n" + dumps(changed, ensure_ascii=False))
+            material_instruction = prompt_templates.MATERIAL_NAMING.format(max_length=naming["max_length"])
+        prompt = prompt_templates.TURN.format(phase=phase, scope=scope, text=text,
+                                              material_instruction=material_instruction, context=dumps(changed, ensure_ascii=False))
         if phase == "branch":
             context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                        "sources": [{"title": source["title"], "content": source["content"]}
                                    for source in state["snapshot"]["sources"]],
                        "repositories": [{"role": entry["role"], "refreshed": entry["refreshed"], "branches": entry["catalog"]}
                                         for entry in state["branch_resolution"]["repositories"] if entry["status"] == "pending"]}
-            inputs = [{"type": "text", "text": BRANCH_INSTRUCTIONS + "\n" + dumps(context, ensure_ascii=False)}]
+            inputs = [{"type": "text", "text": prompt_templates.BRANCH_INPUT.format(context=dumps(context, ensure_ascii=False))}]
         else:
             # 技能已由 thread/start 或 thread/resume 的 developerInstructions 提供。
             inputs = [{"type": "text", "text": prompt}, *image_inputs]
@@ -850,11 +826,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                   display_text="本轮计划未提问且一次成稿，已自动授权，开始实施。" if source == "auto" else "已确认当前计划，开始实施。")
         state["phase"] = "implement"
         self.save()
-        self._start_turn("控制器已授权实施上下文中的计划，授权来源见 workflow.task_context。仅实现该计划的最小范围，先阅读已有代码与项目规范。"
-                         "先调用 workflow.task_context 确认当前阶段，再使用 workflow.write_file 或 replace_text 修改。"
-                         "原生只读沙箱限制原生命令与文件写入，控制器单独授权的 MCP 写入工具在实施阶段可用；不得据此跳过已经授权的 MCP 修改。"
-                         "出现需澄清事项必须调用 workflow.ask_user 后立即结束回合，由控制器等待明确答复。"
-                         "完成后说明修改与静态检查，不执行任何验证命令，也不要提交。")
+        self._start_turn(prompts.IMPLEMENT)
 
     def _capture_user_input(self):
         with self.lock:
@@ -926,7 +898,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             state["pending"] = None
             if state["stage"] == "等待计划确认":
                 self._new_plan_round()
-            self._start_turn("用户已补充信息：\n" + reply + "\n请从上次暂停点继续；若在计划阶段，输出最终 proposed_plan，由控制器判断是否需要人工确认。",
+            self._start_turn(prompt_templates.ANSWER_INPUT.format(reply=reply),
                              FINDING_SCHEMA if state["phase"] == "review" else COMPILE_ANALYSIS_SCHEMA
                              if state["phase"] == "compile_analysis" and self._compile_batch().get("automatic_analysis") else None)
 
@@ -946,14 +918,8 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         state["review_prompt_hash"] = sha256(prompt.encode("utf-8")).hexdigest()
         reviews = self.current_reviews()
         previous = reviews[-1]["result"] if reviews else None
-        self._start_turn(prompt + "\n\n以上固定提示词必须原样遵循。当前只读审查，不得修改。"
-                         "先用 workflow.changes 阅读每个仓库的累计差异，再结合 baseline_file 和当前文件确定问题来源。"
-                         "审查新文件，不遗漏上轮修复。无法确认则标为证据不足，不声称业务运行已经通过。"
-                         "仅输出符合给定 Schema 的 JSON。每个问题必须给出具体需求、代码证据、处理建议和影响。"
-                         "已有问题仍存在时填写 previous_id，新问题填空字符串；上轮问题确已解决时在 resolved_previous 中给出原编号及具体代码证据。"
-                         "未提及也未明确说明解决依据的旧问题会继续保留，不能以遗漏方式将其视为通过。"
-                         "编译检查仅覆盖后端，结果见上下文 compile_checks；前端仍须审查，跳过编译不能视为编译通过。"
-                         "\n上轮审查：" + dumps(previous, ensure_ascii=False), FINDING_SCHEMA)
+        self._start_turn(prompt_templates.REVIEW_INPUT.format(prompt=prompt, review=prompts.REVIEW,
+                                                             previous=dumps(previous, ensure_ascii=False)), FINDING_SCHEMA)
 
     def fix(self, selected_ids, note):
         state = self.require_state("等待修复选择")
@@ -971,9 +937,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                                    "delivery_round": state.get("delivery_round", 1)})
         state["fix_round"] += 1
         state["phase"] = "fix"
-        self._start_turn("用户选择修复以下问题，只处理选中项。不要顺手修改未选项或原有问题。"
-                         "若超出已确认计划，调用 workflow.ask_user 后立即结束回合，等待用户明确决定。修复完成后由控制器自动再次 Review。\n" +
-                         dumps(chosen, ensure_ascii=False) + "\n用户说明：" + note)
+        self._start_turn(prompt_templates.FIX_INPUT.format(fix=prompts.FIX, chosen=dumps(chosen, ensure_ascii=False), note=note))
 
     def add_round(self):
         state = self.require_state("等待修复选择")
@@ -1140,8 +1104,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             state["stage"] = "准备工作区失败"
             self.prepare_and_plan(state["selections"], state["supplement"])
             return
-        self._start_turn("用户选择恢复。先阅读 workflow.task_context 与当前代码，按原阶段继续。"
-                         "不要假定中断前的文件操作已经完成；不得跳过尚未回答的问题和计划确认。",
+        self._start_turn(prompts.RESTORE,
                          FINDING_SCHEMA if state["phase"] == "review" else None)
 
     def _event(self, message, epoch):

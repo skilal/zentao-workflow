@@ -280,7 +280,7 @@ class AutoDeliveryChecks(TestCase):
         self.assertEqual(schema["resolved_previous"]["maxItems"], 0)
         self.assertNotIn("enum", FINDING_SCHEMA["properties"]["findings"]["items"]["properties"]["previous_id"])
         self.assertIn("上轮审查：null", params["input"][0]["text"])
-        self.assertIn("允许引用的旧问题编号：[]", params["input"][0]["text"])
+        self.assertIn("可引用旧编号：[]", params["input"][0]["text"])
 
     def test_review_schema_allows_only_current_delivery_issue_ids(self):
         self.state.update(phase="review", delivery_round=4, reviews=[
@@ -339,7 +339,7 @@ class AutoDeliveryChecks(TestCase):
             self.flow.fix(["R01-01"], "")
         text = self.review(resolved=[{"id": "R01-01", "evidence": "已补齐选中的业务分支"}])
         prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
-        self.assertIn('本轮已选择不修复的问题编号：["R01-02"]', prompt)
+        self.assertIn('本轮不修复编号：["R01-02"]', prompt)
         with patch("workflow.engine.manifest", return_value={}):
             self.complete(text)
         self.assertEqual(self.state["phase"], "complete")
