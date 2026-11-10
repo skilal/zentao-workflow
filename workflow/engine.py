@@ -28,7 +28,7 @@ from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, c
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
 from workflow.pdf_materials import material_files
-from workflow.rpc import AppServer, thread_parameters
+from workflow.rpc import AppServer, CodexRequestError, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.session_titles import collect_session_title, title_generation_context
 from workflow.store import SessionStore, followup_available, timestamp
@@ -873,7 +873,28 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                 self.save()
                 thread_id, turn_id = self.state["thread_id"], self.state["turn_id"]
         if interrupt:
-            self.rpc.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            self._interrupt_turn(thread_id, turn_id)
+
+    def _interrupt_turn(self, thread_id, turn_id):
+        with self.lock:
+            if (not self.turn_running or not self.rpc or self.state.get("thread_id") != thread_id
+                    or self.state.get("turn_id") != turn_id):
+                return
+            rpc = self.rpc
+        try:
+            rpc.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        except CodexRequestError as error:
+            if error.message != "no active turn to interrupt":
+                raise
+            # 回合可能在检查后结束；服务端已确认无需中断，不依赖迟到的完成通知解锁回答。
+            with self.lock:
+                if (self.rpc is not rpc or self.state.get("thread_id") != thread_id
+                        or self.state.get("turn_id") != turn_id):
+                    return
+                self.turn_running = False
+                if self.state.get("pending"):
+                    self.state["pending"]["turn_completed"] = True
+                self.save()
 
     def answer(self, text, answers=None, attachments=None):
         state = self.require_state("等待人工回答", "等待计划补充", "等待计划确认")
@@ -1050,7 +1071,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         state["last_output"] = self.last_message or "\n\n".join(self.output.values())
         self.save()
         if self.rpc and state.get("turn_id") and was_active and state["phase"] != "compile":
-            self.rpc.request("turn/interrupt", {"threadId": state["thread_id"], "turnId": state["turn_id"]})
+            self._interrupt_turn(state["thread_id"], state["turn_id"])
         self.save()
 
     def restore(self, session_id):

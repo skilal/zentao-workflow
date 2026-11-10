@@ -15,6 +15,14 @@ from workflow.branching import BRANCH_INSTRUCTIONS
 from workflow.settings import ROOT, WorkflowError
 
 
+class CodexRequestError(WorkflowError):
+    """保留服务端错误原文，供调用方识别明确的状态冲突。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__("Codex 接口拒绝请求：" + message)
+
+
 class AppServer:
     def __init__(self, settings, callback):
         self.settings = settings
@@ -118,7 +126,7 @@ class AppServer:
             except Empty:
                 raise WorkflowError("Codex 接口响应超时，流程已停止，未自动重试。") from None
             if "error" in response:
-                raise WorkflowError("Codex 接口拒绝请求：" + str(response["error"].get("message", "未知错误")))
+                raise CodexRequestError(str(response["error"].get("message", "未知错误")))
             return response.get("result", {})
         finally:
             with self.lock:

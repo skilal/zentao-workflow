@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from workflow.rpc import AppServer
+from workflow.rpc import AppServer, CodexRequestError
 from workflow.settings import ROOT, WorkflowError
 
 
@@ -22,6 +22,21 @@ class CodexCommandChecks(TestCase):
         with patch("workflow.rpc.Popen") as process, patch("workflow.rpc.Thread"), patch.object(rpc, "notify"):
             rpc.connect()
         return process.call_args.args[0]
+
+    def test_request_error_keeps_server_message_and_workflow_error_contract(self):
+        rpc = AppServer(self.settings, Mock())
+
+        def respond(message):
+            rpc.waiters[message["id"]].put({"error": {"code": -32600,
+                                                   "message": "no active turn to interrupt"}})
+
+        with patch.object(rpc, "_write", side_effect=respond):
+            with self.assertRaises(CodexRequestError) as caught:
+                rpc.request("turn/interrupt", {"threadId": "线程", "turnId": "回合"})
+        self.assertIsInstance(caught.exception, WorkflowError)
+        self.assertEqual(caught.exception.message, "no active turn to interrupt")
+        self.assertEqual(str(caught.exception), "Codex 接口拒绝请求：no active turn to interrupt")
+        self.assertEqual(rpc.waiters, {})
 
     def test_absolute_executable_works_without_path_and_preserves_settings(self):
         with TemporaryDirectory(prefix="Codex 命令 ") as directory:

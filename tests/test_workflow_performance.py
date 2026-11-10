@@ -12,6 +12,7 @@ from workflow.approvals import is_workflow_tool_call
 from workflow.engine import Workflow
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
+from workflow.rpc import CodexRequestError
 from workflow.sessions import SessionManager
 from workflow.settings import ROOT, WorkflowError
 from workflow.user_input import input_request_path
@@ -296,12 +297,67 @@ class ControllerInputChecks(PerformanceFixture):
         self.register()
         self.capture()
         self.complete()
+        self.rpc.request.reset_mock()
         self.flow.pause()
+        self.rpc.request.assert_not_called()
         self.rpc.request.reset_mock()
         self.flow.resume()
         self.rpc.request.assert_not_called()
         self.assertEqual(self.state["stage"], "等待人工回答")
         self.assertTrue(self.state["pending"]["turn_completed"])
+
+    def test_question_interrupt_racing_completion_allows_explicit_answer(self):
+        self.register()
+        self.rpc.request.side_effect = CodexRequestError("no active turn to interrupt")
+        self.capture()
+        self.assertFalse(self.flow.turn_running)
+        self.assertEqual(self.state["stage"], "等待人工回答")
+        self.assertTrue(self.state["pending"]["turn_completed"])
+        self.assertTrue(input_request_path(self.flow.store, self.state).exists())
+        self.assertFalse(self.state.get("error"))
+        self.assertNotIn("error", [call.args[0] for call in self.flow.emit.call_args_list])
+        self.rpc.request.side_effect = None
+        self.rpc.request.return_value = {"turn": {"id": "回答后的回合"}}
+        self.flow.answer("", {"scope": ["纳入"]})
+        self.assertIsNone(self.state["pending"])
+        self.assertEqual(self.state["turn_id"], "回答后的回合")
+        self.assertTrue(self.state["plan_round"]["asked"])
+
+    def test_pause_active_turn_still_requests_interrupt(self):
+        self.rpc.request.reset_mock()
+        self.flow.pause()
+        self.rpc.request.assert_called_once_with("turn/interrupt", {"threadId": "原线程", "turnId": "原回合"})
+        self.assertEqual(self.state["stage"], "已暂停")
+
+    def test_pause_interrupt_racing_completion_preserves_question(self):
+        self.register()
+        self.rpc.request.side_effect = CodexRequestError("no active turn to interrupt")
+        self.flow.pause()
+        self.assertEqual(self.state["stage"], "已暂停")
+        self.assertFalse(self.flow.turn_running)
+        self.assertTrue(self.state["pending"]["turn_completed"])
+        self.assertTrue(input_request_path(self.flow.store, self.state).exists())
+        self.flow.resume()
+        self.assertEqual(self.state["stage"], "等待人工回答")
+
+    def test_interrupt_failure_does_not_change_replacement_turn(self):
+        def replace_turn(method, params):
+            self.state["turn_id"] = "新回合"
+            raise CodexRequestError("no active turn to interrupt")
+
+        self.rpc.request.side_effect = replace_turn
+        self.flow._interrupt_turn("原线程", "原回合")
+        self.assertTrue(self.flow.turn_running)
+        self.assertEqual(self.state["turn_id"], "新回合")
+
+    def test_other_interrupt_errors_are_still_reported(self):
+        for error in (CodexRequestError("thread not found"), WorkflowError("Codex 接口响应超时")):
+            with self.subTest(error=str(error)):
+                self.rpc.request.side_effect = error
+                with self.assertRaises(WorkflowError) as caught:
+                    self.flow._interrupt_turn("原线程", "原回合")
+                self.assertIs(caught.exception, error)
+                self.assertTrue(self.flow.turn_running)
 
     def test_disconnect_after_question_allows_explicit_answer_in_original_thread(self):
         self.register()
