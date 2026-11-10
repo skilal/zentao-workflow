@@ -56,7 +56,7 @@ def session_title(state):
         return "待命名会话"
     if state["item"] is None:
         return state.get("conversation_title", "新会话")
-    names = {"story": "需求", "task": "任务", "bug": "Bug"}
+    names = {"epic": "业务需求", "requirement": "用户需求", "story": "需求", "task": "任务", "bug": "Bug"}
     return "；".join(f"{names[item['kind']]} #{item['id']} · {item['title']}"
                     for item in state.get("items", [state["item"]]))
 

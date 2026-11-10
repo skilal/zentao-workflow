@@ -11,7 +11,7 @@ DOMPurify.addHook("afterSanitizeAttributes", node => {
     else node.setAttribute("disabled", "");
   }
 });
-const TYPE_NAMES = { story: "需求", task: "任务", bug: "Bug" };
+const TYPE_NAMES = { epic: "业务需求", requirement: "用户需求", story: "研发需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
 const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"]);
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
@@ -29,7 +29,7 @@ function plainDescription(value) {
   return String(value || "").replaceAll("【spec】", "【需求描述】").replaceAll("【verify】", "【验收标准】")
     .replaceAll("【desc】", "【详细描述】").replaceAll("【steps】", "【复现步骤】").replaceAll("【bugSteps】", "【来源 Bug 描述】");
 }
-function typeTag(kind) { return h(Tag, { color: { story: "blue", task: "cyan", bug: "orange" }[kind] }, TYPE_NAMES[kind]); }
+function typeTag(kind) { return h(Tag, { color: { epic: "purple", requirement: "geekblue", story: "blue", task: "cyan", bug: "orange" }[kind] }, TYPE_NAMES[kind]); }
 function stageTag(stage) {
   const color = stage?.includes("等待") ? "gold" : stage?.includes("完成") ? "success" : stage?.includes("停止") || stage?.includes("失败") ? "error" : ACTIVE.has(stage) ? "processing" : "default";
   return h(Tag, { color }, stage || "尚未选择工作项");
@@ -1031,7 +1031,7 @@ function WorkflowApp() {
       changeDraft({ selected_items: next });
     }
     const columns = [
-      { title: "类型", dataIndex: "kind", width: 85, render: typeTag },
+      { title: "类型", dataIndex: "kind", width: 110, render: typeTag },
       { title: "编号", dataIndex: "id", width: 90, render: value => h(Typography.Text, { code: true }, `#${value}`) },
       { title: "标题", dataIndex: "title", render: value => h("span", { className: "table-title" }, value) },
       { title: "状态", dataIndex: "status", width: 100, render: value => h(Tag, null, STATUS_NAMES[value] || value) },

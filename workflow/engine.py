@@ -335,7 +335,8 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
     def refresh(self):
         items = []
         with self.zentao_lock:
-            for kind in ("story", "task", "bug"):
+            items.extend(self.zentao.list_requirements())
+            for kind in ("task", "bug"):
                 items.extend(self.zentao.list_items(kind))
         self.emit("items", items)
 

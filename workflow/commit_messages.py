@@ -30,7 +30,7 @@ def prepare_commit_messages(state, entries):
         raise WorkflowError("提交标题须与本轮有改动的仓库逐一对应，请重新 Review。")
     requested = state.get("commit_message", "")
     complete_title = fullmatch(r"(?:" + "|".join(COMMIT_TYPES) + r")\([^()\r\n]+\): .+", requested)
-    labels = {"task": "任务", "bug": "Bug", "story": "需求"}
+    labels = {"epic": "业务需求", "requirement": "用户需求", "task": "任务", "bug": "Bug", "story": "需求"}
     references = list(dict.fromkeys(f"{labels[item['kind']]} #{item['id']}"
                                    for item in state.get("items", [state["item"]]) if item is not None))
     footer = "\n\n关联工作项: " + "、".join(references) if references else ""

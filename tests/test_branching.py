@@ -39,8 +39,9 @@ class ProjectChecks(TestCase):
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
         client = ZentaoClient(settings)
         client.account, client.token = "示例账号", "模拟登录"
-        item = {"id": 7, "project": 41, "projectName": "示例档案馆", "title": "示例需求", "assignedTo": "示例账号"}
-        with patch.object(client, "_fetch", return_value={"story": {"total": 1, "stories": [item]}}):
+        item = {"id": 7, "type": "story", "project": 41, "projectName": "示例档案馆", "title": "示例需求", "assignedTo": "示例账号"}
+        with patch.object(client, "_fetch", side_effect=[{"total": 1, "products": [{"id": 1}]},
+                                                        {"total": 1, "stories": [item]}]):
             result = client.list_items("story")[0]
         self.assertEqual((result["project_id"], result["project_name"]), (41, "示例档案馆"))
         self.assertEqual(result["project_candidates"], [{"id": 41, "name": "示例档案馆"}])

@@ -17,7 +17,9 @@ from workflow.settings import WorkflowError, load_password
 from workflow.pdf_materials import read_pdf
 
 
-KINDS = {"story": ("需求", "stories"), "task": ("任务", "tasks"), "bug": ("Bug", "bugs")}
+REQUIREMENT_KINDS = ("epic", "requirement", "story")
+KINDS = {"epic": ("业务需求", "stories"), "requirement": ("用户需求", "stories"),
+         "story": ("研发需求", "stories"), "task": ("任务", "tasks"), "bug": ("Bug", "bugs")}
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -209,6 +211,8 @@ class ZentaoClient:
             raise WorkflowError("请先连接禅道。")
 
     def list_items(self, kind):
+        if kind in REQUIREMENT_KINDS:
+            return self.list_requirements((kind,))
         self.require_login()
         if kind not in KINDS:
             raise WorkflowError("未知工作项类型。")
@@ -250,6 +254,53 @@ class ZentaoClient:
             page += 1
         return records
 
+    def _pages(self, path, key, parameters):
+        page, seen = 1, set()
+        while True:
+            query = urlencode({**parameters, "limit": self.settings["page_size"], "page": page})
+            data = self._fetch(path + "?" + query)
+            items, total = data.get(key), data.get("total")
+            if not isinstance(items, list) or type(total) is not int or total < 0:
+                raise WorkflowError("禅道产品或需求列表格式不符合预期，已停止。")
+            ids = {identifier(item.get("id")) for item in items}
+            if any(item_id <= 0 for item_id in ids):
+                raise WorkflowError("禅道产品或需求编号无效，已停止。")
+            if not ids.difference(seen) and len(seen) < total:
+                raise WorkflowError("禅道分页提前结束，列表不完整，已停止。")
+            for item in items:
+                if identifier(item["id"]) not in seen:
+                    seen.add(identifier(item["id"]))
+                    yield item
+            if len(seen) >= total:
+                return
+            page += 1
+
+    def list_requirements(self, kinds=REQUIREMENT_KINDS):
+        self.require_login()
+        records, seen = [], set()
+        for product in self._pages("api.php/v1/products", "products", {"status": "all", "order": "id_asc"}):
+            for kind in kinds:
+                parameters = {"product": identifier(product["id"]), "type": kind, "status": "all",
+                              "branch": "all", "order": "id_asc"}
+                for item in self._pages("api.php/v1/stories", "stories", parameters):
+                    if item.get("type") != kind:
+                        raise WorkflowError("禅道返回的需求类型与请求不一致，已停止。")
+                    item_id = identifier(item["id"])
+                    if (kind, item_id) in seen:
+                        continue
+                    seen.add((kind, item_id))
+                    if (account_of(item.get("assignedTo")) != self.account
+                            or item.get("status") in self.settings["excluded_statuses"] or item.get("deleted")):
+                        continue
+                    project = project_context(item)
+                    records.append({"kind": kind, "id": item_id, "title": item.get("title", ""),
+                                    "status": item.get("statusName", item.get("status", "")),
+                                    "project": project["name"] or project["id"],
+                                    "project_id": project["id"], "project_name": project["name"],
+                                    "project_candidates": project["candidates"],
+                                    "priority": item.get("pri", ""), "assigned_to": self.account})
+        return records
+
     def list_projects(self):
         self.require_login()
         page, projects = 1, {}
@@ -275,9 +326,14 @@ class ZentaoClient:
         self.require_login()
         if kind not in KINDS or int(item_id) <= 0:
             raise WorkflowError("工作项类型或编号无效。")
-        data = self._fetch(f"api.php/v1/{KINDS[kind][1]}/{int(item_id)}")
+        path = f"api.php/v1/{KINDS[kind][1]}/{int(item_id)}"
+        if kind in ("epic", "requirement"):
+            path += "?" + urlencode({"type": kind})
+        data = self._fetch(path)
         if identifier(data.get("id")) != int(item_id):
             raise WorkflowError("返回的工作项编号不一致。")
+        if kind in ("epic", "requirement") and data.get("type") != kind:
+            raise WorkflowError("返回的需求类型不一致，已停止。")
         if require_assignee and account_of(data.get("assignedTo")) != self.account:
             raise WorkflowError("该工作项已不再指派给当前账号，已停止。")
         return data
@@ -305,7 +361,7 @@ class ZentaoClient:
                                   "data": {"id": story_id, "title": primary.get("storyTitle", ""),
                                            "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
                                            "files": primary.get("storyFiles", [])}})
-            elif item["kind"] != "story" and story_id:
+            elif item["kind"] in ("task", "bug") and story_id:
                 documents.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
             if item["kind"] == "task" and from_bug:
                 documents.append({"kind": "bug", "data": self.detail("bug", from_bug, require_assignee=False)})
