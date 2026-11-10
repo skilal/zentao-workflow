@@ -173,6 +173,22 @@ function ChangeLocations({ reports = [] }) {
                     h("div", { className: "repo-path", key: index }, `${source.repository} / ${source.path}:${source.line} · ${source.description}`)))))))
           })) }) }] });
 }
+function ItemsSyncStatus({ sync }) {
+  const [elapsed, setElapsed] = useState(0);
+  const loading = sync.status === "loading";
+  useEffect(() => {
+    if (!loading) return;
+    const update = () => setElapsed(Math.max(0, Math.floor((Date.now() - Date.parse(sync.started_at)) / 1000)));
+    update();
+    const timer = setInterval(update, 1000);
+    return () => clearInterval(timer);
+  }, [loading, sync.started_at]);
+  return h(Alert, { className: "items-sync", type: loading ? "info" : sync.status === "failed" ? "error" : "success", showIcon: true,
+    icon: loading ? h(Spin, { size: "small" }) : undefined,
+    message: `${sync.message} · ${loading ? `已用 ${elapsed} 秒` : `耗时 ${sync.elapsed_seconds} 秒`}`,
+    description: loading ? "正在获取最新列表，完成后统一更新。" : sync.status === "failed" ? "本次未更新列表，请处理上述问题后手动刷新。" : undefined,
+    style: { marginBottom: 16 } });
+}
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
@@ -809,7 +825,7 @@ function WorkflowApp() {
       eventSource.current = events;
       events.onopen = () => setOnline(true);
       events.onerror = () => setOnline(false);
-      for (const kind of ["state", "preview", "items", "connected", "connection", "conversation", "delta", "progress", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
+      for (const kind of ["state", "preview", "items", "items_sync", "connected", "connection", "conversation", "delta", "progress", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
         events.addEventListener(kind, event => {
           if (disposed) return;
           const value = JSON.parse(event.data);
@@ -832,6 +848,7 @@ function WorkflowApp() {
           }
           else if (kind === "projects") applyModel({ ...current, project_partitions: value.project_partitions });
           else if (kind === "items") applyModel({ ...current, items: value });
+          else if (kind === "items_sync") applyModel({ ...current, items_sync: value });
           else if (kind === "connected") applyModel({ ...current, connected: true, profile: value });
           else if (kind === "connection") applyModel({ ...current, ...value });
           else if (kind === "busy") {
@@ -1119,6 +1136,7 @@ function WorkflowApp() {
     const snapshot = selectionMatches ? state?.snapshot : null;
     return h("div", { className: "card-stack" },
       h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, { onClick: () => act("refresh"), disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表")) },
+        model.items_sync && h(ItemsSyncStatus, { sync: model.items_sync }),
         h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => { setFilter(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => ({ value, label: `${label} ${model.items.filter(item => item.kind === value).length}` }))] }),
           h(Space, { wrap: true },
             h(Select, { "aria-label": "筛选所属项目", value: itemProject, showSearch: true, optionFilterProp: "label", style: { width: 180 },

@@ -199,7 +199,8 @@ git push origin main
 - 禅道 API v1：账号密码登录、当前用户、分页待办、详情、关联需求 / 来源 Bug、附件及正文图片。
 - 禅道资料读取：UTF-8 文本及不含内嵌媒体的 DOCX、PPTX 提取文本；ZIP 展开成员并保留来源归属。PDF（含 ZIP 内的扫描件）通过 Poppler 的 `pdftoppm` 逐页生成图片，在页面中预览，并随计划回合交给 Codex 阅读。在 `settings.json` 中配置 `pdf.renderer`，推荐使用 `pdftoppm.exe` 的完整路径（例如 `D:/tools/poppler/Library/bin/pdftoppm.exe`），正常启动时无需依赖临时 PATH；命令名仅在启动环境的 PATH 中解析。配置的工具不可用时明确停止 PDF 读取，不自动查找其他路径或切换解析方案。电子表格、旧版 Office、加密文档及含内嵌媒体的 Office 文档仍提示人工补充。
 - 飞书第一版不读取，只保留链接；必要规则由人工补充。
-- 需求列表包含业务需求 `epic`、用户需求 `requirement`、研发需求 `story`，按类型分别展示和筛选；任务 `task`、Bug `bug` 保持原有规则。需求通过 API v1 分页读取可访问产品及各产品的三类需求，覆盖全部产品分支，只保留直接指派给当前账号且未被配置排除的状态；产品不视为所属项目，项目不明确时仍由人工选择。用户、业务需求详情使用 `stories/{id}?type=requirement|epic`，读取正文、验收标准、图片和附件；接口失败或分页不完整时停止，不切换接口或尝试其他类型。
+- 工作项包含业务需求 `epic`、用户需求 `requirement`、研发需求 `story`、任务 `task` 和 Bug `bug`，按类型分别展示和筛选。启动连接与手动刷新采用同一读取流程：研发需求、任务和 Bug 通过 API v1 `user?fields=story,task,bug&type=assignedTo` 合并分页读取，已读完的类型不再请求后续页；业务及用户需求按可访问产品读取 `stories?type=epic|requirement&status=assignedtome&branch=all`，由禅道先筛选指派给当前账号的需求，避免下载全公司需求后再筛选。仍在本机核对指派人、删除标记及配置排除状态，产品不视为所属项目，项目不明确时由人工选择。页面显示读取类型、产品进度及耗时，刷新期间保留上一轮完整列表，全部成功后统一更新；失败或分页不完整时停止，不重试或切换接口，不使用持久缓存替代实时读取。业务及用户需求详情仍使用 `stories/{id}?type=requirement|epic` 读取正文、验收标准、图片和附件。
+- 当前 API v1 的“我的工作”只直接提供研发需求、任务和 Bug，业务及用户需求仍至少需要每产品各一次查询。禅道 Token 对应服务端会话，同一 Token 的并发请求可能受会话锁串行限制。若产品较多且需要进一步减少启动与刷新等待，应由禅道端提供按登录账号聚合五类工作项的只读分页接口；客户端不能用未确认的类型参数或缓存跳过未检查产品。刷新状态的 `list_requests` 记录列表请求数，`elapsed_seconds` 记录本轮耗时，可用于后续定位，均不包含凭据或响应原文。
 - 模型对 Java 代码只做轻量静态检查；开启编译检查时仅由控制器执行受控例外。工作流自身的模拟验证不编译业务仓库、不下载业务依赖，业务功能仍需人工验收。
 
 Codex 官方协议参考：[App Server](https://learn.chatgpt.com/docs/app-server)、[功能配置](https://learn.chatgpt.com/docs/config-file/config-basic)。

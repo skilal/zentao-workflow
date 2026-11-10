@@ -129,6 +129,7 @@ class WebApplication:
         self.cookie_token = token_urlsafe(32)
         self.csrf_token = token_urlsafe(32)
         self.items = []
+        self.items_sync = None
         self.connected = False
         self.profile = None
         self.busy = None
@@ -238,6 +239,9 @@ class WebApplication:
                 self.items = deepcopy(value)
                 self._publish("items", self.items)
                 self._publish("projects", {"project_partitions": self.projects()})
+            elif kind == "items_sync":
+                self.items_sync = deepcopy(value)
+                self._publish("items_sync", self.items_sync)
             elif kind == "connected":
                 self.connected, self.profile = True, value
                 self._publish("connected", value)
@@ -284,7 +288,7 @@ class WebApplication:
 
     def snapshot(self):
         with self.lock:
-            return {"preview_supported": True, "items": deepcopy(self.items), "default_session_id": self.default_session_id,
+            return {"preview_supported": True, "items": deepcopy(self.items), "items_sync": deepcopy(self.items_sync), "default_session_id": self.default_session_id,
                     "connected": self.connected, "profile": self.profile, "busy": self.busy,
                     "cursor": self.sequence, "settings": self.public_settings(),
                     "project_partitions": self.projects(),
@@ -608,8 +612,10 @@ class WebApplication:
         with self.condition:
             self.connected, self.profile = False, None
             self.items = []
+            self.items_sync = None
             self._publish("settings", self.public_settings())
             self._publish("items", [])
+            self._publish("items_sync", None)
             self._publish("connection", {"connected": False})
             self._publish("projects", {"project_partitions": self.projects()})
 

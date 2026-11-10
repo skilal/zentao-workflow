@@ -34,7 +34,7 @@ class RequirementItemsChecks(TestCase):
             query = {key: values[0] for key, values in parse_qs(parsed.query).items()}
             calls.append((parsed.path, query))
             self.assertEqual(query["limit"], "2")
-            self.assertEqual(query["status"], "all")
+            self.assertEqual(query["status"], "all" if parsed.path == "api.php/v1/products" else "assignedtome")
             page = int(query["page"])
             if parsed.path == "api.php/v1/products":
                 return {"total": 2, "products": [{"id": page}]}
@@ -65,6 +65,7 @@ class RequirementItemsChecks(TestCase):
                 self.assertEqual(items[0]["kind"], kind)
                 self.assertEqual(items[0]["project_id"], 0)
                 self.assertEqual(parse_qs(urlparse(fetch.call_args.args[0]).query)["type"], [kind])
+                self.assertEqual(parse_qs(urlparse(fetch.call_args.args[0]).query)["status"], ["assignedtome"])
 
     def test_empty_products_are_successful_empty_list(self):
         with patch.object(self.client, "_fetch", return_value={"total": 0, "products": []}) as fetch:
@@ -185,13 +186,14 @@ class RequirementWorkflowChecks(TestCase):
 
     def test_refresh_publishes_all_kinds_together(self):
         flow = self.application.sessions.connection
-        requirements = [{"kind": kind, "id": 7, "title": KINDS[kind][0]} for kind in REQUIREMENT_KINDS]
+        requirements = [{"kind": kind, "id": 7, "title": KINDS[kind][0]} for kind in ("epic", "requirement")]
         client = self.application.sessions.zentao
         with patch.object(client, "list_requirements", return_value=requirements) as listed, \
-                patch.object(client, "list_items", side_effect=lambda kind: [{"kind": kind, "id": 7}]) as other:
+                patch.object(client, "list_assigned_items", return_value=[{"kind": kind, "id": 7} for kind in ("story", "task", "bug")]) as other:
             flow.refresh()
-        listed.assert_called_once_with()
-        self.assertEqual([call.args[0] for call in other.call_args_list], ["task", "bug"])
+        self.assertEqual(listed.call_args.args, (("epic", "requirement"),))
+        listed.assert_called_once()
+        other.assert_called_once()
         self.assertEqual([item["kind"] for item in self.application.items], list(KINDS))
 
     def test_new_kinds_can_be_selected_as_preview_and_reject_multiple_selection(self):

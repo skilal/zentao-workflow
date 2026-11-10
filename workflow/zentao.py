@@ -213,51 +213,63 @@ class ZentaoClient:
     def list_items(self, kind):
         if kind in REQUIREMENT_KINDS:
             return self.list_requirements((kind,))
-        self.require_login()
         if kind not in KINDS:
             raise WorkflowError("未知工作项类型。")
-        page, seen, records = 1, set(), []
-        while True:
-            query = urlencode({"fields": kind, "type": "assignedTo", "limit": self.settings["page_size"], "page": page})
-            data = self._fetch("api.php/v1/user?" + query)
-            bucket = data.get(kind)
-            if not isinstance(bucket, dict) or "total" not in bucket:
-                raise WorkflowError("禅道未返回该类型列表；请确认“我的工作”访问权限。")
-            items = bucket.get(KINDS[kind][1], [])
-            if not isinstance(items, list):
-                raise WorkflowError("禅道工作项列表格式不符合预期。")
-            new_ids = set()
-            for item in items:
-                item_id = identifier(item.get("id"))
-                if item_id in seen:
-                    continue
-                new_ids.add(item_id)
-                if account_of(item.get("assignedTo")) != self.account:
-                    continue
-                if item.get("status") in self.settings["excluded_statuses"]:
-                    continue
-                project = project_context(item)
-                records.append({"kind": kind, "id": item_id,
-                                "title": item.get("title") if kind != "task" else item.get("name"),
-                                "status": item.get("statusName", item.get("status", "")),
-                                "project": project["name"] or project["id"],
-                                "project_id": project["id"], "project_name": project["name"],
-                                "project_candidates": project["candidates"],
-                                "priority": item.get("pri", ""), "assigned_to": self.account})
-            if not items or not new_ids:
-                if len(seen) < int(bucket["total"]):
-                    raise WorkflowError("禅道分页提前结束，列表不完整，已停止。")
-                break
-            seen.update(new_ids)
-            if len(seen) >= int(bucket["total"]):
-                break
-            page += 1
-        return records
+        return self.list_assigned_items((kind,))
 
-    def _pages(self, path, key, parameters):
+    def list_assigned_items(self, kinds=("story", "task", "bug"), on_progress=None):
+        self.require_login()
+        page, pending = 1, list(kinds)
+        seen, records = {kind: set() for kind in kinds}, {kind: [] for kind in kinds}
+        while pending:
+            query = urlencode({"fields": ",".join(pending), "type": "assignedTo", "order": "id_asc",
+                               "limit": self.settings["page_size"], "page": page})
+            if on_progress:
+                on_progress(f"正在读取{'、'.join(KINDS[kind][0] for kind in pending)}：第 {page} 页")
+            data = self._fetch("api.php/v1/user?" + query)
+            remaining = []
+            for kind in pending:
+                bucket = data.get(kind)
+                if (not isinstance(bucket, dict) or type(bucket.get("total")) is not int
+                        or bucket["total"] < 0 or not isinstance(bucket.get(KINDS[kind][1]), list)):
+                    raise WorkflowError("禅道未返回有效的工作项列表；请确认“我的工作”访问权限及接口格式。")
+                items = bucket[KINDS[kind][1]]
+                new_ids = set()
+                for item in items:
+                    if kind == "story" and item.get("type") != kind:
+                        raise WorkflowError("禅道返回的需求类型与请求不一致，已停止。")
+                    item_id = identifier(item.get("id"))
+                    if item_id <= 0:
+                        raise WorkflowError("禅道工作项编号无效，已停止。")
+                    if item_id in seen[kind] or item_id in new_ids:
+                        continue
+                    new_ids.add(item_id)
+                    if (account_of(item.get("assignedTo")) != self.account
+                            or item.get("status") in self.settings["excluded_statuses"] or item.get("deleted")):
+                        continue
+                    project = project_context(item)
+                    records[kind].append({"kind": kind, "id": item_id,
+                                          "title": item.get("title") if kind != "task" else item.get("name"),
+                                          "status": item.get("statusName", item.get("status", "")),
+                                          "project": project["name"] or project["id"],
+                                          "project_id": project["id"], "project_name": project["name"],
+                                          "project_candidates": project["candidates"],
+                                          "priority": item.get("pri", ""), "assigned_to": self.account})
+                if not new_ids and len(seen[kind]) < bucket["total"]:
+                    raise WorkflowError("禅道分页提前结束，列表不完整，已停止。")
+                seen[kind].update(new_ids)
+                if len(seen[kind]) < bucket["total"]:
+                    remaining.append(kind)
+            pending = remaining
+            page += 1
+        return [item for kind in kinds for item in records[kind]]
+
+    def _pages(self, path, key, parameters, on_page=None):
         page, seen = 1, set()
         while True:
             query = urlencode({**parameters, "limit": self.settings["page_size"], "page": page})
+            if on_page:
+                on_page(page)
             data = self._fetch(path + "?" + query)
             items, total = data.get(key), data.get("total")
             if not isinstance(items, list) or type(total) is not int or total < 0:
@@ -282,14 +294,17 @@ class ZentaoClient:
                 return
             page += 1
 
-    def list_requirements(self, kinds=REQUIREMENT_KINDS):
+    def list_requirements(self, kinds=REQUIREMENT_KINDS, on_progress=None):
         self.require_login()
         records, seen = [], set()
-        for product in self._pages("api.php/v1/products", "products", {"status": "all", "order": "id_asc"}):
+        products = list(self._pages("api.php/v1/products", "products", {"status": "all", "order": "id_asc"},
+                                   on_page=(lambda page: on_progress(f"正在读取可见产品：第 {page} 页")) if on_progress else None))
+        for index, product in enumerate(products, 1):
             for kind in kinds:
-                parameters = {"product": identifier(product["id"]), "type": kind, "status": "all",
+                parameters = {"product": identifier(product["id"]), "type": kind, "status": "assignedtome",
                               "branch": "all", "order": "id_asc"}
-                for item in self._pages("api.php/v1/stories", "stories", parameters):
+                on_page = (lambda page: on_progress(f"正在读取{KINDS[kind][0]}：产品 {index}/{len(products)}，第 {page} 页")) if on_progress else None
+                for item in self._pages("api.php/v1/stories", "stories", parameters, on_page=on_page):
                     item_id = identifier(item["id"])
                     if (kind, item_id) in seen:
                         continue

@@ -9,6 +9,7 @@ from json import JSONDecodeError, dumps, loads
 from pathlib import Path
 from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
+from time import monotonic
 
 from workflow.approvals import is_workflow_tool_call
 from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
@@ -315,18 +316,33 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         self.note("控制器", "已接收本轮明确的审查提交请求，将重新 Review，通过后本地提交。")
 
     def connect(self):
-        with self.zentao_lock:
-            profile = self.zentao.login()
-        self.emit("connected", profile)
-        self.refresh()
+        self.refresh(reconnect=True)
 
-    def refresh(self):
-        items = []
-        with self.zentao_lock:
-            items.extend(self.zentao.list_requirements())
-            for kind in ("task", "bug"):
-                items.extend(self.zentao.list_items(kind))
+    def refresh(self, reconnect=False):
+        started, started_at, requests = monotonic(), timestamp(), 0
+        def report(message):
+            nonlocal requests
+            requests += 1
+            self.emit("items_sync", {"status": "loading", "message": message, "started_at": started_at,
+                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
+        self.emit("items_sync", {"status": "loading", "message": "正在连接禅道" if reconnect else "正在刷新工作项",
+                                 "started_at": started_at, "elapsed_seconds": 0, "list_requests": 0})
+        try:
+            if reconnect:
+                with self.zentao_lock:
+                    profile = self.zentao.login()
+                self.emit("connected", profile)
+            with self.zentao_lock:
+                assigned = self.zentao.list_assigned_items(on_progress=report)
+                requirements = self.zentao.list_requirements(("epic", "requirement"), on_progress=report)
+            items = [*requirements, *assigned]
+        except WorkflowError as error:
+            self.emit("items_sync", {"status": "failed", "message": str(error), "started_at": started_at,
+                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
+            raise
         self.emit("items", items)
+        self.emit("items_sync", {"status": "complete", "message": f"已更新 {len(items)} 项工作项", "started_at": started_at,
+                                 "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
 
     def collect(self, items):
         if self.state and not self.editable():
