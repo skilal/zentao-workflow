@@ -421,6 +421,8 @@ function WorkflowApp() {
   const selectionRequest = useRef("");
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
+  const [itemProject, setItemProject] = useState("all");
+  const [itemPagination, setItemPagination] = useState({ current: 1, pageSize: 10 });
   const [draft, setDraft] = useState(emptyDraft());
   const draftRef = useRef(draft);
   const imageInput = useRef(null);
@@ -1012,7 +1014,11 @@ function WorkflowApp() {
   }
 
   function renderItems() {
+    const projects = [...new Map(model.items.map(item => [item.project_id, {
+      value: item.project_id, label: item.project_name || (item.project_id > 0 ? `项目 #${item.project_id}` : "未关联项目")
+    }])).values()];
     const rows = model.items.filter(item => (filter === "all" || item.kind === filter) &&
+      (itemProject === "all" || item.project_id === itemProject) &&
       (!query.trim() || `${item.id} ${item.title}`.toLowerCase().includes(query.trim().toLowerCase())));
     const canCollect = !state || state.can_edit;
     const selectionDisabled = busy || !canCollect || !model.connected;
@@ -1035,9 +1041,17 @@ function WorkflowApp() {
     const snapshot = selectionMatches ? state?.snapshot : null;
     return h("div", { className: "card-stack" },
       h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, { onClick: () => act("refresh"), disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表")) },
-        h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => setFilter(event.target.value), optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => ({ value, label: `${label} ${model.items.filter(item => item.kind === value).length}` }))] }),
-          h(Input.Search, { placeholder: "搜索编号或标题", allowClear: true, value: query, onChange: event => setQuery(event.target.value), style: { width: 260 } })),
-        h(Table, { columns, dataSource: rows, rowKey: itemKey, size: "middle", pagination: rows.length > 10 ? { pageSize: 10, showSizeChanger: false } : false,
+        h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => { setFilter(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => ({ value, label: `${label} ${model.items.filter(item => item.kind === value).length}` }))] }),
+          h(Space, { wrap: true },
+            h(Select, { "aria-label": "筛选所属项目", value: itemProject, showSearch: true, optionFilterProp: "label", style: { width: 180 },
+              options: [{ value: "all", label: "全部项目" }, ...projects],
+              onChange: value => { setItemProject(value); setItemPagination(previous => ({ ...previous, current: 1 })); } }),
+            h(Input.Search, { placeholder: "搜索编号或标题", allowClear: true, value: query,
+              onChange: event => { setQuery(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, style: { width: 260 } }))),
+        h(Table, { columns, dataSource: rows, rowKey: itemKey, size: "middle", pagination: {
+          ...itemPagination, current: Math.min(itemPagination.current, Math.max(1, Math.ceil(rows.length / itemPagination.pageSize))),
+          showSizeChanger: true, pageSizeOptions: [10, 20, 50], showTotal: total => `共 ${total} 项`,
+          onChange: (current, pageSize) => setItemPagination({ current: pageSize === itemPagination.pageSize ? current : 1, pageSize }) },
           scroll: { x: 700 }, locale: { emptyText: model.connected ? "暂无符合条件的待处理工作项" : "连接禅道后显示待处理工作项" }, rowClassName: "item-row",
           rowSelection: { type: "checkbox", selectedRowKeys: selectedItems, preserveSelectedRowKeys: true, hideSelectAll: filter !== "task", onChange: chooseItems,
             getCheckboxProps: () => ({ disabled: selectionDisabled }) },
