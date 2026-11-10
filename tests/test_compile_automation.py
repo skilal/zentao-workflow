@@ -11,7 +11,7 @@ import test_compile_checks as compile_fixtures
 from test_compile_checks import BLOCKED, MISSING, PASSED
 from workflow.compile_checks import CompileRunner, classify, compile_context, compile_repositories
 from workflow.gitops import git
-from workflow.mcp_server import Tools
+from review_fixtures import VersionedTools as Tools
 from workflow.settings import WorkflowError
 from workflow.store import write_authorized
 from workflow.web import WebApplication
@@ -147,13 +147,19 @@ class CompileAutomationChecks(TestCase):
         self.assertEqual(self.state["commits"], {"后端": head})
         self.assertEqual(git(self.repo["path"], "rev-parse", "HEAD"), head)
 
-    def test_manual_check_requires_idle_state_and_unchanged_head(self):
+    def test_manual_check_requires_idle_state_and_allows_shared_head_fast_forward(self):
         with self.assertRaises(WorkflowError):
             self.flow.compile_now("执行中")
         self.state.update(phase="complete", stage="已完成（未审查）")
         git(self.repo["path"], "commit", "--allow-empty", "-m", "外部更新")
+        with patch.object(CompileRunner, "check", return_value=deepcopy(PASSED)) as runner:
+            self.flow.compile_now("同分支快进")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(self.state["phase"], "complete")
+        self.repo["checkout_head"] = git(self.repo["path"], "rev-parse", "HEAD")
+        git(self.repo["path"], "reset", "--soft", "HEAD~1")
         with self.assertRaisesRegex(WorkflowError, "HEAD"):
-            self.flow.compile_now("已过期")
+            self.flow.compile_now("历史回退")
 
     def test_independent_failure_and_automatic_analysis_survive_restart(self):
         self.state.update(phase="complete", stage="已完成（未审查）")
@@ -194,11 +200,12 @@ class CompileAutomationChecks(TestCase):
         self.assertIs(runtime.engine.followup.call_args.args[-1], False)
         self.assertEqual(runtime.engine.compile_now.call_count, 1)
 
-    def test_independent_check_respects_other_session_workspace_ownership(self):
+    def test_independent_check_allows_other_session_on_shared_workspace(self):
         other = self.flow.store.new({"kind": "task", "id": 99})
         other.update(repos=deepcopy(self.state["repos"]), phase="implement", stage="已暂停", prepare_complete=True)
         self.flow.store.save(other)
         self.state.update(phase="complete", stage="已完成（未审查）")
-        with patch.object(CompileRunner, "check") as runner, self.assertRaisesRegex(WorkflowError, "其他未完成会话"):
-            self.flow.compile_now("不能占用其他会话")
-        runner.assert_not_called()
+        with patch.object(CompileRunner, "check", return_value=deepcopy(PASSED)) as runner:
+            self.flow.compile_now("共享目录独立检查")
+        self.assertEqual(runner.call_count, 1)
+        self.assertEqual(self.state["phase"], "complete")

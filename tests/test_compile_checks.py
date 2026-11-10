@@ -14,8 +14,10 @@ from workflow.approvals import is_workflow_tool_call
 from workflow.compile_checks import CompileRunner, DiagnosticOutput, backend_modules, classify, compile_context, redact, source_snapshot
 from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import git
-from workflow.mcp_server import TOOLS, Tools
+from workflow.mcp_server import TOOLS
+from review_fixtures import VersionedTools as Tools
 from workflow.settings import ROOT, WorkflowError, load_settings
+from workflow.shared_changes import initialize, record_write
 from workflow.web import WebApplication, public_state
 
 
@@ -76,10 +78,17 @@ class CompileChecks(TestCase):
                       "baseline": git(root, "rev-parse", "HEAD"), "branch": "功能分支", "preserved_paths": ["保留.txt"]}
         self.state["repos"].append(repository)
         (root / "保留.txt").write_text("本机原有修改", encoding="utf-8")
+        initialize(self.flow.store, self.state, repository)
         return repository
 
+    def change_repository(self, repository, relative, content):
+        file = Path(repository["path"]) / relative
+        before = file.read_bytes() if file.is_file() else None
+        file.write_text(content, encoding="utf-8")
+        record_write(repository, relative, before, file.read_bytes())
+
     def change(self, relative, content):
-        (Path(self.repo["path"]) / relative).write_text(content, encoding="utf-8")
+        self.change_repository(self.repo, relative, content)
 
     def start(self, results):
         with patch.object(CompileRunner, "check", side_effect=deepcopy(results)) as check:
@@ -106,7 +115,7 @@ class CompileChecks(TestCase):
     def test_unregistered_module_stops(self):
         root = Path(self.repo["path"]) / "未登记"
         root.mkdir()
-        (root / "pom.xml").write_text(POM.format(""), encoding="utf-8")
+        self.change("未登记/pom.xml", POM.format(""))
         with self.assertRaisesRegex(WorkflowError, "未登记"):
             backend_modules(self.repo)
 
@@ -124,7 +133,7 @@ class CompileChecks(TestCase):
 
     def test_only_changed_repositories_checked_before_review(self):
         frontend = self.repository("frontend", "前端")
-        (Path(frontend["path"]) / "页面.ts").write_text("const 值 = 2;\n", encoding="utf-8")
+        self.change_repository(frontend, "页面.ts", "const 值 = 2;\n")
         check = self.start([PASSED])
         self.assertEqual(check.call_count, 1)
         self.assertEqual(check.call_args.args[1:], (["档案服务"], False))
@@ -134,7 +143,7 @@ class CompileChecks(TestCase):
     def test_frontend_changes_while_waiting_still_enter_review_without_compiling(self):
         frontend = self.repository("frontend", "前端")
         self.start([MISSING])
-        (Path(frontend["path"]) / "页面.ts").write_text("const 值 = 2;\n", encoding="utf-8")
+        self.change_repository(frontend, "页面.ts", "const 值 = 2;\n")
         check = self.decide("skip")
         check.assert_not_called()
         self.assertEqual(len(self.state["compile_checks"][-1]["repositories"]), 1)
@@ -387,7 +396,7 @@ class CompileChecks(TestCase):
             self.change("保留.txt", "不应出现的变化")
             return 0, ""
         with patch("workflow.compile_checks.which", return_value="mvn.cmd"), patch.object(runner, "execute", side_effect=mutate):
-            with self.assertRaisesRegex(WorkflowError, "改变了源码"):
+            with self.assertRaisesRegex(WorkflowError, "共享源码已变化"):
                 runner.check(self.repo, ["档案服务"])
 
     def test_backend_offline_command_and_download_command(self):
@@ -413,7 +422,7 @@ class CompileChecks(TestCase):
     def test_frontend_only_changes_skip_compilation_and_are_reviewed(self):
         self.change("档案服务/业务.java", "class 业务 { int 值 = 1; }\n")
         frontend = self.repository("frontend", "前端")
-        (Path(frontend["path"]) / "页面.ts").write_text("const 值 = 2;\n", encoding="utf-8")
+        self.change_repository(frontend, "页面.ts", "const 值 = 2;\n")
         check = self.start([])
         check.assert_not_called()
         self.assertEqual(self.state["phase"], "review")

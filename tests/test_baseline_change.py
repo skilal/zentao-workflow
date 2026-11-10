@@ -8,7 +8,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from workflow.engine import Workflow
-from workflow.gitops import cleanup_workspaces, git, workspace_claims
+from workflow.gitops import checkout_snapshot, cleanup_workspaces, ensure_baseline, git, workspace_claims
 from workflow.store import session_repositories
 from workflow.settings import ROOT, WorkflowError
 
@@ -49,7 +49,7 @@ class BaselineChangeChecks(TestCase):
             self.state["repos"].append({"name": role, "role": role, "path": str(path),
                 "source": str(path), "branch": "项目分支", "baseline": baseline,
                 "workspace_owned": False, "preserved_paths": ["本机.txt"]})
-        self.state["history"] = [{"role": "用户", "text": "原始需求及回答"}]
+        self.state["history"] = [{"role": "用户", "text": "原始需求及回答", "time": self.state["updated_at"]}]
         self.state["reviews"] = [{"number": 1, "result": {"findings": []}}]
         self.state["decisions"] = [{"round": 1, "fix_ids": ["R01-01"]}]
         self.state["review_manifest"] = {"旧文件": "旧摘要"}
@@ -104,14 +104,79 @@ class BaselineChangeChecks(TestCase):
         with self.assertRaisesRegex(WorkflowError, "重新预览"):
             self.engine.change_baseline(token)
 
-    def test_wrong_branch_and_detached_head_require_manual_resolution(self):
+    def test_detached_head_requires_manual_resolution(self):
         path = self.state["repos"][0]["path"]
-        git(path, "switch", "-c", "其他分支")
-        with self.assertRaisesRegex(WorkflowError, "手工恢复原分支"):
-            self.preview()
         git(path, "switch", "--detach")
         with self.assertRaisesRegex(WorkflowError, "游离 HEAD"):
             self.preview()
+
+    def test_same_directory_branch_change_at_same_head_requires_confirmation(self):
+        for repo in self.state["repos"]:
+            repo["baseline"] = git(repo["path"], "rev-parse", "HEAD")
+        repo = self.state["repos"][0]
+        repo.update(base="refs/heads/项目分支", create=True, workspace_owned=True,
+                    checkout_head=repo["baseline"], handoff_head=repo["baseline"])
+        self.state["selections"] = [{"name": item["name"], "path": item["path"],
+            "branch": item["branch"], "base": "refs/heads/" + item["branch"], "create": True}
+            for item in self.state["repos"]]
+        settings = deepcopy(self.engine.settings)
+        old = deepcopy(self.state)
+        git(repo["path"], "switch", "-c", "资阳档案馆/develop")
+        snapshot = checkout_snapshot(repo["path"])
+        token = self.preview()
+        preview = self.state["baseline_change_request"]["repositories"][0]
+        self.assertFalse(preview["directory_changed"])
+        self.assertTrue(preview["branch_changed"])
+        self.assertEqual(preview["previous_branch"], "项目分支")
+        self.assertEqual(preview["branch"], "资阳档案馆/develop")
+        self.assertEqual(preview["previous"], preview["current"])
+        self.assertEqual(preview["relationship"], "切换分支，重新建立基线")
+        self.assertEqual(preview["remaining_paths"], ["任务.txt"])
+        self.assertEqual(self.state["repos"], old["repos"])
+        self.engine.restore(self.state["id"])
+        self.state = self.engine.state
+        self.engine.change_baseline(token)
+        repo = self.state["repos"][0]
+        self.assertEqual(repo["branch"], "资阳档案馆/develop")
+        self.assertEqual(repo["base"], "refs/heads/资阳档案馆/develop")
+        self.assertFalse(repo["create"])
+        self.assertEqual(repo["baseline"], git(repo["path"], "rev-parse", "HEAD"))
+        self.assertEqual(repo["checkout_head"], repo["baseline"])
+        self.assertEqual(repo["handoff_head"], repo["baseline"])
+        self.assertEqual(repo["path"], old["repos"][0]["path"])
+        self.assertEqual(repo["source"], old["repos"][0]["source"])
+        self.assertTrue(repo["workspace_owned"])
+        self.assertEqual(repo["preserved_paths"], ["本机.txt"])
+        self.assertEqual(checkout_snapshot(repo["path"]), snapshot)
+        ensure_baseline(repo)
+        self.assertNotIn("retired_repos", self.state)
+        self.assertEqual(self.state["repos"][1], old["repos"][1])
+        self.assertEqual(self.state["selections"][0]["branch"], repo["branch"])
+        self.assertEqual(self.state["selections"][0]["base"], repo["base"])
+        self.assertEqual(self.engine.settings, settings)
+        backup = loads(Path(self.state["baseline_changes"][-1]["backup"]).read_text(encoding="utf-8"))
+        self.assertEqual(backup["repos"], old["repos"])
+        self.assertTrue(any("分支 项目分支 → 资阳档案馆/develop" in entry["text"]
+                            for entry in self.state["history"]))
+
+    def test_same_directory_cancel_keeps_original_session_branch(self):
+        old = deepcopy(self.state)
+        git(self.state["repos"][0]["path"], "switch", "-c", "新分支")
+        self.preview()
+        self.engine.cancel_baseline_change()
+        for key in ("repos", "history", "thread_id", "stage", "error"):
+            self.assertEqual(self.state[key], old[key])
+        self.assertEqual(git(self.state["repos"][0]["path"], "branch", "--show-current"), "新分支")
+
+    def test_same_directory_branch_change_after_preview_invalidates_confirmation(self):
+        repo = self.state["repos"][0]
+        git(repo["path"], "switch", "-c", "待确认分支")
+        token = self.preview()
+        old = deepcopy(self.state["repos"])
+        git(repo["path"], "switch", "-c", "预览后分支")
+        with self.assertRaisesRegex(WorkflowError, "重新预览"):
+            self.engine.change_baseline(token)
+        self.assertEqual(self.state["repos"], old)
 
     def test_partial_commit_pending_question_and_active_turn_are_rejected(self):
         for key, value in (("commits", {"frontend": "提交"}), ("pending", {"id": "待答"})):
@@ -223,6 +288,71 @@ class BaselineChangeChecks(TestCase):
         self.engine.change_baseline(self.state["baseline_change_request"]["token"])
         self.assertEqual(self.state["repos"][0]["path"], str(path))
 
+    def test_relocation_adopts_new_branch_only_after_confirmation_and_preserves_files(self):
+        targets = self.relocation_targets()
+        old = deepcopy(self.state["repos"])
+        settings = deepcopy(self.engine.settings)
+        self.state["selections"] = [{"name": repo["name"], "path": repo["path"],
+            "branch": repo["branch"], "base": "refs/heads/" + repo["branch"], "create": False}
+            for repo in old]
+        self.state["branch_resolution"] = {"repositories": [{"role": repo["role"],
+            "branch": repo["branch"], "source": "ai"} for repo in old]}
+        path = targets["frontend"]
+        git(path, "switch", "-c", "资阳档案馆/develop")
+        before = checkout_snapshot(path)
+        self.engine.change_baseline(paths={"frontend": path})
+        preview = self.state["baseline_change_request"]
+        selected = preview["repositories"][0]
+        self.assertEqual(selected["previous_branch"], "项目分支")
+        self.assertEqual(selected["branch"], "资阳档案馆/develop")
+        self.assertEqual(self.state["repos"], old)
+        self.assertEqual(self.state["selections"][0]["branch"], "项目分支")
+        self.engine.change_baseline(preview["token"])
+        repo = self.state["repos"][0]
+        selection = self.state["selections"][0]
+        self.assertEqual(repo["branch"], "资阳档案馆/develop")
+        self.assertEqual(repo["base"], "refs/heads/资阳档案馆/develop")
+        self.assertEqual(selection["branch"], repo["branch"])
+        self.assertEqual(selection["base"], repo["base"])
+        self.assertEqual(repo["baseline"], git(path, "rev-parse", "HEAD"))
+        ensure_baseline(repo)
+        self.assertEqual(checkout_snapshot(path), before)
+        self.assertEqual(repo["preserved_paths"], ["本机.txt"])
+        self.assertEqual(git(old[0]["path"], "branch", "--show-current"), "项目分支")
+        self.assertEqual(self.state["repos"][1]["path"], old[1]["path"])
+        self.assertEqual(self.state["repos"][1]["branch"], old[1]["branch"])
+        self.assertEqual(self.engine.settings, settings)
+        backup = loads(Path(self.state["baseline_changes"][-1]["backup"]).read_text(encoding="utf-8"))
+        self.assertEqual(backup["repos"], old)
+        self.engine.restore(self.state["id"])
+        self.assertEqual(self.engine.state["repos"][0]["branch"], "资阳档案馆/develop")
+        self.assertEqual(self.engine.state["selections"][0]["branch"], "资阳档案馆/develop")
+
+    def test_relocation_branch_change_after_preview_requires_new_confirmation(self):
+        targets = self.relocation_targets()
+        path = targets["frontend"]
+        git(path, "switch", "-c", "新目录分支")
+        self.engine.change_baseline(paths={"frontend": path})
+        token = self.state["baseline_change_request"]["token"]
+        old = deepcopy(self.state["repos"])
+        git(path, "switch", "-c", "预览后分支")
+        with self.assertRaisesRegex(WorkflowError, "重新预览"):
+            self.engine.change_baseline(token)
+        self.assertEqual(self.state["repos"], old)
+
+    def test_relocation_rejects_detached_target_and_cancel_keeps_original_branch(self):
+        targets = self.relocation_targets()
+        path = targets["frontend"]
+        git(path, "switch", "--detach")
+        with self.assertRaisesRegex(WorkflowError, "游离 HEAD"):
+            self.engine.change_baseline(paths={"frontend": path})
+        git(path, "switch", "-c", "新目录分支")
+        old = deepcopy(self.state["repos"])
+        self.engine.change_baseline(paths={"frontend": path})
+        self.engine.cancel_baseline_change()
+        self.assertEqual(self.state["repos"], old)
+        self.assertNotIn("retired_repos", self.state)
+
     def test_relocation_rejects_claimed_target_and_checks_again_at_confirmation(self):
         targets = self.relocation_targets()
         self.engine.change_baseline(paths=targets)
@@ -292,6 +422,7 @@ class BaselineChangeChecks(TestCase):
             for repo in fixture.state["repos"]:
                 path = fixture.root / (repo["role"] + "-relocated")
                 git(fixture.root, "clone", "--local", repo["path"], str(path))
+                git(path, "switch", "-c", "新目录分支")
                 targets[repo["name"]] = str(path)
             fixture.engine.change_baseline(paths=targets)
             fixture.engine.change_baseline(fixture.state["baseline_change_request"]["token"])
@@ -301,5 +432,30 @@ class BaselineChangeChecks(TestCase):
             fixture.send("继续说明，不修改", review_enabled=False)
             self.assertEqual(fixture.state["thread_id"], "原需求线程")
             self.assertTrue(all(repo["path"] == targets[repo["name"]] for repo in fixture.state["repos"]))
+            self.assertTrue(all(repo["branch"] == "新目录分支" for repo in fixture.state["repos"]))
+        finally:
+            fixture.doCleanups()
+
+    def test_same_directory_next_round_keeps_confirmed_branch_and_original_thread(self):
+        from test_followup import FollowupChecks
+
+        fixture = FollowupChecks()
+        fixture.setUp()
+        try:
+            fixture.send("仅了解当前代码，不修改", review_enabled=False)
+            fixture.pause_current()
+            paths = [repo["path"] for repo in fixture.state["repos"]]
+            for repo in fixture.state["repos"]:
+                git(repo["path"], "switch", "-c", "同目录分支")
+            fixture.engine.change_baseline()
+            fixture.engine.change_baseline(fixture.state["baseline_change_request"]["token"])
+            fixture.engine.resume()
+            fixture.complete("当前代码已说明")
+            self.assertEqual(fixture.state["phase"], "complete")
+            fixture.send("继续说明，不修改", review_enabled=False)
+            self.assertEqual(fixture.state["thread_id"], "原需求线程")
+            self.assertEqual([repo["path"] for repo in fixture.state["repos"]], paths)
+            self.assertTrue(all(repo["branch"] == "同目录分支" for repo in fixture.state["repos"]))
+            self.assertTrue(all(selection["branch"] == "同目录分支" for selection in fixture.state["selections"]))
         finally:
             fixture.doCleanups()

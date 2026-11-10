@@ -57,26 +57,29 @@ class BaselineFlow:
                 if moved and Path(path).is_relative_to(self.store.root.resolve()):
                     raise WorkflowError("更换目录请选择会话管理目录之外的本机仓库，不接管会话自建工作区。")
                 branch = git(path, "branch", "--show-current")
-                if branch != repo["branch"]:
-                    raise WorkflowError(f"{repo['name']}当前分支为“{branch or '游离 HEAD'}”，会话要求“{repo['branch']}”。"
-                                        f"请手工恢复原分支，或填写已检出该分支的新仓库目录后重新预览；会话及代码未修改。")
+                if not branch:
+                    raise WorkflowError(f"{repo['name']}目标目录处于游离 HEAD，请先手工检出要采用的分支，再重新预览；会话及代码未修改。")
+                branch_changed = branch != repo["branch"]
                 head = git(path, "rev-parse", "HEAD")
                 previous = repo["baseline"]
                 common = git(path, "merge-base", previous, head, optional=True) if not moved else ""
-                relationship = ("更换目录，重新建立基线" if moved else "未变化" if head == previous else "快进" if common == previous else
+                relationship = ("更换目录，重新建立基线" if moved else "切换分支，重新建立基线" if branch_changed else
+                                "未变化" if head == previous else "快进" if common == previous else
                                 "回退" if common == head else "历史分叉或无共同祖先")
                 snapshot = checkout_snapshot(path)
                 preserved = snapshot["paths"] if moved else repo.get("preserved_paths", [])
                 repositories.append({"name": repo["name"], "path": path, "branch": branch,
+                    "previous_branch": repo["branch"], "branch_changed": branch_changed,
                     "previous_path": repo["path"], "directory_changed": moved,
                     "previous": previous, "current": head, "relationship": relationship,
                     "stat": "更换目录后以新目录 HEAD 建立基线，不跨目录比较提交差异。" if moved else
                         git(path, "diff", "--no-ext-diff", "--no-textconv", "--stat", previous, head),
-                    "remaining_paths": [] if moved else working_paths(repo), "preserved_paths": preserved,
-                    "previous_remaining_paths": working_paths(repo) if moved else [],
+                    "remaining_paths": [] if moved else working_paths({key: value for key, value in repo.items() if key != "change_record"}), "preserved_paths": preserved,
+                    "previous_remaining_paths": working_paths({key: value for key, value in repo.items() if key != "change_record"}) if moved else [],
                     "snapshot": snapshot})
-            if not any(repo["directory_changed"] or repo["previous"] != repo["current"] for repo in repositories):
-                raise WorkflowError("当前 HEAD 与保存的审查基线一致，无需变更。")
+            if not any(repo["directory_changed"] or repo["branch_changed"] or repo["previous"] != repo["current"]
+                       for repo in repositories):
+                raise WorkflowError("当前目录、分支与 HEAD 均与保存的会话基线一致，无需变更。")
             preview = {"repositories": repositories, "phase": state["phase"],
                        "delivery_round": state.get("delivery_round", 1)}
             fingerprint = sha256(dumps(preview, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -97,13 +100,19 @@ class BaselineFlow:
                     state.setdefault("retired_repos", []).append(deepcopy(repo))
                     repo.update(path=selected["path"], source=selected["path"],
                                 workspace_owned=False, workspace_mode="relocated", create=False,
-                                base="refs/heads/" + repo["branch"], preserved_paths=selected["preserved_paths"])
+                                preserved_paths=selected["preserved_paths"])
                     repo.pop("adopted_paths", None)
                     repo.pop("checkout_backup", None)
+                if selected["directory_changed"] or selected["branch_changed"]:
+                    repo.update(branch=selected["branch"], base="refs/heads/" + selected["branch"], create=False)
                     for selection in state.get("selections", []):
                         if selection["name"] == repo["name"]:
-                            selection.update(path=selected["path"], base=repo["base"], create=False)
+                            selection.update(path=selected["path"], branch=repo["branch"],
+                                             base=repo["base"], create=False, track=False)
                 repo["baseline"] = selected["current"]
+                if "checkout_head" in repo:
+                    repo["checkout_head"] = selected["current"]
+                    repo["handoff_head"] = selected["current"]
             state.setdefault("baseline_changes", []).append(record)
             state.update(baseline_change_request=None, review_manifest={}, acceptance=None,
                          review_start=len(state["reviews"]), error="", turn_id=None)
@@ -118,11 +127,13 @@ class BaselineFlow:
             if state["stage"] not in {"等待计划确认", "等待计划补充"}:
                 state.update(stage="已暂停", pause_requested=True)
             self.note("用户", "人工确认变更审查基线：" + "；".join(
-                f"{repo['name']}：{repo['previous_path']} → {repo['path']}；{repo['previous']} → {repo['current']}（{repo['relationship']}）"
-                for repo in repositories if repo["directory_changed"] or repo["previous"] != repo["current"]))
+                f"{repo['name']}：{repo['previous_path']} → {repo['path']}；分支 {repo['previous_branch']} → {repo['branch']}；"
+                f"{repo['previous']} → {repo['current']}（{repo['relationship']}）"
+                for repo in repositories if repo["directory_changed"] or repo["branch_changed"] or repo["previous"] != repo["current"]))
             self.note("系统", f"完整会话已备份至 {backup}。原线程、聊天、计划、附件与历史记录保留。"
                       "新基线之前的已提交代码不再计入本轮差异；工作区与暂存区未修改，本机保留文件仍排除。"
-                      "更换目录时不搬迁旧目录文件，新目录已有改动按本机保留内容登记；更换仅对当前会话生效。"
+                      "采用明确确认的目录当前分支与 HEAD 更新本会话目标分支及基线；同目录保留原有本轮差异与本机文件排除规则。"
+                      "更换目录时不搬迁旧目录文件，新目录已有改动按本机保留内容登记；变更仅对当前会话生效。"
                       "旧基线下的审查及检查结论已失效，继续后按当前阶段处理。")
 
     def cancel_baseline_change(self):

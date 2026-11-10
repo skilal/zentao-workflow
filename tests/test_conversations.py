@@ -12,7 +12,7 @@ from uuid import uuid4
 
 from workflow.engine import Workflow
 from workflow.gitops import git
-from workflow.mcp_server import Tools
+from review_fixtures import VersionedTools as Tools, scoped_result
 from workflow.projects import project_locked
 from workflow.settings import ROOT, WorkflowError
 from workflow.web import WebApplication
@@ -218,7 +218,7 @@ class ConversationChecks(TestCase):
                     return {"turn": {"id": f"模拟回合-{next(turns)}"}}
                 engine.rpc.request.side_effect = request
         def complete(engine, text):
-            engine.last_message = text
+            engine.last_message = scoped_result(engine.state, text)
             engine.turn_running = False
             engine._completed({"id": engine.state["turn_id"], "status": "completed"},
                               engine.state["id"], engine.connection_epoch)

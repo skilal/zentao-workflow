@@ -9,9 +9,9 @@ from pathlib import Path
 from uuid import uuid4
 
 from workflow.compile_checks import CompileRunner, backend_modules, compile_repositories, dependency_hash, redact, snapshot_hash
-from workflow.gitops import git, manifest, repository_lock, safe_file, working_paths, workspace_claims
+from workflow.gitops import check_lock, ensure_baseline, git, manifest, repository_lock, safe_file, working_paths, workspace_claims
 from workflow.settings import WorkflowError
-from workflow.store import timestamp
+from workflow.store import require_attached_workspaces, timestamp
 
 
 COMPILE_ANALYSIS_SCHEMA = {"type": "object", "properties": {
@@ -52,12 +52,14 @@ class CompileFlow:
         heads = {}
         claims = workspace_claims(self.store.sessions(), state["id"])
         for repo in state["repos"]:
-            if str(Path(repo["path"]).resolve()).casefold() in claims:
+            if not repo.get("change_record") and str(Path(repo["path"]).resolve()).casefold() in claims:
                 raise WorkflowError("当前目录正被其他未完成会话使用，不能启动独立编译检查。")
             head = git(repo["path"], "rev-parse", "HEAD")
             committed = state.get("commits", {}).get(repo["name"]) if state["phase"] == "complete" else None
             expected = repo.get("handoff_head") or (repo["baseline"] if committed in {None, "无代码修改"} else committed)
-            if head != expected or git(repo["path"], "branch", "--show-current") != repo["branch"]:
+            if repo.get("change_record"):
+                ensure_baseline(repo)
+            elif head != expected or git(repo["path"], "branch", "--show-current") != repo["branch"]:
                 raise WorkflowError("工作区 HEAD 或分支已变化，请先变更目录与审查基线。")
             heads[repo["name"]] = head
         state["manual_compile"] = {"request_id": request_id, "phase": state["phase"], "stage": state["stage"],
@@ -67,6 +69,7 @@ class CompileFlow:
         self._begin_compile()
 
     def _before_review(self):
+        require_attached_workspaces(self.state)
         state = self.state
         state["stage"] = "核对改动中"
         self.save()
@@ -103,6 +106,18 @@ class CompileFlow:
             self.save()
             self.note("系统", "独立编译检查已完成。" + ("修复内容保留在工作区。" if repaired else "") + "未自动 Review 或提交。")
             return
+        if state.get("review_waiting_compile"):
+            number = state.pop("review_waiting_compile")
+            if self.current_reviews()[-1]["number"] != number or manifest(state["repos"]) != state["review_manifest"]:
+                raise WorkflowError("检查期间已审查片段变化，请重新 Review。")
+            self._guard_compile()
+            state.update(phase="review", stage="等待修复选择")
+            self.save()
+            from workflow.engine import skipped_review_ids
+            skipped = skipped_review_ids(state, state.get("delivery_round", 1))
+            if not any(item["id"] not in skipped for item in self.current_reviews()[-1]["result"]["findings"]):
+                self.finalize([], "", automatic=True)
+            return
         if state.get("followup") and "review_enabled" in state:
             changes = manifest(state["repos"])
             if not state.get("review_requested") and (not state["review_enabled"] or not changes):
@@ -116,6 +131,7 @@ class CompileFlow:
         self._begin_review()
 
     def _begin_compile(self):
+        require_attached_workspaces(self.state)
         state = self.state
         changes = self._compile_manifest()
         batch = {"id": uuid4().hex, "delivery_round": state.get("delivery_round", 1),
@@ -123,7 +139,7 @@ class CompileFlow:
                  "limit": state.get("max_fix_rounds", self.settings["review"]["max_fix_rounds"]), "status": "running", "repositories": [], "decisions": []}
         batch["task_paths"] = {}
         for repo in state["repos"]:
-            protected = {path.casefold() for path in repo.get("preserved_paths", [])}
+            protected = set() if repo.get("change_record") else {path.casefold() for path in repo.get("preserved_paths", [])}
             prefix = repo["name"] + "/"
             historical = {**(state.get("review_manifest") or {}), **(state.get("uncommitted_manifest") or {})}
             paths = set(working_paths(repo))
@@ -172,7 +188,7 @@ class CompileFlow:
                 return
             if entry["status"] in {"passed", "skipped"}:
                 continue
-            lock = repository_lock(repository["path"])
+            lock = check_lock(repository["path"])
             while not lock.acquire(timeout=0.2):
                 if self.closed or state.get("pause_requested"):
                     state["stage"] = "已暂停"
@@ -244,6 +260,9 @@ class CompileFlow:
         self._after_compile()
 
     def _repair_compile(self, entry):
+        self.state.pop("review_waiting_compile", None)
+        for repo in self.state["repos"]:
+            repo.pop("commit_scope", None)
         batch = self._compile_batch()
         fingerprint = sha256(dumps([entry.get("source_hash"), entry["diagnostics"]], sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         attempts = batch.setdefault("repair_attempts", [])
@@ -329,7 +348,7 @@ class CompileFlow:
                     return
                 task_paths = set(batch.get("task_paths", {}).get(entry["name"], []))
                 allowed = task_paths | {item["path"] for item in entry.get("compiler_diagnostics", [])}
-                protected = {path.casefold() for path in repository.get("preserved_paths", [])}
+                protected = set() if repository.get("change_record") else {path.casefold() for path in repository.get("preserved_paths", [])}
                 repairs = []
                 if not result["repairs"]:
                     raise WorkflowError("本轮任务代码分析未提供修复文件及源码证据，已停止。")
@@ -431,8 +450,14 @@ class CompileFlow:
         names = {repo["name"] for repo in self.state["repos"] if repo["role"] == "backend"}
         expected = {key: value for key, value in batch["manifest"].items()
                     if any(key.startswith(name + "/") for name in names)}
-        if batch["status"] != "complete" or expected != self._compile_manifest():
+        shared = any(repo.get("change_record") for repo in self.state["repos"])
+        if batch["status"] != "complete" or (not shared and expected != self._compile_manifest()):
             raise WorkflowError("当前代码尚未完成编译检查或明确跳过，请先处理编译检查。")
+        if shared:
+            changed = self._compile_manifest()
+            required = {name for name in names if any(key.startswith(name + "/") for key in changed)}
+            if not required.issubset({entry["name"] for entry in batch["repositories"]}):
+                raise WorkflowError("本轮新纳入的后端差异尚未检查，请先处理编译检查。")
         for entry in batch["repositories"]:
             repository = next(repo for repo in self.state["repos"] if repo["name"] == entry["name"])
             if repository["role"] != "backend":
@@ -440,6 +465,20 @@ class CompileFlow:
             if (entry["status"] not in {"passed", "skipped"} or entry["source_hash"] != snapshot_hash(repository)
                     or entry["dependency_hash"] != dependency_hash(repository)):
                 raise WorkflowError("编译检查结果已失效，请重新检查。")
+
+    def _scope_needs_compile(self):
+        if not self.state.get("compile_check", {}).get("enabled"):
+            return False
+        batch = self._compile_batch()
+        checked = {entry["name"]: entry for entry in batch["repositories"]}
+        for repo in self.state["repos"]:
+            if repo["role"] != "backend" or not manifest([repo]):
+                continue
+            entry = checked.get(repo["name"])
+            if (entry is None or entry.get("source_hash") != snapshot_hash(repo)
+                    or entry.get("dependency_hash") != dependency_hash(repo)):
+                return True
+        return False
 
     def _resume_compile(self):
         batch = self._compile_batch()

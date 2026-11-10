@@ -17,7 +17,8 @@ from review_fixtures import commit_messages
 from workflow.approvals import is_workflow_tool_call
 from workflow.engine import Workflow
 from workflow.gitops import cleanup_workspaces, commit, git, prepare, worktrees
-from workflow.mcp_server import TOOLS, Tools
+from workflow.mcp_server import TOOLS, Tools as RawTools
+from review_fixtures import VersionedTools as Tools, scoped_result
 from workflow.settings import ROOT, WorkflowError
 from workflow.store import write_authorized
 from workflow.web import WebApplication, public_state
@@ -98,7 +99,7 @@ class FollowupChecks(TestCase):
         self.complete("")
 
     def complete(self, text):
-        self.engine.last_message = text
+        self.engine.last_message = scoped_result(self.state, text)
         self.engine.turn_running = False
         self.engine._completed({"status": "completed", "id": self.state["turn_id"]},
                                self.state["id"], self.engine.connection_epoch)
@@ -166,7 +167,7 @@ class FollowupChecks(TestCase):
         self.send("新增说明文件", review_enabled=True)
         self.assertIn("业务.txt", self.state["repos"][0]["preserved_paths"])
         with self.assertRaises(WorkflowError):
-            Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "不能覆盖"})
+            RawTools(self.state["id"]).call("write_file", {"repository": "前端", "path": "业务.txt", "content": "不能覆盖"})
         Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "说明.txt", "content": "本轮说明\n"})
         self.complete("已新增说明。")
         self.assertEqual(self.state["phase"], "review")
@@ -424,12 +425,12 @@ class FollowupChecks(TestCase):
         self.finish()
         self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "本轮正确代码\n")
         self.assertIn("前端/业务.txt", self.state["uncommitted_manifest"])
-        self.assertNotIn("业务.txt", self.state["repos"][0]["preserved_paths"])
+        self.assertIn("业务.txt", self.state["repos"][0]["preserved_paths"])
         self.assertIn("本机.txt", self.state["repos"][0]["preserved_paths"])
         self.assertEqual((path / "本机.txt").read_text(encoding="utf-8"), "本机保留修改\n")
         self.assertFalse(self.state["review_requested"])
 
-    def test_replace_text_still_rejects_unrelated_and_externally_changed_preserved_files(self):
+    def test_shared_historical_and_manual_files_require_current_version(self):
         path = Path(self.state["repos"][0]["path"])
         (path / "本机.txt").write_text("本机保留修改\n", encoding="utf-8")
         self.send("修改任务文件", review_enabled=False)
@@ -437,16 +438,11 @@ class FollowupChecks(TestCase):
         self.finish()
         (path / "业务.txt").write_text("外部修改后的代码\n", encoding="utf-8")
         self.send("修复任务文件", review_enabled=False)
-        tools = Tools(self.state["id"])
-        with self.assertRaisesRegex(WorkflowError, "被外部修改"):
-            tools.call("replace_text", {"repository": "前端", "path": "业务.txt", "old": "代码", "new": "修复"})
-        arguments = {"repository": "前端", "path": "本机.txt", "old": "修改", "new": "覆盖"}
-        description = next(description for name, description, _ in TOOLS if name == "replace_text")
-        params = {"serverName": "workflow", "mode": "form", "_meta": {"codex_approval_kind": "mcp_tool_call",
-                  "tool_description": description, "tool_params": arguments}}
-        self.assertTrue(is_workflow_tool_call(params))
-        with self.assertRaisesRegex(WorkflowError, "本机保留改动"):
-            tools.call("replace_text", arguments)
+        tools = RawTools(self.state["id"])
+        for relative in ("业务.txt", "本机.txt"):
+            with self.subTest(path=relative), self.assertRaisesRegex(WorkflowError, "版本"):
+                tools.call("replace_text", {"repository": "前端", "path": relative, "old": "改", "new": "覆盖", "expected_version": "过期版本"})
+        self.assertEqual((path / "本机.txt").read_text(encoding="utf-8"), "本机保留修改\n")
         self.assertEqual((path / "业务.txt").read_text(encoding="utf-8"), "外部修改后的代码\n")
 
     def test_replaced_historical_file_can_still_be_explicitly_reviewed_and_committed(self):
@@ -723,21 +719,16 @@ class FollowupChecks(TestCase):
         self.assertTrue(result["duplicate"])
         self.assertEqual(len(restored.sessions.get(self.state["id"]).engine.state["deliveries"]), 2)
 
-    def test_occupied_branch_stops_and_resume_keeps_one_feedback(self):
-        other = self.engine.store.new({"kind": "task", "id": 9, "title": "占用会话"})
-        other.update(phase="implement", repos=[deepcopy(self.state["repos"][0])])
+    def test_same_branch_followup_shares_directory_and_keeps_one_feedback(self):
+        other = self.engine.store.new({"kind": "task", "id": 9, "title": "共享会话"})
+        original = deepcopy(self.state["repos"][0])
+        other.update(phase="implement", repos=[original])
         self.engine.store.save(other)
         self.application.dispatch(self.request())
         self.drain()
-        self.assertEqual(self.state["stage"], "已停止")
-        self.assertFalse(self.state["prepare_complete"])
-        self.assertIn("占用", self.state["error"])
-        with self.assertRaises(WorkflowError):
-            self.engine.rereview()
-        other["phase"] = "complete"
-        self.engine.store.save(other)
-        self.engine.resume()
         self.assertEqual(self.state["stage"], "续聊处理中")
+        self.assertTrue(self.state["prepare_complete"])
+        self.assertEqual(self.state["repos"][0]["path"], original["path"])
         self.assertEqual(len([entry for entry in self.state["history"] if entry["role"] == "用户"]), 1)
         self.assertEqual(len(self.state["deliveries"]), 1)
 
@@ -752,7 +743,7 @@ class FollowupChecks(TestCase):
         self.assertEqual(git(path, "branch", "--show-current"), "项目分支")
         self.assertIn("本机.txt", self.state["repos"][0]["preserved_paths"])
         with self.assertRaises(WorkflowError):
-            Tools(self.state["id"]).call("write_file", {"repository": "前端", "path": "本机.txt", "content": "不能覆盖"})
+            RawTools(self.state["id"]).call("write_file", {"repository": "前端", "path": "本机.txt", "content": "不能覆盖"})
         self.finish()
         self.assertEqual(git(path, "diff", "--cached", binary=True), index)
         self.assertEqual((path / "本机.txt").read_text(encoding="utf-8"), "本机需要保留\n")
@@ -760,7 +751,7 @@ class FollowupChecks(TestCase):
     def test_partial_commit_only_continues_unfinished_repository(self):
         self.send()
         for repo in self.state["repos"]:
-            (Path(repo["path"]) / "业务.txt").write_text("本轮修复\n", encoding="utf-8")
+            Tools(self.state["id"]).call("write_file", {"repository": repo["name"], "path": "业务.txt", "content": "本轮修复\n"})
         self.complete("已修复")
         committed = []
         def partial(repo, message, expected):
@@ -840,7 +831,8 @@ class FollowupChecks(TestCase):
 
     def test_restart_resumes_partial_workspace_preparation_without_duplication(self):
         other = self.engine.store.new({"kind": "task", "id": 9})
-        other.update(phase="implement", repos=[deepcopy(self.state["repos"][1])])
+        other.update(phase="implement", repos=[deepcopy(self.state["repos"][1])],
+                     workspace_release_request={"kind": "release", "repository": "后端", "token": "预览中"})
         self.engine.store.save(other)
         self.application.dispatch(self.request())
         self.drain()
@@ -849,6 +841,7 @@ class FollowupChecks(TestCase):
         first = deepcopy(self.state["repos"][0])
         self.application.close()
         other["phase"] = "complete"
+        other.pop("workspace_release_request", None)
         self.engine.store.save(other)
         restored = WebApplication(self.settings)
         self.addCleanup(restored.close)
@@ -861,7 +854,7 @@ class FollowupChecks(TestCase):
         self.assertEqual(len(engine.state["deliveries"]), 1)
         self.assertEqual(len([entry for entry in engine.state["history"] if entry["role"] == "用户"]), 1)
 
-    def test_simultaneous_followups_do_not_claim_the_same_directory(self):
+    def test_simultaneous_followups_share_same_branch_directory(self):
         other = deepcopy(self.state)
         other["id"] = self.engine.store.new({"kind": "story", "id": 9})["id"]
         runtime = self.application.sessions.add(other)
@@ -874,8 +867,8 @@ class FollowupChecks(TestCase):
             list(pool.map(self.application.dispatch, requests))
             self.drain()
             runtime.engine.executor.submit(lambda: None).result(timeout=10)
-        self.assertEqual(sorted([self.state["stage"], other["stage"]]), sorted(["修复中", "已停止"]))
-        self.assertEqual(len(self.state["repos"]) + len(other["repos"]), 2)
+        self.assertEqual(sorted([self.state["stage"], other["stage"]]), sorted(["修复中", "修复中"]))
+        self.assertEqual(len(self.state["repos"]) + len(other["repos"]), 4)
 
     def test_delete_checks_archived_owned_workspaces_and_other_claims(self):
         repo = self.state["repos"][0]

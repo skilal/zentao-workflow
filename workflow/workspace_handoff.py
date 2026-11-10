@@ -8,10 +8,12 @@ from uuid import uuid4
 
 from workflow.gitops import checkout_snapshot, git, reject_hooks, repository_lock, safe_file, workspace_claims, worktrees
 from workflow.settings import WorkflowError
-from workflow.store import timestamp
+from workflow.store import timestamp, workspaces_released
 
 
 def handoff_reason(state):
+    if workspaces_released(state):
+        return "请先完成释放预览或确认改用本地开发目录。"
     if state.get("phase") != "complete" or state.get("stage") not in {"已完成（静态审查）", "已完成（未审查）"}:
         return "仅已完成且需求代码已提交的会话可以交接。"
     if not state.get("prepare_complete") or not state.get("repos"):

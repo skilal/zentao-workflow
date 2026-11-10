@@ -10,6 +10,7 @@ from workflow.session_titles import collect_session_title
 from workflow.store import PreviewStore, SessionStore
 from workflow.user_input import pending_input
 from workflow.zentao import ZentaoClient
+from workflow.workspace_release import settle_workspace_releases
 
 
 class SessionRuntime:
@@ -37,13 +38,17 @@ class SessionManager:
         self.connection = Workflow(settings, lambda kind, value: emit(None, kind, value),
                                    self.store, self.zentao, self.zentao_lock, self.settings_lock)
         for state in self.store.sessions():
+            if (state.get("repos") and state.get("reviews") and state["phase"] != "complete"
+                    and state["reviews"][-1].get("protocol_version", 1) < 3 and not state.get("commits")):
+                state["scope_review_required"] = True
             question = pending_input(self.store, state)
             native_question = (state.get("pending") or {}).get("method") == "item/tool/requestUserInput"
             interrupted = state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}
-            changed = interrupted or state.get("rpc_connected") or state.get("pending")
+            changed = interrupted or state.get("rpc_connected") or state.get("pending") or state.get("scope_review_required")
             changed = settle_progress(state, "waiting" if question else "interrupted") or changed
             changed = collect_artifacts(self.store, state) or changed
             changed = collect_session_title(self.store, state) or changed
+            changed = settle_workspace_releases(state) or changed
             handoff = state.get("workspace_handoff_request")
             if handoff and handoff.get("started") and handoff["status"] == "working":
                 handoff.update(status="interrupted", error="上次交接中断，请核对目录和备份后明确继续，或恢复原状后取消。")

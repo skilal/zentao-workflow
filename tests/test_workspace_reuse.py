@@ -1,6 +1,7 @@
 """用临时 Git 仓库检查目录复用、并发占用和本机改动保留。"""
 
 from concurrent.futures import ThreadPoolExecutor
+from hashlib import sha256
 from json import loads
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -12,6 +13,8 @@ from workflow.engine import Workflow
 from workflow.mcp_server import Tools
 from workflow.settings import ROOT, WorkflowError
 from workflow.store import SessionStore
+from workflow.shared_changes import record_write
+from review_fixtures import approve_fragments
 
 
 class WorkspaceReuseChecks(TestCase):
@@ -46,6 +49,12 @@ class WorkspaceReuseChecks(TestCase):
         state = self.state if state is None else state
         return acquire_workspace(self.selection(branch, create, track),
             self.store.directory(state["id"]) / "workspace" / "repo-1", self.store, state)
+
+    def task_write(self, record, relative, content):
+        file = Path(record["path"]) / relative
+        before = file.read_bytes() if file.is_file() else None
+        file.write_text(content, encoding="utf-8")
+        record_write(record, relative, before, file.read_bytes())
 
     def local_changes(self):
         (self.source / "本机配置.txt").write_text("本机保留配置\n", encoding="utf-8")
@@ -97,14 +106,15 @@ class WorkspaceReuseChecks(TestCase):
         self.assertEqual(git(self.source, "branch", "--show-current"), "主分支")
         self.assertEqual(git(record["path"], "branch", "--show-current"), "其他项目")
 
-    def test_paused_session_retains_exclusive_ownership(self):
+    def test_paused_session_allows_same_branch_sharing(self):
         self.acquire()
         self.state.update(stage="已暂停")
         self.store.save(self.state)
         other = self.new_session(2)
-        with self.assertRaisesRegex(WorkflowError, self.state["id"]):
-            self.acquire(state=other)
-        self.assertFalse(other["repos"])
+        shared = self.acquire(state=other)
+        self.assertEqual(shared["path"], str(self.source))
+        self.assertEqual(len(other["repos"]), 1)
+        self.assertEqual(len(self.state["repos"]), 1)
 
     def test_completed_session_releases_original_directory(self):
         self.acquire()
@@ -206,8 +216,8 @@ class WorkspaceReuseChecks(TestCase):
         self.assertEqual(record["checkout_backup"], request["stash"])
         self.assertTrue({"本机配置.txt", "已暂存配置.txt", "其他.txt"}.issubset(record["preserved_paths"]))
         self.assertFalse(manifest([record]))
-        (self.source / "任务.txt").write_text("需求修改\n", encoding="utf-8")
-        commit(record, "fix: 当前需求", manifest([record]))
+        self.task_write(record, "任务.txt", "需求修改\n")
+        commit(record, "fix: 当前需求", approve_fragments(record))
         self.assertEqual(git(self.source, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"), "任务.txt")
         self.assertEqual(git(self.source, "diff", "--cached", "--binary", binary=True), index)
 
@@ -451,14 +461,14 @@ class WorkspaceReuseChecks(TestCase):
         index = git(self.source, "diff", "--cached", "--binary", binary=True)
         record = self.acquire()
         baseline = record["baseline"]
-        (self.source / "任务.txt").write_text("本次任务修改\n", encoding="utf-8")
-        (self.source / "任务新增.txt").write_text("任务新增内容\n", encoding="utf-8")
+        self.task_write(record, "任务.txt", "本次任务修改\n")
+        self.task_write(record, "任务新增.txt", "任务新增内容\n")
         self.assertEqual(changed_paths(record), ["任务.txt", "任务新增.txt"])
         diff = differences(record)
         self.assertNotIn("本机配置.txt", diff["patch"])
         self.assertNotIn("已暂存配置.txt", diff["patch"])
         self.assertEqual(diff["untracked"], ["任务新增.txt"])
-        result = commit(record, "feat(workflow): 脱敏任务", manifest([record]))
+        result = commit(record, "feat(workflow): 脱敏任务", approve_fragments(record))
         self.assertEqual(result, git(self.source, "rev-parse", "HEAD"))
         committed = git(self.source, "diff", "--name-only", "-z", baseline, "HEAD", binary=True)
         self.assertEqual({value.decode("utf-8") for value in committed.split(b"\0") if value}, {"任务.txt", "任务新增.txt"})
@@ -473,13 +483,14 @@ class WorkspaceReuseChecks(TestCase):
         self.assertFalse(manifest([record]))
         self.assertEqual(differences(record)["patch"], "")
         self.assertEqual(differences(record)["untracked"], [])
-        self.assertIsNone(commit(record, "不应提交本机改动", {}))
+        self.assertIsNone(commit(record, "不应提交本机改动", approve_fragments(record)))
         self.assertEqual(git(self.source, "rev-parse", "HEAD"), record["baseline"])
 
-    def test_file_tools_refuse_to_modify_preserved_files_including_path_aliases(self):
+    def test_file_tools_require_version_even_for_preserved_paths_and_aliases(self):
         originals = self.local_changes()
         self.acquire()
-        self.state.update(stage="实施中", approved_hash="已确认")
+        plan = "核对版本后修改指定片段"
+        self.state.update(stage="实施中", approved_plan=plan, approved_hash=sha256(plan.encode()).hexdigest())
         self.store.save(self.state)
         tools = Tools(self.state["id"])
         for name, arguments in (
@@ -487,7 +498,7 @@ class WorkspaceReuseChecks(TestCase):
             ("replace_text", {"old": "本机", "new": "不能替换"}),
             ("delete_file", {}),
         ):
-            with self.subTest(tool=name), self.assertRaisesRegex(WorkflowError, "本机保留改动"):
+            with self.subTest(tool=name), self.assertRaisesRegex(WorkflowError, "版本"):
                 tools.call(name, {"repository": "前端", "path": "不存在目录/../本机配置.txt", **arguments})
         self.assertEqual((self.source / "本机配置.txt").read_bytes(), originals["本机配置.txt"])
 
@@ -502,7 +513,7 @@ class WorkspaceReuseChecks(TestCase):
         for name, content in originals.items():
             self.assertEqual((self.source / name).read_bytes(), content)
 
-    def test_simultaneous_sessions_cannot_acquire_the_same_directory(self):
+    def test_simultaneous_sessions_share_same_branch_directory(self):
         states = [self.state, self.new_session(2)]
         def acquire(state):
             try:
@@ -511,9 +522,9 @@ class WorkspaceReuseChecks(TestCase):
                 return str(error)
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(acquire, states))
-        self.assertEqual(sum(isinstance(result, dict) for result in results), 1)
-        self.assertEqual(sum(isinstance(result, str) and "已被占用" in result for result in results), 1)
-        self.assertEqual(sum(len(state["repos"]) for state in self.store.sessions()), 1)
+        self.assertEqual(sum(isinstance(result, dict) for result in results), 2)
+        self.assertEqual({result["path"] for result in results}, {str(self.source)})
+        self.assertEqual(sum(len(state["repos"]) for state in self.store.sessions()), 2)
 
     def test_renamed_local_files_are_both_excluded_from_task_changes(self):
         git(self.source, "mv", "本机配置.txt", "重命名配置.txt")
@@ -524,8 +535,8 @@ class WorkspaceReuseChecks(TestCase):
     def test_partial_commit_can_finish_without_committing_preserved_local_changes(self):
         originals = self.local_changes()
         record = self.acquire()
-        (self.source / "任务.txt").write_text("任务代码\n", encoding="utf-8")
-        first_commit = commit(record, "feat(workflow): 第一仓库", manifest([record]))
+        self.task_write(record, "任务.txt", "任务代码\n")
+        first_commit = commit(record, "feat(workflow): 第一仓库", approve_fragments(record))
         other = self.root / "backend"
         git(self.root, "clone", "--local", str(self.source), str(other))
         second = {"name": "后端", "source": str(other), "path": str(other), "branch": "主分支",

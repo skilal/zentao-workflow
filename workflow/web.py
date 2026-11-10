@@ -21,7 +21,7 @@ from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
 from workflow.context import normalized_sources
-from workflow.store import followup_available, session_repositories, session_title, timestamp
+from workflow.store import followup_available, require_attached_workspaces, session_repositories, session_title, timestamp, workspaces_released
 from workflow.engine import ACTIVE, COMPLETE, parse_review, skipped_review_ids
 from workflow.gitops import branches, changed_paths, cleanup_workspaces, differences, safe_file
 from workflow.sessions import SessionManager
@@ -36,6 +36,7 @@ from workflow.artifacts import MIME_TYPES, artifact_file, checked_path, preview_
 from workflow.followup_attachments import attachment_file as followup_attachment_file, inspect_zip, prepare_attachments
 from workflow.followup_documents import DOCUMENT_EXTENSIONS, attachment_image, prepare_document, preview_document
 from workflow.workspace_handoff import handoff_reason
+from workflow.workspace_release import RELEASE_ACTIONS
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -73,6 +74,7 @@ def public_state(state):
     result.setdefault("compile_checks", [])
     result.setdefault("compile_check", {"enabled": False})
     result["can_followup"] = followup_available(state)
+    result["workspaces_released"] = workspaces_released(state)
     # 旧记录只在响应副本中关联原文，不修改磁盘上的会话数据。
     cursor = 0
     for review in result.get("reviews", []):
@@ -166,6 +168,11 @@ class WebApplication:
 
     def session_payload(self, runtime):
         state = public_state(runtime.engine.state)
+        for repo in state.get("repos", []):
+            repo["sharing_sessions"] = [session_title(other.engine.state) for other in self.sessions.runtimes.values()
+                                        if other.engine.state["id"] != state["id"] and other.engine.state["phase"] != "complete"
+                                        and any(Path(entry["path"]).resolve() == Path(repo["path"]).resolve()
+                                                for entry in other.engine.state.get("repos", []))]
         state["title"] = session_title(runtime.engine.state)
         state["handoff_reason"] = handoff_reason(state)
         state["handoff_targets"] = {repo["name"]: entry["path"] for repo in state["repos"]
@@ -708,6 +715,8 @@ class WebApplication:
             if self.busy == "settings" or (global_action and self.busy):
                 raise WorkflowError("全局操作尚未完成，请等待。")
             if runtime:
+                if action not in RELEASE_ACTIONS | {"pause", "delete_session"}:
+                    require_attached_workspaces(state)
                 if state.get("workspace_handoff_request") and action not in {"preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff"}:
                     raise WorkflowError("请先完成或取消本地开发目录交接，再执行其他操作。")
                 if runtime.uploads and action != "pause":
@@ -720,6 +729,8 @@ class WebApplication:
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
                 if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
+                if action in RELEASE_ACTIONS and request.get("revision") != runtime.revision:
+                    raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if not preview_id:
                     if ("plan_started_at" in state and "compile_check_enabled" in data
                             and data["compile_check_enabled"] != state.get("compile_check", {}).get("enabled", False)):
@@ -727,7 +738,7 @@ class WebApplication:
                     saved = state.get("codex")
                     if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
                         raise WorkflowError("会话模型配置已经固定，请新建会话使用其他配置。")
-                    if not saved and action not in {"collect", "pause", "delete_session", "configure_codex", "plan"}:
+                    if not saved and action not in RELEASE_ACTIONS | {"collect", "pause", "delete_session", "configure_codex", "plan"}:
                         raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
             affects, control = True, action == "pause"
             if action == "connect":
@@ -832,6 +843,16 @@ class WebApplication:
                 operation, arguments = engine.followup, (text, images, request_id, review_enabled, plan_mode, attachments)
                 if compile_enabled is not None:
                     arguments = (*arguments, compile_enabled)
+            elif action == "preview_workspace_release":
+                operation, arguments = engine.preview_workspace_release, (data.get("repository"),)
+            elif action == "confirm_workspace_release":
+                operation, arguments = engine.confirm_workspace_release, (data.get("token"),)
+            elif action in {"cancel_workspace_release", "cancel_workspace_adoption"}:
+                operation, arguments = engine.cancel_workspace_release, (data.get("token"),)
+            elif action == "preview_workspace_adoption":
+                operation, arguments = engine.preview_workspace_adoption, (data.get("repository"), data.get("path"))
+            elif action in {"confirm_workspace_adoption", "confirm_workspace_adoption_baseline"}:
+                operation, arguments = engine.confirm_workspace_adoption, (data.get("token"), action == "confirm_workspace_adoption_baseline")
             elif action == "preview_workspace_handoff":
                 operation, arguments = engine.preview_workspace_handoff, (data.get("repository"), data.get("path"))
             elif action == "confirm_workspace_handoff":
@@ -1007,7 +1028,7 @@ class WebApplication:
                 continue
             record = differences(repository)
             new_files = []
-            for relative in record["untracked"]:
+            for relative in ([] if repository.get("change_record") else record["untracked"]):
                 path = safe_file(repository, relative)
                 if path.stat().st_size > 512 * 1024:
                     new_files.append({"path": relative, "note": "文件较大，请在本地工作区查看。"})

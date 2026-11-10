@@ -11,6 +11,7 @@ from threading import Lock, RLock
 
 from workflow.settings import WorkflowError
 from workflow.store import session_repositories
+from workflow.locks import ProcessLock
 
 
 HOOK_NAMES = ("post-checkout", "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "pre-auto-gc",
@@ -19,10 +20,11 @@ REPOSITORY_LOCKS = {}
 LOCK_REGISTRY = Lock()
 
 
-def git(repository, *arguments, optional=False, binary=False, input_data=None):
+def git(repository, *arguments, optional=False, binary=False, input_data=None, environment_override=None):
     environment = dict(environ)
     environment["GIT_TERMINAL_PROMPT"] = "0"
     environment["GIT_OPTIONAL_LOCKS"] = "0"
+    environment.update(environment_override or {})
     process = run(["git", "-c", "core.fsmonitor=false", "-C", str(repository), *arguments],
                   input=input_data or b"", stdout=PIPE, stderr=PIPE, env=environment, creationflags=CREATE_NO_WINDOW)
     if process.returncode and not optional:
@@ -35,7 +37,13 @@ def repository_lock(repository):
     common = Path(git(root, "rev-parse", "--git-common-dir"))
     common = (root / common).resolve() if not common.is_absolute() else common.resolve()
     with LOCK_REGISTRY:
-        return REPOSITORY_LOCKS.setdefault(str(common).casefold(), RLock())
+        return REPOSITORY_LOCKS.setdefault(str(common).casefold(), ProcessLock(str(common).casefold()))
+
+
+def check_lock(repository):
+    identity = "check:" + str(Path(repository).resolve()).casefold()
+    with LOCK_REGISTRY:
+        return REPOSITORY_LOCKS.setdefault(identity, ProcessLock(identity))
 
 
 def locked_repository(operation):
@@ -180,6 +188,10 @@ def workspace_claims(sessions, excluded_session):
             for repository in [*session["repos"], *(repo for repo in session.get("retired_repos", [])
                                                    if repo.get("workspace_owned", True))]}
     for session in sessions:
+        if session["id"] != excluded_session:
+            for repo in session["repos"]:
+                if repo.get("workspace_release"):
+                    claims[str(Path(repo["path"]).resolve()).casefold()] = session["id"]
         request = session.get("workspace_handoff_request")
         if session["id"] != excluded_session and request and request.get("started"):
             for path in (request["source"], request["target"]):
@@ -309,9 +321,14 @@ def acquire_workspace(selection, destination, store, state):
         if entry.get("branch") == "refs/heads/" + selection["branch"]:
             if "locked" in entry or "prunable" in entry:
                 raise WorkflowError(f"目标分支工作区被锁定或登记失效，已停止：{path}")
+            if owner or managed:
+                holders = [session for session in sessions if session["id"] != state["id"]
+                           and any(Path(repo["path"]).resolve() == path for repo in session["repos"])]
+                if any(session.get("workspace_handoff_request") or session.get("workspace_release_request")
+                       or any(repo.get("workspace_release") for repo in session["repos"]) for session in holders):
+                    raise WorkflowError("目标目录正在交接或释放，请完成目录操作后再共享。")
+                reusable = True
             if not reusable:
-                if owner or managed:
-                    raise WorkflowError(f"分支 {selection['branch']} 已被占用：{path}（会话：{owner or managed}）。请先完成或删除占用会话，或明确选择其他分支。")
                 raise WorkflowError(f"分支 {selection['branch']} 已在外部工作区检出：{path}。"
                                     "请点击“预览复用已有工作区”，核对后明确确认复用；不会自动接管该目录。")
             available = [entry]
@@ -332,8 +349,11 @@ def acquire_workspace(selection, destination, store, state):
             raise WorkflowError("目标分支和代码基准尚未确定。")
         git(source, "check-ref-format", "--branch", branch)
         baseline = git(source, "rev-parse", "--verify", base + "^{commit}")
-        if not selection["create"] and git(source, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}") != baseline:
+        actual = git(source, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}") if not selection["create"] else baseline
+        if not selection["create"] and actual != baseline and entry.get("branch") != "refs/heads/" + branch:
             raise WorkflowError("现有目标分支与所选代码基准不一致，请重新选择。")
+        if entry.get("branch") == "refs/heads/" + branch:
+            baseline = actual
         reject_hooks(path)
         configured_hooks = git(path, "config", "--path", "--get", "core.hooksPath", optional=True)
         if configured_hooks and not Path(configured_hooks).is_absolute():
@@ -367,13 +387,18 @@ def acquire_workspace(selection, destination, store, state):
         if request and request["status"] == "restored" and request["selection"] == selection:
             record["checkout_backup"] = request["stash"]
     record.update(name=selection["name"], role=selection["role"])
+    from workflow.shared_changes import initialize
+    initialize(store, state, record)
     state["repos"].append(record)
     store.save(state)
     return record
 
 
 def ensure_baseline(repository):
-    if git(repository["path"], "rev-parse", "HEAD") != repository["baseline"]:
+    expected = repository.get("checkout_head", repository["baseline"])
+    head = git(repository["path"], "rev-parse", "HEAD")
+    if head != expected and not (repository.get("change_record")
+                                and git(repository["path"], "merge-base", expected, head, optional=True) == expected):
         raise WorkflowError("工作区 HEAD 已改变，不能继续使用原审查基线。")
     if git(repository["path"], "branch", "--show-current") != repository["branch"]:
         raise WorkflowError("工作区分支已改变，已停止。")
@@ -381,10 +406,26 @@ def ensure_baseline(repository):
 
 def changed_paths(repository):
     ensure_baseline(repository)
+    if repository.get("change_record"):
+        from workflow.shared_changes import own_fragments
+        return sorted({fragment["path"] for fragment in own_fragments(repository)})
+    if "checkout_head" in repository:
+        return baseline_paths(repository)
     return working_paths(repository)
 
 
+def baseline_paths(repository):
+    tracked = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                  "--name-only", "-z", repository["baseline"], "--", binary=True)
+    preserved = {relative.casefold() for relative in repository.get("preserved_paths", [])}
+    return sorted(set(working_paths(repository)) | {part.decode("utf-8") for part in tracked.split(b"\0")
+                                                  if part and part.decode("utf-8").casefold() not in preserved})
+
+
 def working_paths(repository):
+    if repository.get("change_record"):
+        from workflow.shared_changes import own_fragments
+        return sorted({fragment["path"] for fragment in own_fragments(repository)})
     path = repository["path"]
     tracked = git(path, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", "HEAD", "--", binary=True)
     added = git(path, "ls-files", "--others", "--exclude-standard", "-z", binary=True)
@@ -413,6 +454,10 @@ def safe_file(repository, relative):
 def manifest(repositories):
     result = {}
     for repository in repositories:
+        if repository.get("change_record"):
+            from workflow.shared_changes import fragment_manifest
+            result.update(fragment_manifest(repository))
+            continue
         for relative in changed_paths(repository):
             path = safe_file(repository, relative)
             if path.exists() and not path.is_file():
@@ -423,7 +468,10 @@ def manifest(repositories):
 
 
 def differences(repository):
-    paths = changed_paths(repository)
+    if repository.get("change_record"):
+        from workflow.shared_changes import changes
+        return changes(repository)
+    paths = baseline_paths(repository) if repository.get("workspace_release") else changed_paths(repository)
     text = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--stat", repository["baseline"], "--", *paths) if paths else ""
     patch = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-color", repository["baseline"], "--", *paths) if paths else ""
     new_files = git(repository["path"], "ls-files", "--others", "--exclude-standard", "-z", binary=True)
@@ -433,13 +481,16 @@ def differences(repository):
 
 @locked_repository
 def commit(repository, message, expected_manifest):
+    if repository.get("change_record"):
+        from workflow.scoped_commit import commit_fragments
+        return commit_fragments(repository, message, expected_manifest)
     ensure_baseline(repository)
     reject_hooks(repository["path"])
     if manifest([repository]) != expected_manifest:
         raise WorkflowError("代码在最后一次 Review 后发生变化，必须重新 Review 后再提交。")
-    paths = changed_paths(repository)
+    paths = working_paths(repository) if "checkout_head" in repository else changed_paths(repository)
     if not paths:
-        return None
+        return repository["checkout_head"] if expected_manifest and "checkout_head" in repository else None
     staged_before = git(repository["path"], "diff", "--cached", "--no-renames", "--name-only", "-z", binary=True)
     preserved = {relative.casefold() for relative in repository.get("preserved_paths", [])}
     allowed_staged = preserved | {relative.casefold() for relative in repository.get("adopted_paths", [])}
@@ -455,7 +506,10 @@ def commit(repository, message, expected_manifest):
         git(repository["path"], "commit", "--only", "-m", message, "--", *paths)
     else:
         git(repository["path"], "commit", "-m", message)
-    return git(repository["path"], "rev-parse", "HEAD")
+    head = git(repository["path"], "rev-parse", "HEAD")
+    if "checkout_head" in repository:
+        repository.update(checkout_head=head, handoff_head=head)
+    return head
 
 
 def cleanup_workspaces(store, state, repositories):

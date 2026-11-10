@@ -415,4 +415,6 @@ class CompileRunner:
             return classify(repository, code, output)
         finally:
             if source_snapshot(repository) != before:
+                if repository.get("change_record"):
+                    raise WorkflowError("检查期间共享源码已变化，本次结果失效，请重新检查；未自动回滚或扩大修复范围。")
                 raise WorkflowError("编译过程改变了源码或非忽略文件，已停止；请人工检查，未自动回滚。")

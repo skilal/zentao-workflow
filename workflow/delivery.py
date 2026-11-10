@@ -11,6 +11,21 @@ from workflow.store import write_authorized
 
 def previous_task_changes(state):
     recorded = {}
+    shared_candidates = []
+    for repository in state["repos"]:
+        if repository.get("change_record"):
+            from workflow.shared_changes import candidates as current_fragments, file_version, journals
+            current, records = journals(repository)
+            eligible = {entry["path"] for entry in current_fragments(repository)
+                        if entry["source"] not in {"其他会话", "归属重叠"}}
+            historical = {}
+            for other, record in sorted(records, key=lambda item: item[1]["round"]):
+                if record["session"] == current["session"] and record["round"] < current["round"]:
+                    for edit in record["edits"]:
+                        historical[edit["path"]] = edit["after"] or "missing"
+            shared_candidates.extend({"repository": repository["name"], "path": relative,
+                                      "unchanged": file_version(safe_file(repository, relative)) == version}
+                                     for relative, version in historical.items() if relative in eligible)
     for delivery in state.get("deliveries", []):
         snapshots = {**(delivery.get("review_manifest") or {}), **(delivery.get("uncommitted_manifest") or {})}
         for repository in state["repos"]:
@@ -19,13 +34,26 @@ def previous_task_changes(state):
                              and Path(repo["path"]).resolve() == Path(repository["path"]).resolve()), None)
             if previous is None:
                 continue
-            protected = {value.casefold() for value in previous.get("preserved_paths", [])}
+            protected = set() if previous.get("change_record") else {value.casefold() for value in previous.get("preserved_paths", [])}
             prefix = repository["name"] + "/"
             for key, digest in snapshots.items():
                 if key.startswith(prefix) and key[len(prefix):].casefold() not in protected:
                     recorded[key] = digest
     candidates = []
     for repository in state["repos"]:
+        if repository.get("change_record"):
+            from workflow.shared_changes import candidates as current_fragments
+            eligible = {entry["path"] for entry in current_fragments(repository)
+                        if entry["source"] not in {"其他会话", "归属重叠"}}
+            known = {(entry["repository"], entry["path"]) for entry in shared_candidates}
+            prefix = repository["name"] + "/"
+            for key, version in recorded.items():
+                relative = key[len(prefix):] if key.startswith(prefix) else None
+                if relative in eligible and (repository["name"], relative) not in known:
+                    file = safe_file(repository, relative)
+                    checksum = sha256(file.read_bytes()).hexdigest() + ":" + oct(file.stat().st_mode) if file.is_file() else "deleted"
+                    shared_candidates.append({"repository": repository["name"], "path": relative, "unchanged": checksum == version})
+            continue
         prefix = repository["name"] + "/"
         preserved = repository.get("preserved_paths", [])
         paths = [relative for relative in preserved if prefix + relative in recorded]
@@ -35,7 +63,7 @@ def previous_task_changes(state):
         candidates.extend({"repository": repository["name"], "path": relative,
                            "unchanged": current[prefix + relative] == recorded[prefix + relative]}
                           for relative in paths if prefix + relative in current)
-    return candidates
+    return [*candidates, *shared_candidates]
 
 
 def followup_replacements(store, state):
@@ -110,7 +138,11 @@ def validate_review_request(state, arguments):
     for repository in state["repos"]:
         included = {relative for name, relative in selected if name == repository["name"]}
         if included:
-            current = manifest([{**repository, "preserved_paths": [value for value in repository.get("preserved_paths", []) if value not in included]}])
+            if repository.get("change_record"):
+                from workflow.shared_changes import requested_manifest
+                current = requested_manifest(repository, included)
+            else:
+                current = manifest([{**repository, "preserved_paths": [value for value in repository.get("preserved_paths", []) if value not in included]}])
             included_manifest.update({key: digest for key, digest in current.items()
                                       if key in {repository["name"] + "/" + relative for relative in included}})
     return {"instruction": instruction, "commit_message": message.strip(), "include_paths": paths,

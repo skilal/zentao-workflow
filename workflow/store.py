@@ -61,7 +61,19 @@ def session_title(state):
                     for item in state.get("items", [state["item"]]))
 
 
+def workspaces_released(state):
+    return bool(state.get("workspace_release_request") or
+                any(repo.get("workspace_release") for repo in state.get("repos", [])))
+
+
+def require_attached_workspaces(state):
+    if workspaces_released(state):
+        raise WorkflowError("工作区正在释放或已释放分支占用，请先完成或取消预览，并确认改用本地开发目录后再继续。")
+
+
 def write_authorized(state):
+    if workspaces_released(state):
+        return False
     manual = state.get("manual_compile")
     checks = state.get("compile_checks", [])
     if (manual and state.get("phase") == "compile_fix" and checks and checks[-1]["status"] == "repairing"
@@ -79,7 +91,7 @@ def write_authorized(state):
 
 
 def followup_available(state):
-    if state.get("manual_compile") or state.get("workspace_handoff_request"):
+    if workspaces_released(state) or state.get("manual_compile") or state.get("workspace_handoff_request"):
         return False
     phase, stage = state.get("phase"), state.get("stage")
     completed = phase == "complete" and stage in {"已完成（静态审查）", "已完成（未审查）"}

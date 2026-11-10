@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import TestCase
 from unittest.mock import patch
 
+from review_fixtures import VersionedTools
 import test_auto_delivery as auto_delivery
 import test_followup as followup
 from workflow.commit_messages import prepare_commit_messages
@@ -162,7 +163,7 @@ class CommitMessageProtocolChecks(TestCase):
     def test_legacy_history_remains_readable_but_cannot_be_committed(self):
         result = {"summary": "历史审查结论", "findings": [], "resolved_previous": []}
         self.state.update(phase="review", stage="等待修复选择", reviews=[{"number": 1, "result": result}],
-                          history=[{"role": "Codex", "phase": "review", "text": dumps(result)}])
+                          history=[{"role": "Codex", "phase": "review", "time": self.state["updated_at"], "text": dumps(result)}])
         original = deepcopy(self.state)
         self.assertEqual(public_state(self.state)["reviews"][0]["history_index"], 0)
         self.assertEqual(self.state, original)
@@ -191,7 +192,7 @@ class CommitMessageGitChecks(TestCase):
     def prepare(self, both=False):
         self.fixture.send("增加范围检索", review_enabled=True)
         for repo in self.state["repos"][:2 if both else 1]:
-            (Path(repo["path"]) / "业务.txt").write_text("本轮范围检索代码\n", encoding="utf-8")
+            VersionedTools(self.state["id"]).call("write_file", {"repository": repo["name"], "path": "业务.txt", "content": "本轮范围检索代码\n"})
         self.fixture.complete("已完成修改")
         return {"summary": "无待处理问题", "findings": [], "resolved_previous": [],
                 "commit_messages": entries() if both else entries()[:1]}

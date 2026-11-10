@@ -397,6 +397,58 @@ function WorkspaceHandoff({ state, repository, defaultTarget, busy, onAction, on
         h(Typography.Text, { type: "secondary" }, "目标目录没有本机改动。")));
 }
 
+function WorkspaceRelease({ state, repository, defaultTarget, busy, onAction, onClose }) {
+  const request = state.workspace_release_request;
+  const adopting = !request || request.kind === "adopt";
+  const [target, setTarget] = useState(request?.target || defaultTarget);
+  const [baselineOpen, setBaselineOpen] = useState(false);
+  useEffect(() => { setBaselineOpen(false); if (request?.target) setTarget(request.target); }, [request?.token]);
+  const matches = request && (!adopting || request.target === target.trim());
+  const cancel = async () => {
+    if (!request || await onAction(adopting ? "cancel_workspace_adoption" : "cancel_workspace_release", { token: request.token })) onClose();
+  };
+  const items = request ? [
+    { key: "source", label: "原工作目录", children: h(Typography.Text, { copyable: true }, request.source) },
+    { key: "branch", label: "目标分支", children: request.branch },
+    { key: "head", label: adopting ? "开发目录当前提交" : "当前提交", children: h(Typography.Text, { code: true, copyable: true }, request.head) },
+    ...(adopting ? [
+      { key: "target", label: "本地开发目录", children: h(Typography.Text, { copyable: true }, request.target) },
+      { key: "baseline", label: "原任务基线", children: h(Typography.Text, { code: true, copyable: true }, request.baseline) },
+      { key: "release_head", label: "释放时提交", children: h(Typography.Text, { code: true, copyable: true }, request.release_head) },
+      { key: "preserved", label: "新目录本机保留改动", children: request.snapshot.paths.length ? request.snapshot.paths.join("、") : "无" }] : [
+      { key: "actual_branch", label: "当前工作区状态", children: request.actual_branch || "分离 HEAD" }])] : [];
+  return h(React.Fragment, null,
+    h(Modal, { title: `${adopting ? "确认改用本地开发目录" : "释放分支占用"} · ${repository.name}`,
+      open: true, centered: true, width: "min(800px, calc(100vw - 32px))", maskClosable: false,
+      styles: { body: { maxHeight: "60vh", overflow: "auto" } }, onCancel: cancel,
+      footer: h(Space, { wrap: true }, h(Button, { disabled: busy, onClick: cancel }, "取消"),
+        h(Button, { disabled: busy || (adopting && !target.trim()),
+          onClick: () => adopting ? onAction("preview_workspace_adoption", { repository: repository.name, path: target.trim() }) :
+            onAction("preview_workspace_release", { repository: repository.name }) }, request ? "重新预览" : "预览接管"),
+        matches && h(Button, { type: "primary", disabled: busy || Boolean(request.baseline_reason), onClick: () => {
+          if (adopting && request.baseline_changed) setBaselineOpen(true);
+          else onAction(adopting ? "confirm_workspace_adoption" : "confirm_workspace_release", { token: request.token });
+        } }, adopting ? (request.baseline_changed ? "预览基线变化" : "确认改用本地开发目录") : "确认释放")) },
+      h(Alert, { type: "info", showIcon: true, message: adopting ? "先在 IDEA 中切换到目标分支，再确认接管" : "保留目录和文件，解除当前工作区与分支的绑定",
+        description: adopting ? "当前提交与释放时一致则保留原任务基线和审查范围；新目录已有改动排除，接管不自动启动任务。" :
+          "存在未提交修改时停止。释放后可在 IDEA 原项目切换该分支；原会话需确认改用本地开发目录后才能继续。" }),
+      adopting && h(Form, { layout: "vertical", style: { marginTop: 16 } }, h(Form.Item, { label: "本地开发目录" },
+        h(Input, { value: target, disabled: busy, "aria-label": "本地开发目录", onChange: event => setTarget(event.target.value) }))),
+      state.error && h(Alert, { type: "error", showIcon: true, message: "操作已停止", description: state.error, style: { marginTop: 16 } }),
+      matches && h(React.Fragment, null,
+        h(Descriptions, { column: 1, size: "small", items, style: { marginTop: 16 } }),
+        request.baseline_changed && h(Alert, { type: "warning", showIcon: true, message: "IDEA 当前提交已变化，不能直接接管",
+          description: request.baseline_reason || "请另行预览并明确确认基线变化；确认后原基线之前的提交不再计入本轮差异，旧审查及检查结论失效。" }))),
+    h(Modal, { title: "确认变更审查基线并接管", open: baselineOpen && Boolean(matches), centered: true, maskClosable: false,
+      styles: { body: { maxHeight: "60vh", overflow: "auto" } },
+      width: "min(800px, calc(100vw - 32px))", onCancel: () => setBaselineOpen(false),
+      footer: h(Space, { wrap: true }, h(Button, { disabled: busy, onClick: () => setBaselineOpen(false) }, "返回接管预览"),
+        h(Button, { type: "primary", disabled: busy, onClick: () => onAction("confirm_workspace_adoption_baseline", { token: request.token }) }, "确认变更基线并接管")) },
+      h(Alert, { type: "warning", showIcon: true, message: "当前 HEAD 将成为该仓库的新任务基线", description:
+        "确认前备份完整会话。此前提交移出本轮审查范围，旧审查及检查结论失效；计划、聊天、问题与历史记录保留。本操作不提交、不启动任务。" }),
+      matches && h(Descriptions, { column: 1, size: "small", items, style: { marginTop: 16 } })));
+}
+
 function PromptText({ text }) {
   return h("div", { className: "prompt-text-block" },
     h("div", { className: "prompt-copy" }, h(Typography.Text, { copyable: { text, tooltips: ["复制全文", "已复制"] } }, "复制全文")),
@@ -501,6 +553,7 @@ function WorkflowApp() {
   const [diffOpen, setDiffOpen] = useState(false);
   const [baselineDirectoriesOpen, setBaselineDirectoriesOpen] = useState(false);
   const [handoffRepository, setHandoffRepository] = useState(null);
+  const [releaseRepository, setReleaseRepository] = useState(null);
   const [diffs, setDiffs] = useState(null);
   const [settingsForm] = Form.useForm();
   const settingsModel = Form.useWatch("model", settingsForm);
@@ -893,6 +946,7 @@ function WorkflowApp() {
 
   useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
   useEffect(() => { setHandoffRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_handoffs?.length]);
+  useEffect(() => { setReleaseRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_release_history?.length]);
 
   const state = model?.state;
   const stage = state?.stage || "";
@@ -900,10 +954,11 @@ function WorkflowApp() {
   const transfers = imageTransfers[state?.id] || [];
   const imagesUploading = transfers.some(entry => entry.status !== "error");
   const supplementEditable = Boolean(state && ["资料已读取", "准备工作区失败"].includes(stage) &&
-    !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
+    !state.workspaces_released && !stopped && !sending && !model?.busy && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
   const followupEditable = Boolean(state?.can_followup &&
     !stopped && !sending && !model?.busy && !model?.working && !state.cleanup?.removed?.length && !state.cleanup?.finalizing);
   const answerAttachmentEditable = Boolean(state?.pending && stage === "等待人工回答" && !stopped && !sending && !model?.busy &&
+    !state.workspaces_released &&
     !state.cleanup?.removed?.length && !state.cleanup?.finalizing &&
     (state.pending.method !== "workflow/ask_user" || state.pending.turn_completed === true));
   const answerRequestId = state?.pending?.attachment_request_id;
@@ -914,7 +969,8 @@ function WorkflowApp() {
       publishImageTransfers();
     }
   }, [state?.id, answerRequestId]);
-  const busy = Boolean(stopped || sending || model?.busy || (stage === "已暂停" && model?.working) || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
+  const workspaceBusy = Boolean(stopped || sending || model?.busy || (stage === "已暂停" && model?.working) || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
+  const busy = workspaceBusy || Boolean(state?.workspaces_released);
   const canPause = ACTIVE.has(stage) || ["等待人工回答", "等待计划补充", "等待计划确认", "等待修复选择", "等待编译选择"].includes(stage);
   const selectedKey = selectedItems.join("|");
   const loadedKey = state ? sessionItems(state).map(itemKey).join("|") : "";
@@ -1187,7 +1243,7 @@ function WorkflowApp() {
           model.settings.repositories.map(repository => {
             const entry = repositories.find(entry => entry.role === repository.role);
             const workspace = state.repos.find(entry => entry.name === repository.name);
-            const branch = entry?.branch || workspace?.branch;
+            const branch = workspace?.branch || entry?.branch;
             return h("section", { className: "project-info-section", key: repository.role },
               h("div", { className: "project-info-section-heading" },
                 h("span", { className: "project-info-label" }, repository.role === "frontend" ? "前端仓库" : "后端仓库"),
@@ -1315,10 +1371,20 @@ function WorkflowApp() {
           entry?.refresh_state && h("p", { className: "muted" }, { running: "正在核对远程分支清单…", done: "已核对远程分支清单", failed: "远程分支清单核对失败，修复连接后可恢复当前阶段" }[entry.refresh_state]),
           entry?.fetch_state && h("p", { className: "muted" }, `${{ running: "正在拉取目标分支", done: "已拉取目标分支", failed: "目标分支拉取失败" }[entry.fetch_state]}：${entry.fetch_branch}`),
           workspace && h(React.Fragment, null,
-            h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : []), ...(workspace.checkout_backup ? [{ key: "checkout_backup", label: "本机改动备份", children: h(Typography.Text, { copyable: true }, workspace.checkout_backup) }] : [])] }),
+            h(Descriptions, { column: 1, size: "small", style: { marginTop: 18 }, items: [{ key: "commit", label: "起始提交", children: h(Typography.Text, { code: true }, workspace.baseline.slice(0, 12)) }, { key: "path", label: workspace.change_record ? "共享开发目录" : workspace.workspace_owned === false ? "复用工作目录" : "独立工作区", children: h(Typography.Text, { style: { fontSize: 12 }, copyable: true }, workspace.path) }, ...(workspace.sharing_sessions?.length ? [{ key: "sharing", label: "共同使用", children: workspace.sharing_sessions.join("、") }] : []), ...(workspace.preserved_paths?.length ? [{ key: "preserved", label: "本机保留改动", children: workspace.change_record ? `${workspace.preserved_paths.length} 个文件，Review 按片段核对归属` : `${workspace.preserved_paths.length} 个文件，不自动修改或提交` }] : []), ...(workspace.checkout_backup ? [{ key: "checkout_backup", label: "本机改动备份", children: h(Typography.Text, { copyable: true }, workspace.checkout_backup) }] : [])] }),
+            workspace.workspace_release && h(Alert, { type: workspace.workspace_release.status === "released" ? "success" : "warning", showIcon: true,
+              message: { detaching: "正在释放分支占用", released: "分支占用已释放，可在 IDEA 原项目切换", interrupted: "释放中断，请预览并核对实际 Git 状态" }[workspace.workspace_release.status],
+              description: workspace.workspace_release.error, style: { marginBottom: 12 } }),
+            h(Space, { wrap: true },
+            h(Tooltip, { title: model.working || ACTIVE.has(stage) ? "请先手动暂停并等待后台完全停止，再释放分支占用" : "保留目录和文件，释放 Git 分支占用" }, h("span", null,
+              h(Button, { size: "small", disabled: workspaceBusy || model.working || ACTIVE.has(stage) ||
+                workspace.workspace_release?.status === "released" || Boolean(state.workspace_release_request) || Boolean(state.workspace_handoff_request),
+                onClick: () => act("preview_workspace_release", { repository: workspace.name }) }, workspace.workspace_release?.status === "released" ? "已释放分支占用" : workspace.workspace_release ? "预览并核对释放" : "释放分支占用"))),
+            workspace.workspace_release?.status === "released" && h(Button, { size: "small", disabled: workspaceBusy || model.working || Boolean(state.workspace_release_request),
+              onClick: () => setReleaseRepository(workspace.name) }, "确认改用本地开发目录"),
             h(Tooltip, { title: state.handoff_reason || "将已完成需求交接到原 IDEA 开发目录，保留本机改动" }, h("span", null,
               h(Button, { size: "small", disabled: busy || model.working || Boolean(state.handoff_reason) || Boolean(state.workspace_handoff_request),
-                onClick: () => setHandoffRepository(workspace.name) }, "交接到本地开发目录")))));
+                onClick: () => setHandoffRepository(workspace.name) }, "交接到本地开发目录"))))));
       })),
       (["资料已读取", "准备工作区失败"].includes(stage) || state.supplement_images?.length > 0 || transfers.length > 0) &&
         h(CardBox, { title: state.item === null ? "输入需求与验收标准" : "补充需求与验收标准" },
@@ -1450,9 +1516,9 @@ function WorkflowApp() {
             if (await act("preview_baseline", { paths })) setBaselineDirectoriesOpen(false);
           } }, "预览目录与基线")) },
         h(Alert, { type: "info", showIcon: true, message: "更换仅对当前会话生效", description:
-          "填写已检出原目标分支的 Git 仓库根目录。保留原线程和历史消息；旧目录文件留在原处，新目录已有改动按本机保留文件排除。下一步预览后仍须明确确认。" }),
+          "可保留现有目录，或填写其他已检出分支的 Git 仓库根目录。预览并明确确认后，采用所填目录当前分支及 HEAD，更新本会话目标分支与审查基线。同目录保留本轮未提交差异；更换目录时，旧文件留在原处，新目录已有改动按本机保留文件排除。" }),
         h(Form, { layout: "vertical", style: { marginTop: 16 } }, state.repos.map(repo =>
-          h(Form.Item, { key: repo.name, label: `${repo.name}仓库目录（分支：${repo.branch}）` },
+          h(Form.Item, { key: repo.name, label: `${repo.name}仓库目录（原目标分支：${repo.branch}）` },
             h(Input, { "aria-label": `${repo.name}仓库目录`, disabled: busy,
               value: draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path,
               onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) }))))),
@@ -1568,13 +1634,15 @@ function WorkflowApp() {
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
         state.baseline_change_request && h(CardBox, { title: "确认变更审查基线" },
           h(Alert, { type: "warning", showIcon: true, message: "将当前 HEAD 设为本轮新基线", description:
-            "原线程、聊天、计划、附件和历史记录保留，确认前备份完整会话。旧基线下的审查及检查结论失效；新基线之前的已提交代码将移出本轮审查范围。更换目录时旧文件留在原处，新目录已有改动全部排除；不自动复制代码。" }),
+            "原线程、聊天、计划、附件和历史记录保留，确认前备份完整会话。将采用下方展示的目录当前分支作为本会话目标分支，并以当前 HEAD 建立基线。旧审查及检查结论失效；新基线之前的已提交代码将移出本轮审查范围。同目录保留本轮未提交差异与原有本机文件排除规则；更换目录时，旧文件留在原处，新目录已有改动全部排除。" }),
           state.baseline_change_request.repositories.map(repo => h("div", { key: repo.name, style: { marginTop: 16 } },
             h(Typography.Text, { strong: true }, `${repo.name} · ${repo.branch} · ${repo.relationship}`),
             h(Descriptions, { column: 1, size: "small", items: [
               { key: "old", label: "旧基线", children: h(Typography.Text, { code: true, copyable: true }, repo.previous) },
               { key: "new", label: "新基线", children: h(Typography.Text, { code: true, copyable: true }, repo.current) },
               { key: "path", label: "工作目录", children: h(Typography.Text, { copyable: true }, repo.path) },
+              { key: "old_branch", label: "原目标分支", children: repo.previous_branch },
+              { key: "new_branch", label: "确认后目标分支（目录当前分支）", children: repo.branch },
               ...(repo.directory_changed ? [
                 { key: "old_path", label: "原工作目录", children: h(Typography.Text, { copyable: true }, repo.previous_path) },
                 { key: "old_files", label: "旧目录改动（不搬迁）", children: repo.previous_remaining_paths.length ? repo.previous_remaining_paths.join("、") : "无未提交任务文件" }] : []),
@@ -1669,6 +1737,7 @@ function WorkflowApp() {
           h(Tag, null, latest ? `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮` : `修复第 ${entry.fix_round} 轮后`), !latest && h(Tag, null, "历史记录 · 只读"))),
       validationError && h(Alert, { type: "error", showIcon: true, message: "此结果不能作为修复或提交依据", description: validationError }),
       h("div", { className: "review-summary" }, h("div", { className: "review-number" }, pending.length, h("span", null, validationError ? "返回问题" : "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
+      entry.result.commit_scope?.length > 0 && h("p", { className: "muted" }, entry.result.commit_scope.map(scope => `${scope.repository}：纳入 ${scope.include.length} 个片段，排除 ${scope.exclude.length} 个片段`).join("；")),
       h("div", { className: "finding-list" }, findings.length === 0 && h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: validationError ? "返回结果中没有问题，尚未通过校验" : "本轮没有发现待处理问题" }),
         findings.map((finding, index) => h("div", { className: `finding-card${selected.includes(finding.id) ? " selected" : ""}`, key: validationError ? index : finding.id },
           h("div", { className: "finding-title" }, h(Checkbox, { checked: selected.includes(finding.id), disabled: !canSelect || skipped.has(finding.id),
@@ -1806,6 +1875,8 @@ function WorkflowApp() {
   const showSidebar = showProjectInfo || showImplementationPlan;
   const handoffName = state?.workspace_handoff_request?.repository || handoffRepository;
   const handoffWorkspace = state?.repos.find(repo => repo.name === handoffName);
+  const releaseName = state?.workspace_release_request?.repository || releaseRepository;
+  const releaseWorkspace = state?.repos.find(repo => repo.name === releaseName);
   return h(ConfigProvider, { locale: antd.locales.zh_CN, theme: { token: { colorPrimary: "rgb(27, 143, 255)", borderRadius: 6, fontSize: 14,
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif' }, components: { Button: { colorLink: "rgb(27, 143, 255)", defaultColor: "rgb(27, 143, 255)", defaultHoverColor: "rgb(27, 143, 255)" } } } },
     noticeHolder, modalHolder,
@@ -1826,6 +1897,8 @@ function WorkflowApp() {
         h(Layout.Content, { className: "page-content" },
           !online && h(Alert, { className: "offline-banner", type: stopped ? "info" : "warning", showIcon: true, message: stopped ? "本地服务已停止" : "与本地服务的实时连接暂时中断", description: stopped ? "会话记录已保留。需要继续时，重新运行启动脚本后刷新页面。" : "页面会尝试恢复事件连接；如果服务已重启，请刷新页面。", action: h(Button, { onClick: () => location.reload() }, "刷新页面") }),
           workPage && state?.error && stage !== "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
+          workPage && state?.workspaces_released && h(Alert, { type: "info", showIcon: true, message: "分支占用正在释放或已释放",
+            description: "可查看会话记录与代码差异。请在各仓库的分支与工作区中完成或取消预览，并确认改用本地开发目录后继续任务。", style: { marginBottom: 16 } }),
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h("div", { className: workPage ? "session-workspace" : "" }, workPage && renderSessions(), h("div", { className: "session-content" },
           workPage && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
@@ -1851,15 +1924,21 @@ function WorkflowApp() {
         renderWorkItemMaterials(state.snapshot, { session: state.id }))),
     handoffWorkspace && h(WorkspaceHandoff, { key: `${state.id}:${handoffName}`, state, repository: handoffWorkspace,
       defaultTarget: state.handoff_targets[handoffName] ?? "", busy: busy || model.working, onAction: act, onClose: () => setHandoffRepository(null) }),
+    releaseWorkspace && h(WorkspaceRelease, { key: `${state.id}:${releaseName}`, state, repository: releaseWorkspace,
+      defaultTarget: state.handoff_targets[releaseName] ?? "", busy: workspaceBusy || model.working, onAction: act, onClose: () => setReleaseRepository(null) }),
     h(Modal, { title: `${implementationPlanTitle}详情`, className: "implementation-plan-details", centered: true,
       width: "min(1200px, calc(100vw - 32px))", open: Boolean(planDetailsOpen && hasImplementationPlan && state.plan),
       onCancel: () => setPlanDetailsOpen(false), footer: h(Button, { onClick: () => setPlanDetailsOpen(false) }, "关闭"), destroyOnClose: true },
       planDetailsOpen && hasImplementationPlan && h(React.Fragment, null,
         h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`),
         h(Markdown, { text: state.plan }))),
-    h(Drawer, { title: "相对初始基线的累计代码差异", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
+    h(Drawer, { title: "本轮代码差异与归属", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
       diffs === null ? h(Spin, null) : h(Collapse, { defaultActiveKey: diffs.map((_, index) => String(index)), items: diffs.map((diff, index) => ({ key: String(index), label: diff.repository,
-        children: diff.commit ? h(Typography.Text, { copyable: true }, diff.commit) : h(React.Fragment, null, h("pre", { className: "diff-text" }, diff.stat || "没有已跟踪文件差异"), diff.patch && h("pre", { className: "diff-text" }, diff.patch),
+        children: diff.commit ? h(Typography.Text, { copyable: true }, diff.commit) : h(React.Fragment, null, h("pre", { className: "diff-text" }, diff.stat || "没有本轮差异"),
+          diff.fragments?.length > 0 && h(Table, { size: "small", rowKey: "id", pagination: { pageSize: 10 }, dataSource: diff.fragments,
+            columns: [{ title: "文件", dataIndex: "path" }, { title: "行", dataIndex: "line", width: 70 },
+              { title: "归属", dataIndex: "source", width: 110 }, { title: "片段", dataIndex: "id", render: value => h(Typography.Text, { code: true }, value.slice(0, 12)) }] }),
+          diff.patch && h("pre", { className: "diff-text" }, diff.patch),
           diff.new_files.map(file => h("div", { key: file.path }, h("strong", null, file.path), h("pre", { className: "diff-text" }, file.patch || file.note)))) })) })));
 }
 

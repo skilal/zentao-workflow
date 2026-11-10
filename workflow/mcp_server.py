@@ -14,10 +14,12 @@ from workflow.answer_attachments import read_answer_attachment, submitted_attach
 from workflow.context import context_hash, requirement_context
 from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
 from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
-from workflow.gitops import differences, git, safe_file
+from workflow.gitops import differences, git, repository_lock, safe_file
+from workflow.shared_changes import (check_overlap, file_version, fragment_details, load_record, read_blob,
+                                     record_write, remember_read, validate_write)
 from workflow.settings import WorkflowError, load_settings
 from workflow.session_titles import register_session_title, title_generation_context
-from workflow.store import SessionStore, write_authorized
+from workflow.store import SessionStore, require_attached_workspaces, write_authorized
 from workflow.user_input import pending_input, register_input
 
 
@@ -54,7 +56,8 @@ TOOLS = [
     }, ("files",))),
     ("search_text", "在指定仓库文本中搜索字面量；最多返回 100 项并明确标记截断。", schema({"repository": STRING, "text": STRING, "pattern": STRING}, ("repository", "text"))),
     ("baseline_file", "按行读取实施前基线；默认 200 行，最多 500 行；返回 next_line；可用 read_files 批量核对。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
-    ("changes", "读取相对初始基线的累计差异；超长时用文件工具逐项查看。", schema({"repository": STRING}, ("repository",))),
+    ("changes", "读取本轮差异及归属候选；fragment_ids 按编号读取待判断片段。", schema({
+        "repository": STRING, "fragment_ids": {"type": "array", "items": STRING, "minItems": 1, "maxItems": 100}}, ("repository",))),
     ("ask_user", "将问题交给控制器并立即结束回合；由网页等待明确答复，禁止 sleep、轮询或默认放行。", schema({
         "questions": {"type": "array", "minItems": 1, "maxItems": 3, "items": schema({
             "id": STRING, "header": STRING, "question": STRING,
@@ -66,9 +69,9 @@ TOOLS = [
         "instruction": STRING, "commit_message": STRING,
         "include_paths": {"type": "array", "items": schema(FILE_ARGS, ("repository", "path"))}
     }, ("instruction", "commit_message", "include_paths"))),
-    ("write_file", "仅控制器授权的实施或修复阶段可用：写入一个工作区内 UTF-8 文件；编译修复限诊断文件。", schema({**FILE_ARGS, "content": STRING}, ("repository", "path", "content"))),
-    ("replace_text", "仅控制器授权的实施或修复阶段可用：精确替换唯一一处文本；编译修复限诊断文件。", schema({**FILE_ARGS, "old": STRING, "new": STRING}, ("repository", "path", "old", "new"))),
-    ("delete_file", "仅控制器授权的实施或修复阶段可用：删除范围内普通文件；编译修复限诊断文件。", schema(FILE_ARGS, ("repository", "path"))),
+    ("write_file", "授权阶段写入 UTF-8 文件；expected_version 使用读取返回的版本，新文件用 missing。", schema({**FILE_ARGS, "content": STRING, "expected_version": STRING}, ("repository", "path", "content"))),
+    ("replace_text", "授权阶段精确替换唯一文本；expected_version 使用最近读取或保存返回的版本。", schema({**FILE_ARGS, "old": STRING, "new": STRING, "expected_version": STRING}, ("repository", "path", "old", "new"))),
+    ("delete_file", "授权阶段删除普通文件；expected_version 使用最近读取的版本。", schema({**FILE_ARGS, "expected_version": STRING}, ("repository", "path"))),
 ]
 SKIP = {".git", ".local", ".codex", ".idea", ".husky", "node_modules", "target", "dist", "build", "logs", "__pycache__", ".venv", "outputs", "output"}
 
@@ -144,6 +147,9 @@ class Tools:
 
     def call(self, name, arguments):
         state = self.store.load(self.session_id)
+        self.reading_review = state["phase"] == "review"
+        if name in {"write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", "set_change_summary"}:
+            require_attached_workspaces(state)
         if name != "ask_user" and pending_input(self.store, state):
             raise WorkflowError("问题已交给控制器，等待用户明确答复期间不能继续调用工具。")
         if name == "task_context":
@@ -228,6 +234,10 @@ class Tools:
                             return {"matches": results[:100], "truncated": True}
             return {"matches": results, "truncated": False}
         if name == "changes":
+            if arguments.get("fragment_ids") is not None:
+                if not repository.get("change_record"):
+                    raise WorkflowError("旧会话请先继续以建立片段记录。")
+                return {"fragments": fragment_details(repository, arguments["fragment_ids"])}
             data = differences(repository)
             if len(data["patch"]) > 100000:
                 data["patch"] = data["patch"][:100000]
@@ -242,16 +252,22 @@ class Tools:
             raise WorkflowError("未知 MCP 工具。")
         if state["stage"] not in ("实施中", "修复中", "续聊处理中", "编译修复中") or not write_authorized(state):
             raise WorkflowError("当前阶段禁止修改文件，必须等待计划确认或修复选择。")
+        with repository_lock(repository["path"]):
+            return self.write(state, repository, name, arguments, relative, path)
+
+    def write(self, state, repository, name, arguments, relative, path):
         if state["stage"] == "编译修复中":
             checks = state.get("compile_checks", [])
-            if (repository["role"] != "backend" or not write_authorized(state)
+            if (repository["role"] != "backend"
                     or not state.get("compile_check", {}).get("enabled") or not checks
                     or checks[-1]["status"] != "repairing" or repository["name"] != checks[-1].get("repair_repository")
                     or Path(relative).as_posix() not in checks[-1].get("repair_paths", [])):
                 raise WorkflowError("编译修复只能修改控制器授权的本次错误文件。")
         relative = path.relative_to(Path(repository["path"]).resolve()).as_posix()
         replacement_path = None
-        if relative.casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
+        if repository.get("change_record"):
+            validate_write(repository, relative, arguments.get("expected_version"))
+        if not repository.get("change_record") and relative.casefold() in {value.casefold() for value in repository.get("preserved_paths", [])}:
             candidate = next((entry for entry in previous_task_changes(state)
                               if entry["repository"] == repository["name"] and entry["path"] == relative), None) if (
                 name == "replace_text" and state["phase"] == "followup" and state.get("approval_source") == "followup") else None
@@ -266,8 +282,13 @@ class Tools:
         if name == "delete_file":
             if not path.is_file():
                 raise WorkflowError("删除目标不是普通文件。")
+            before = path.read_bytes()
+            if repository.get("change_record"):
+                check_overlap(repository, relative, before, None)
             path.unlink()
-            return "文件已删除。"
+            if repository.get("change_record"):
+                record_write(repository, relative, before, None)
+            return {"message": "文件已删除。", "version": "missing"}
         if name == "replace_text":
             old, new = arguments["old"], arguments["new"]
             text = read_source(path)
@@ -285,14 +306,19 @@ class Tools:
                     text = "\ufeff" + text
         if len(text.encode("utf-8")) > 4 * 1024 * 1024:
             raise WorkflowError("写入内容超出单文件上限。")
+        before = path.read_bytes() if path.is_file() else None
+        if repository.get("change_record"):
+            check_overlap(repository, relative, before, text.encode("utf-8"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="")
+        if repository.get("change_record"):
+            record_write(repository, relative, before, path.read_bytes())
         if replacement_path is not None:
             replacements["files"].setdefault(repository["name"], {})[relative] = sha256(path.read_bytes()).hexdigest()
             temporary = replacement_path.with_suffix(".json.tmp")
             temporary.write_text(dumps(replacements, ensure_ascii=False), encoding="utf-8")
             temporary.replace(replacement_path)
-        return "文件已保存，仅允许静态检查。"
+        return {"message": "文件已保存，仅允许静态检查。", "version": file_version(path)}
 
     def read_request(self, repositories, arguments):
         if not isinstance(arguments, dict):
@@ -313,21 +339,39 @@ class Tools:
         return repository, relative, path, start, count, baseline
 
     def read_segment(self, repository, relative, path, start, count, baseline):
+        with repository_lock(repository["path"]):
+            return self.read_locked_segment(repository, relative, path, start, count, baseline)
+
+    def read_locked_segment(self, repository, relative, path, start, count, baseline):
         if baseline:
-            data = git(repository["path"], "show", repository["baseline"] + ":" + Path(relative).as_posix(), binary=True)
+            if repository.get("change_record"):
+                record = load_record(repository)
+                first = next((edit for edit in record["edits"] if edit["path"] == relative), None)
+                key = first["before"] if first else record["initial"].get(relative)
+                data = read_blob(repository, key) if first or relative in record["initial"] else git(
+                    repository["path"], "show", record["head"] + ":" + Path(relative).as_posix(), binary=True)
+                data = data if data is not None else b""
+            else:
+                data = git(repository["path"], "show", repository["baseline"] + ":" + Path(relative).as_posix(), binary=True)
             if len(data) > 4 * 1024 * 1024:
                 raise WorkflowError("单文件过大，第一版不自动读取。")
             source = data.decode("utf-8")
         else:
+            if repository.get("change_record") and not path.exists():
+                remember_read(repository, relative, start, count, review=getattr(self, "reading_review", False))
+                return {"repository": repository["name"], "path": relative, "version": "missing", "text": "", "total_lines": 0,
+                        "start_line": start, "next_line": None, "baseline": False}
             if path.stat().st_size > 4 * 1024 * 1024:
                 raise WorkflowError("单文件过大，第一版不自动读取。")
             source = read_source(path)
+            remember_read(repository, relative, start, count, review=getattr(self, "reading_review", False), content=source.encode("utf-8"))
         lines = source.lstrip("\ufeff").splitlines()
         end = min(len(lines), start - 1 + count)
         return {"repository": repository["name"], "path": relative, "baseline": baseline,
                 "total_lines": len(lines), "start_line": start,
                 "next_line": end + 1 if end < len(lines) else None,
                 "line_ending": "CRLF" if "\r\n" in source else "LF", "utf8_bom": source.startswith("\ufeff"),
+                "version": sha256(source.encode("utf-8")).hexdigest(),
                 "text": "\n".join(f"{index + 1}: {lines[index]}" for index in range(start - 1, end))}
 
 

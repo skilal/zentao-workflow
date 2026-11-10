@@ -16,12 +16,18 @@ from workflow.gitops import git
 def run():
     fixture = BaselineChangeChecks()
     fixture.setUp()
+    for repository in fixture.engine.settings["repositories"]:
+        repository["name"] = repository["role"]
     app = WebApplication(fixture.engine.settings)
     state = fixture.state
     state.update(phase="implement", followup=None,
                  codex={"model": "隔离模型", "reasoning_effort": "high"},
                  snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []})
     targets = fixture.relocation_targets()
+    git(targets["frontend"], "switch", "-c", "资阳档案馆/develop")
+    state["branch_resolution"] = {"repositories": [{"role": repo["role"],
+        "branch": repo["branch"], "source": "ai", "candidates": []} for repo in state["repos"]]}
+    git(state["repos"][0]["path"], "switch", "-c", "同目录/develop")
     runtime = app.sessions.add(state)
     runtime.engine.save()
     app.default_session_id = state["id"]
@@ -43,10 +49,14 @@ def run():
             confirm = page.get_by_role("button", name="确认变更并保留会话", exact=True)
             expect(confirm).to_be_enabled()
             expect(page.get_by_text("旧基线", exact=True)).to_have_count(2)
+            expect(page.get_by_text("确认后目标分支（目录当前分支）", exact=True)).to_have_count(2)
+            expect(page.get_by_text("同目录/develop", exact=True)).to_be_visible()
             assert state["repos"][0]["baseline"] == baseline
+            assert state["repos"][0]["branch"] == "项目分支"
             page.get_by_role("button", name="取消变更", exact=True).click()
             expect(confirm).to_have_count(0)
             assert state["repos"][0]["baseline"] == baseline
+            assert state["repos"][0]["branch"] == "项目分支"
             preview.click()
             page.get_by_role("button", name="预览目录与基线", exact=True).click()
             expect(confirm).to_be_enabled()
@@ -56,6 +66,9 @@ def run():
             expect(confirm).to_have_count(0)
             expect(page.get_by_role("button", name="从暂停点继续", exact=True)).to_be_enabled()
             assert state["repos"][0]["baseline"] != baseline
+            assert state["repos"][0]["branch"] == "同目录/develop"
+            assert state["repos"][0]["preserved_paths"] == ["本机.txt"]
+            expect(page.locator('.project-info-panel .project-info-branch').first).to_have_text("同目录/develop")
             assert state["thread_id"] == "原线程"
             assert state["history"][0]["text"] == "原始需求及回答"
             assert state["stage"] == "已暂停"
@@ -68,11 +81,19 @@ def run():
             page.get_by_role("button", name="预览目录与基线", exact=True).click()
             expect(confirm).to_be_enabled()
             expect(page.get_by_text("原工作目录", exact=True)).to_have_count(2)
+            expect(page.get_by_text("原目标分支", exact=True)).to_have_count(2)
+            expect(page.get_by_text("确认后目标分支（目录当前分支）", exact=True)).to_have_count(2)
+            assert state["repos"][0]["branch"] == "同目录/develop"
+            page.reload()
+            expect(confirm).to_be_enabled()
+            expect(page.get_by_text("资阳档案馆/develop", exact=True)).to_be_visible()
             confirm.click()
             expect(confirm).to_have_count(0)
             assert all(repo["path"] == targets[repo["name"]] for repo in state["repos"])
             assert state["thread_id"] == "原线程"
             assert state["repos"][0]["preserved_paths"] == ["本机.txt"]
+            assert state["repos"][0]["branch"] == "资阳档案馆/develop"
+            expect(page.locator('.project-info-panel .project-info-branch').first).to_have_text("资阳档案馆/develop")
             assert not errors, errors
             browser.close()
     finally:
