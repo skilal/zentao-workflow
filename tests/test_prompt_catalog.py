@@ -13,7 +13,7 @@ import test_auto_delivery as delivery
 import test_previews as previews
 from workflow import prompt_templates, prompts
 from workflow.branching import BRANCH_INSTRUCTIONS
-from workflow.change_locations import LOCATION_INSTRUCTIONS
+from workflow.change_locations import SUMMARY_INSTRUCTIONS
 from workflow.commit_messages import COMMIT_INSTRUCTIONS
 from workflow.prompt_catalog import prompt_catalog
 from workflow.settings import ROOT, WorkflowError
@@ -67,7 +67,7 @@ class PromptCatalogChecks(TestCase):
                 self.assertTrue(variant["condition"])
                 if stage["id"] in {"restore", "answer"}:
                     phase = variant["id"]
-                    self.assertEqual(LOCATION_INSTRUCTIONS in text, phase in {"implement", "fix", "followup", "compile_fix"})
+                    self.assertEqual(SUMMARY_INSTRUCTIONS in text, phase in {"review", "followup"})
                     self.assertEqual(COMMIT_INSTRUCTIONS in text, phase == "review")
         self.assertNotIn(prompts.COMPILE_MANUAL_ANALYSIS, stages["compile"]["templates"][0]["content"])
         self.assertNotIn(prompts.FOLLOWUP_PLAN, stages["plan"]["templates"][0]["content"])

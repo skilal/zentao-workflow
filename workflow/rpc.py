@@ -204,7 +204,7 @@ def thread_parameters(state, model, disabled_mcp):
     server = {"command": python_executable,
               "args": [str(ROOT / "mcp.py"), state["id"]], "cwd": str(ROOT),
               "required": True, "enabled": state["phase"] != "branch", "startup_timeout_sec": 30,
-              "enabled_tools": ["task_context", "set_session_title", "read_answer_attachment", "read_followup_attachment", "list_files", "read_file", "read_files", "search_text", "baseline_file", "changes", "ask_user", "request_review", "report_change_locations", "write_file", "replace_text", "delete_file", "create_artifact", "publish_artifact"]}
+              "enabled_tools": ["task_context", "set_session_title", "read_answer_attachment", "read_followup_attachment", "list_files", "read_file", "read_files", "search_text", "baseline_file", "changes", "ask_user", "request_review", "set_change_summary", "write_file", "replace_text", "delete_file", "create_artifact", "publish_artifact"]}
     if state["phase"] == "branch":
         return {"cwd": str(session_path), "model": model,
                 "approvalPolicy": "on-request", "sandbox": "read-only",

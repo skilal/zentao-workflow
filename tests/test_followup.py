@@ -15,7 +15,6 @@ from uuid import uuid4
 from review_fixtures import commit_messages
 
 from workflow.approvals import is_workflow_tool_call
-from workflow.change_locations import location_context, register_locations
 from workflow.engine import Workflow
 from workflow.gitops import cleanup_workspaces, commit, git, prepare, worktrees
 from workflow.mcp_server import TOOLS, Tools
@@ -99,11 +98,6 @@ class FollowupChecks(TestCase):
         self.complete("")
 
     def complete(self, text):
-        context = location_context(self.engine.store, self.state)
-        if context and context["files"] and not self.state.get("pause_requested") and not self.state.get("pending"):
-            register_locations(self.engine.store, self.state, [{"status": "unresolved", "location_path": [],
-                "change": "模拟模型完成本轮修改", "steps": [], "reason": "隔离检查未提供业务菜单资料",
-                "files": context["files"], "evidence": []}])
         self.engine.last_message = text
         self.engine.turn_running = False
         self.engine._completed({"status": "completed", "id": self.state["turn_id"]},

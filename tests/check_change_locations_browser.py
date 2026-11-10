@@ -1,6 +1,5 @@
-"""位置面板的历史折叠、实时完成、刷新、会话隔离及窄屏检查。"""
+"""整体页面说明仅在完成后展示，覆盖刷新、替换、会话隔离和窄屏。"""
 
-from copy import deepcopy
 from pathlib import Path
 import sys
 from threading import Thread
@@ -17,21 +16,15 @@ def run():
     fixture = SessionFixture()
     fixture.setUp()
     app = fixture.application
-    engine = fixture.first.engine
-    state = engine.state
-    for runtime, title in ((fixture.first, "位置主会话"), (fixture.second, "位置其他会话")):
-        runtime.engine.state.update(custom_title=title, phase="implement", stage="已暂停", prepare_complete=True,
-                                    thread_id=f"模拟线程{title}",
-                                    followup={"text": "查看位置说明"},
+    engine, state = fixture.first.engine, fixture.first.engine.state
+    for runtime, title in ((fixture.first, "汇总主会话"), (fixture.second, "汇总其他会话")):
+        runtime.engine.state.update(custom_title=title, phase="followup", stage="续聊处理中", prepare_complete=True,
+                                    followup={"text": "修改页面"},
                                     snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []})
         runtime.engine.save()
-    item = {"status": "located", "location_path": ["系统管理", "用户管理", "编辑弹窗", "保存按钮"],
-            "route": "/system/users", "change": "新增必填校验", "steps": ["打开用户管理", "编辑用户后点击保存"], "reason": "",
-            "files": [{"repository": "前端", "path": "src/views/system/users/页面.js"}],
-            "evidence": [{"repository": "前端", "path": "src/router/routes.js", "line": 12, "description": "页面入口"}]}
-    old = {"turn_id": "历史回合", "delivery_round": 1, "phase": "implement", "completed_at": state["updated_at"], "items": [deepcopy(item)]}
-    old["items"][0]["change"] = "历史位置说明"
-    state["change_locations"] = [old]
+    state["change_summary"] = [{"page": "系统管理 → 用户管理", "description": "新增保存时的必填校验"}]
+    # 历史逐回合记录保留在旧会话数据中，界面不再读取。
+    state["change_locations"] = [{"turn_id": "旧回合", "items": [{"files": ["旧文件.js"]}]}]
     engine.save()
     app.default_session_id = state["id"]
     app.codex_catalog = {"default_model": "示例模型", "models": [
@@ -50,38 +43,31 @@ def run():
             page.add_init_script("sessionStorage.setItem('workflow-page', 'plan')")
             page.goto(server.origin)
             panel = page.locator(".change-locations")
-            expect(panel.get_by_text("历史位置说明", exact=True)).to_be_visible()
-            newest = {"turn_id": "新回合", "delivery_round": 2, "phase": "followup", "completed_at": state["updated_at"], "items": [item]}
-            state["change_locations"].append(newest)
+            expect(page.get_by_text("工作流会话", exact=True)).to_be_visible()
+            expect(panel).to_have_count(0)
+            state.update(phase="complete", stage="已完成（未审查）")
             engine.save()
-            expect(panel.get_by_text("新增必填校验", exact=True)).to_be_visible()
-            expect(panel.get_by_text("历史位置说明", exact=True)).not_to_be_visible()
-            expect(panel.get_by_text("系统管理 → 用户管理 → 编辑弹窗 → 保存按钮", exact=True).first).to_be_visible()
-            expect(panel.get_by_text("前端 / src/router/routes.js:12 · 页面入口", exact=True).first).to_be_visible()
-            panel.get_by_text("第 1 轮交付", exact=False).click()
-            expect(panel.get_by_text("历史位置说明", exact=True)).to_be_visible()
-            panel.get_by_text("第 1 轮交付", exact=False).click()
+            expect(panel.get_by_text("整体改动说明", exact=True)).to_be_visible()
+            expect(panel.get_by_text("系统管理 → 用户管理", exact=True)).to_be_visible()
+            expect(panel.get_by_text("新增保存时的必填校验", exact=True)).to_be_visible()
+            expect(panel).not_to_contain_text("旧文件.js")
+            expect(panel).not_to_contain_text("回合")
             page.reload()
-            expect(panel.get_by_text("新增必填校验", exact=True)).to_be_visible()
-            expect(panel.get_by_text("历史位置说明", exact=True)).not_to_be_visible()
-
-            unknown = deepcopy(item)
-            unknown.update(status="unresolved", location_path=[], steps=[], evidence=[], reason="菜单由数据库配置，尚未取得资料", change="更新接口返回值")
-            no_ui = deepcopy(unknown)
-            no_ui.update(status="no_ui", reason="仅定时任务使用", change="修复后台任务")
-            state["change_locations"].append({**newest, "turn_id": "后端回合", "phase": "compile_fix", "items": [unknown, no_ui]})
+            expect(panel.get_by_text("新增保存时的必填校验", exact=True)).to_be_visible()
+            state["change_summary"] = [{"page": "档案管理 → 检索页面", "description": "调整查询条件"}]
             engine.save()
-            expect(panel.get_by_text("菜单由数据库配置，尚未取得资料", exact=True)).to_be_visible()
-            expect(panel.get_by_text("仅定时任务使用", exact=True)).to_be_visible()
+            expect(panel.get_by_text("调整查询条件", exact=True)).to_be_visible()
+            expect(panel).not_to_contain_text("新增保存时的必填校验")
             for width in (1440, 820, 600):
                 page.set_viewport_size({"width": width, "height": 1050})
                 assert panel.evaluate("element => element.scrollWidth <= element.clientWidth"), width
             page.set_viewport_size({"width": 1440, "height": 1050})
-            page.locator(".session-entry-custom-title").get_by_text("位置其他会话", exact=True).click()
-            expect(panel.get_by_text("暂无位置记录", exact=True)).to_be_visible()
-            expect(panel.get_by_text("更新接口返回值", exact=True)).not_to_be_visible()
-            page.locator(".session-entry-custom-title").get_by_text("位置主会话", exact=True).click()
-            expect(panel.get_by_text("更新接口返回值", exact=True)).to_be_visible()
+            fixture.second.engine.state.update(phase="complete", stage="已完成（未审查）")
+            fixture.second.engine.save()
+            page.locator(".session-entry-custom-title").get_by_text("汇总其他会话", exact=True).click()
+            expect(panel.get_by_text("暂无整体改动说明", exact=True)).to_be_visible()
+            page.locator(".session-entry-custom-title").get_by_text("汇总主会话", exact=True).click()
+            expect(panel.get_by_text("调整查询条件", exact=True)).to_be_visible()
             assert not errors, errors
             browser.close()
     finally:

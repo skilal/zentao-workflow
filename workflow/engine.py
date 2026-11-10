@@ -18,7 +18,7 @@ from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_re
 from workflow.baseline import BaselineFlow
 from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
 from workflow.compile_checks import compile_context, compile_repositories
-from workflow.change_locations import EDIT_PHASES, LOCATION_INSTRUCTIONS, begin_location_turn, complete_locations
+from workflow.change_locations import SUMMARY_PHASES, SUMMARY_INSTRUCTIONS, collect_change_summary
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import apply_followup_replacements, validate_review_request
 from workflow.commit_messages import COMMIT_INSTRUCTIONS, COMMIT_MESSAGE_SCHEMA, prepare_commit_messages
@@ -687,8 +687,8 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
         if pending_input(self.store, state):
             raise WorkflowError("仍有问题等待明确答复，不能启动新的模型回合。")
         phase = state["phase"]
-        if phase in EDIT_PHASES:
-            text += "\n" + LOCATION_INSTRUCTIONS
+        if phase in SUMMARY_PHASES:
+            text += "\n" + SUMMARY_INSTRUCTIONS
         if phase == "review":
             reviews = self.current_reviews()
             previous_ids = [finding["id"] for finding in reviews[-1]["result"]["findings"]] if reviews else []
@@ -809,8 +809,6 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             raise
         with self.lock:
             state["turn_id"] = response["turn"]["id"]
-            if phase in EDIT_PHASES:
-                begin_location_turn(self.store, state)
             self.start_progress(state["turn_id"])
             if phase != "branch":
                 state["thread_input"] = {"thread_id": state["thread_id"], "context_hashes": hashes,
@@ -1303,13 +1301,6 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                 state["stage"] = "等待计划补充"
                 self.save()
             else:
-                try:
-                    complete_locations(self.store, state)
-                except WorkflowError as error:
-                    state.update(stage="已停止", error=str(error))
-                    self.save()
-                    return
-                self.save()
                 if state["phase"] == "compile_fix":
                     self._compile_repaired()
                 else:
@@ -1317,12 +1308,15 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
                         self.note("系统", "本轮计划实施已完成，继续处理后续检查。")
                     if state["phase"] == "followup":
                         self._apply_review_request()
+                        if not state.get("review_enabled", True) and manifest(state["repos"]):
+                            collect_change_summary(self.store, state)
                     self._before_review()
         elif state["phase"] == "review":
             if manifest(state["repos"]) != state["review_manifest"]:
                 raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
             result = parse_review(text)
             commit_messages = prepare_commit_messages(state, result["commit_messages"])
+            collect_change_summary(self.store, state)
             review_number = len(state["reviews"]) + 1
             reviews = self.current_reviews()
             previous = {finding["id"]: finding for finding in reviews[-1]["result"]["findings"]} if reviews else {}
