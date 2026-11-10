@@ -110,6 +110,13 @@ button, input, textarea { font: inherit; }
 .changed-files-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; max-height: 180px; overflow: auto; }
 .changed-files-repository { min-width: 0; }
 .changed-files .repo-path { margin: 4px 0 0; }
+.change-locations { margin-top: 16px; }
+.location-items { display: grid; gap: 12px; min-width: 0; }
+.location-item { min-width: 0; overflow-wrap: anywhere; }
+.location-item + .location-item { border-top: 1px solid #edf0f4; padding-top: 12px; }
+.location-item .finding-details { margin-top: 8px; }
+.location-item .repo-path { margin: 4px 0 0; }
+.location-item ol { margin: 0; padding-left: 20px; }
 .conversation-feed { height: 640px; overflow: auto; padding-right: 5px; }
 .chat-entry { margin-bottom: 20px; }
 .chat-meta { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; color: #8a94a6; font-size: 11px; margin-bottom: 7px; }

@@ -10,6 +10,7 @@ TOOL_LABELS = {
     "delete_file": "删除文件", "ask_user": "等待你的回答", "request_review": "登记审查请求",
     "create_artifact": "生成成果文件", "publish_artifact": "返回成果文件",
     "set_session_title": "生成会话名称",
+    "report_change_locations": "登记修改位置",
 }
 ITEM_LABELS = {"reasoning": "模型正在思考中", "agentMessage": "生成回复", "plan": "生成计划",
                "contextCompaction": "压缩上下文", "fileChange": "修改文件", "commandExecution": "执行命令"}

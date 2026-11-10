@@ -141,6 +141,32 @@ function ChangedFiles({ sessionId, revision, running }) {
                 repo.paths.map(path => h("div", { className: "repo-path", key: path }, path))))) }]
   });
 }
+function ChangeLocations({ reports = [] }) {
+  const latest = reports.at(-1)?.turn_id;
+  const phases = { implement: "首次实施", followup: "续聊修改", fix: "Review 修复", compile_fix: "编译修复" };
+  const statuses = { located: "已定位", no_ui: "无直接前端入口", unresolved: "尚未定位" };
+  return h(Collapse, { className: "change-locations", size: "small", defaultActiveKey: ["locations"],
+    items: [{ key: "locations", label: `修改位置${reports.length ? ` · ${reports.length} 个回合` : ""}`,
+      children: reports.length === 0 ? h(Typography.Text, { type: "secondary" }, "暂无位置记录") :
+        h(Collapse, { key: latest, size: "small", ghost: true, defaultActiveKey: [latest],
+          items: [...reports].reverse().map((report, index) => ({ key: report.turn_id,
+            label: `第 ${report.delivery_round} 轮交付 · ${phases[report.phase]} · ${timeLabel(report.completed_at)}${index === 0 ? " · 最新" : ""}`,
+            children: h("div", { className: "location-items" }, report.items.map((item, number) =>
+              h("div", { className: "location-item", key: number },
+                h("div", null, h(Tag, { color: item.status === "located" ? "blue" : item.status === "unresolved" ? "orange" : "default" }, statuses[item.status]),
+                  h(Typography.Text, { strong: true }, item.location_path.join(" → ") || statuses[item.status])),
+                h("div", { className: "finding-details" },
+                  h("div", null, h("strong", null, "具体改动"), h("p", null, item.change)),
+                  item.route && h("div", null, h("strong", null, "页面路由"), h("p", null, item.route)),
+                  item.reason && h("div", null, h("strong", null, "定位说明"), h("p", null, item.reason)),
+                  item.steps.length > 0 && h("div", null, h("strong", null, "查看步骤"), h("ol", null,
+                    item.steps.map((step, index) => h("li", { key: index }, step)))),
+                  h("div", null, h("strong", null, "关联文件"), item.files.map(file =>
+                    h("div", { className: "repo-path", key: `${file.repository}:${file.path}` }, `${file.repository} / ${file.path}`))),
+                  item.evidence.length > 0 && h("div", null, h("strong", null, "源码依据"), item.evidence.map((source, index) =>
+                    h("div", { className: "repo-path", key: index }, `${source.repository} / ${source.path}:${source.line} · ${source.description}`)))))))
+          })) }) }] });
+}
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
@@ -1373,7 +1399,8 @@ function WorkflowApp() {
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
               model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream })))),
           h(ChangedFiles, { key: state.id, sessionId: state.id, revision: model.revision,
-            running: !stopped && (model.working || Boolean(model.busy) || ACTIVE.has(stage)) })),
+            running: !stopped && (model.working || Boolean(model.busy) || ACTIVE.has(stage)) }),
+          h(ChangeLocations, { key: `${state.id}:locations`, reports: state.change_locations })),
         h(CardBox, { className: "app-card followup-composer", title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复",
           extra: hasWorkItemMaterials && h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
             onClick: () => setMaterialsOpen(true) }, "工作项资料") },

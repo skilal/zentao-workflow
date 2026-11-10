@@ -8,6 +8,7 @@ from pathlib import Path
 from sys import stdin, stdout
 
 from workflow.compile_checks import compile_context, compile_repositories
+from workflow.change_locations import location_context, record_location_write, register_locations
 from workflow.artifacts import ARTIFACT_TOOLS, create_artifact, manifests
 from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
@@ -28,7 +29,19 @@ STRING = {"type": "string"}
 FILE_ARGS = {"repository": STRING, "path": STRING}
 LINE_ARGS = {"start_line": {"type": "integer", "minimum": 1},
              "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}
+LOCATION_ITEM = schema({
+    "status": {"type": "string", "enum": ["located", "no_ui", "unresolved"]},
+    "location_path": {"type": "array", "items": STRING}, "route": STRING,
+    "change": STRING, "steps": {"type": "array", "items": STRING}, "reason": STRING,
+    "files": {"type": "array", "minItems": 1, "items": schema(FILE_ARGS, ("repository", "path"))},
+    "evidence": {"type": "array", "items": schema({**FILE_ARGS,
+        "line": {"type": "integer", "minimum": 1}, "description": STRING},
+        ("repository", "path", "line", "description"))},
+}, ("status", "location_path", "change", "steps", "reason", "files", "evidence"))
 TOOLS = [
+    ("report_change_locations", "修改回合结束前登记所有实际变化文件对应的前端位置；located 为已定位，no_ui 为无直接前端入口，unresolved 为尚未定位。按源码核实菜单、页面和按钮；后两种须说明原因，不猜测。登记后再修改须重新登记。", schema({
+        "items": {"type": "array", "minItems": 1, "items": LOCATION_ITEM}
+    }, ("items",))),
     ("create_artifact", "生成独立会话成果，不修改业务仓库。text 的 content 为 UTF-8 字符串；docx/pdf 为 {blocks:[{type:heading,text,level?}|{type:paragraph,text}|{type:list,items,ordered?}|{type:table,rows:二维字符串数组}]}；xlsx 为 {sheets:[{name,rows:二维单元格数组,column_widths?:数字数组}]}，单元格为字符串/数字/布尔/null 或 {value,bold?,number_format?} 或 {formula:以等号开头的字符串,bold?,number_format?}。普通字符串始终按文本保存。", schema({
         "name": STRING, "format": {"type": "string", "enum": ["text", "docx", "xlsx", "pdf"]},
         "content": {"anyOf": [{"type": "string"}, {"type": "object"}]}
@@ -151,6 +164,7 @@ class Tools:
                     "snapshot": snapshot if include else {key: snapshot[key] for key in ("blockers", "feishu_links")},
                     "materials_revision": context_hash(snapshot), "materials_included": include,
                     "session_title_generation": title_generation_context(state),
+                    "change_locations": location_context(self.store, state),
                     "decisions": [entry for entry in state["decisions"] if entry.get("delivery_round", 1) == state.get("delivery_round", 1)],
                     "supplement_images": state.get("supplement_images", []),
                     "answer_attachments": submitted_attachments(state),
@@ -166,6 +180,8 @@ class Tools:
                     "compile_checks": compile_context(state)}
         if name == "set_session_title":
             return register_session_title(self.store, state, arguments.get("title"))
+        if name == "report_change_locations":
+            return register_locations(self.store, state, arguments.get("items"))
         if name == "ask_user":
             return register_input(self.store, state, arguments.get("questions"))
         if name == "read_answer_attachment":
@@ -260,7 +276,9 @@ class Tools:
         if name == "delete_file":
             if not path.is_file():
                 raise WorkflowError("删除目标不是普通文件。")
+            before = path.read_bytes()
             path.unlink()
+            record_location_write(self.store, state, repository, relative, before, None)
             return "文件已删除。"
         if name == "replace_text":
             old, new = arguments["old"], arguments["new"]
@@ -279,8 +297,10 @@ class Tools:
                     text = "\ufeff" + text
         if len(text.encode("utf-8")) > 4 * 1024 * 1024:
             raise WorkflowError("写入内容超出单文件上限。")
+        before = path.read_bytes() if path.is_file() else None
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="")
+        record_location_write(self.store, state, repository, relative, before, path.read_bytes())
         if replacement_path is not None:
             replacements["files"].setdefault(repository["name"], {})[relative] = sha256(path.read_bytes()).hexdigest()
             temporary = replacement_path.with_suffix(".json.tmp")
@@ -338,7 +358,7 @@ def serve(session_id):
                           "capabilities": {"tools": {}}, "serverInfo": {"name": "workflow", "version": "0.1.0"}}
             elif method == "tools/list":
                 result = {"tools": [{"name": name, "description": description, "inputSchema": definition,
-                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", *ARTIFACT_TOOLS),
+                                     "annotations": {"readOnlyHint": name not in ("write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", "report_change_locations", *ARTIFACT_TOOLS),
                                                      "openWorldHint": False}} for name, description, definition in TOOLS]}
             elif method == "tools/call":
                 try:
