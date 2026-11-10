@@ -215,11 +215,17 @@ button, input, textarea { font: inherit; }
 .session-entry.ant-list-item { padding: 12px 10px; border-radius: 6px; cursor: pointer; border-bottom: 1px solid #edf0f4; }
 .session-entry:hover, .session-entry:focus-visible { background: #f6f8fb; }
 .session-entry.selected { background: #eef7ff; box-shadow: inset 3px 0 rgb(27, 143, 255); }
+.session-entry.inactive { background: #f6f8fb; }
+.session-entry.inactive:hover, .session-entry.inactive:focus-visible { background: #edf0f4; }
+.session-entry.inactive.selected { background: #eef7ff; }
+.session-entry.inactive .session-entry-custom-title, .session-entry.inactive .session-entry-title { color: #8a94a6; }
+.session-entry.inactive .session-entry-status .ant-tag { color: #8a94a6; background: #f6f8fb; border-color: #edf0f4; }
+.session-entry-status .session-inactive-tag { margin-inline-end: 0; font-size: 11px; }
 .session-entry-body { width: 100%; min-width: 0; }
 .session-entry-custom-title { margin-bottom: 4px; color: #25354b; font-weight: 600; font-size: 14px; line-height: 1.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-entry-title { color: #25354b; font-weight: 500; font-size: 13px; line-height: 1.7; }
 .session-entry-title > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-entry-status { margin: 9px 0 5px; display: flex; align-items: center; gap: 6px; }
+.session-entry-status { margin: 9px 0 5px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .session-entry-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
 .session-entry-foot .muted { font-size: 11px; }
 .session-panel-note { padding-top: 14px; border-top: 1px solid #edf0f4; line-height: 1.8; }

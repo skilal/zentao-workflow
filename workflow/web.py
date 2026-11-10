@@ -3,6 +3,7 @@
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from datetime import datetime, timezone
 from difflib import unified_diff
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,10 +41,25 @@ ASSETS = ROOT / "web" / "dist"
 COOKIE_NAME = "zentao_workflow_session"
 
 
+def session_activity(state):
+    last_dialogue, last_user = None, None
+    for entry in state["history"]:
+        if entry["role"] not in {"用户", "Codex"}:
+            continue
+        time = datetime.fromisoformat(entry["time"]).astimezone(timezone.utc)
+        if last_dialogue is None or time > last_dialogue:
+            last_dialogue = time
+        if entry["role"] == "用户" and (last_user is None or time > last_user):
+            last_user = time
+    return {"last_dialogue_at": last_dialogue.isoformat() if last_dialogue else None,
+            "last_user_message_at": last_user.isoformat() if last_user else None}
+
+
 def public_state(state):
     if state is None:
         return None
     result = deepcopy(state)
+    result.update(session_activity(state))
     result.setdefault("supplement_images", [])
     result.setdefault("followup_images", [])
     result.setdefault("followup_attachments", [])
@@ -96,6 +112,7 @@ def public_state(state):
 
 def history_summary(state):
     return {**{key: state.get(key) for key in ("id", "item", "items", "stage", "updated_at", "fix_round", "commits")},
+            **session_activity(state),
             "handoff_pending": bool(state.get("workspace_handoff_request")),
             "project": session_project(state), "title": session_title(state)}
 
@@ -272,7 +289,8 @@ class WebApplication:
                     "project_partitions": self.projects(),
                     "sessions": {session_id: self.session_payload(runtime) for session_id, runtime in self.sessions.runtimes.items()},
                     "history": sorted((self.summary(runtime) for runtime in self.sessions.runtimes.values()),
-                                      key=lambda entry: (entry["updated_at"], entry["id"]), reverse=True)}
+                                      key=lambda entry: (datetime.fromisoformat(entry["last_dialogue_at"]).timestamp()
+                                                         if entry["last_dialogue_at"] else float("-inf"), entry["id"]), reverse=True)}
 
     def session(self, session_id):
         with self.lock:

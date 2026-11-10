@@ -25,6 +25,11 @@ function itemKey(item) { return item ? `${item.kind}:${item.id}` : ""; }
 function sessionItems(state) { return state.items || [state.item]; }
 function itemLabel(state) { return sessionItems(state).map(item => `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`).join("；") || state.title || "新会话"; }
 function timeLabel(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : ""; }
+function dialogueTime(entry) { return entry.last_dialogue_at ? Date.parse(entry.last_dialogue_at) : -Infinity; }
+function compareSessions(left, right) {
+  const leftTime = dialogueTime(left), rightTime = dialogueTime(right);
+  return leftTime === rightTime ? right.id.localeCompare(left.id) : rightTime - leftTime;
+}
 function plainDescription(value) {
   return String(value || "").replaceAll("【spec】", "【需求描述】").replaceAll("【verify】", "【验收标准】")
     .replaceAll("【desc】", "【详细描述】").replaceAll("【steps】", "【复现步骤】").replaceAll("【bugSteps】", "【来源 Bug 描述】");
@@ -170,9 +175,9 @@ function ChangeLocations({ reports = [] }) {
 function Field(props) { return h("div", null, h("label", { className: "field-label" }, props.label), props.children); }
 function mergeHistory(history, state) {
   if (!state) return history || [];
-  const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
+  const summary = Object.fromEntries(["id", "item", "items", "title", "stage", "updated_at", "last_dialogue_at", "last_user_message_at", "fix_round", "commits", "project", "can_move_project", "project_move_reason"].map(key => [key, state[key]]));
   summary.handoff_pending = Boolean(state.workspace_handoff_request);
-  return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
+  return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort(compareSessions);
 }
 function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", plan_mode: false, review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
   followup_compile_enabled: Boolean(state?.compile_check?.enabled ?? settings?.compile_check_enabled),
@@ -412,6 +417,7 @@ function WorkflowApp() {
   const sending = requestsPending[model?.selectedSessionId || model?.preview?.preview_id || "new"] || requestsPending.new || requestsPending.global || "";
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionFilter, setSessionFilter] = useState("all");
+  const [sessionNow, setSessionNow] = useState(Date.now);
   const [collapsedProjects, setCollapsedProjects] = useState(() => JSON.parse(localStorage.getItem("workflow-collapsed-projects") || "[]"));
   const [dragSessionId, setDragSessionId] = useState(null);
   const [dropProjectId, setDropProjectId] = useState(null);
@@ -811,6 +817,17 @@ function WorkflowApp() {
   useEffect(() => {
     window.addEventListener("pagehide", discardPreview);
     return () => window.removeEventListener("pagehide", discardPreview);
+  }, []);
+  useEffect(() => {
+    const update = () => setSessionNow(Date.now());
+    const timer = setInterval(update, 60000);
+    document.addEventListener("visibilitychange", update);
+    window.addEventListener("focus", update);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener("visibilitychange", update);
+      window.removeEventListener("focus", update);
+    };
   }, []);
 
   useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
@@ -1645,10 +1662,10 @@ function WorkflowApp() {
       const entries = model.history.filter(entry => (entry.project?.id || 0) === project.id);
       const rows = entries.filter(entry => (sessionFilter === "all" || entry.stage === sessionFilter) &&
         (!query || `${entry.title} ${itemLabel(entry)} ${project.name} ${project.id > 0 ? `项目 #${project.id}` : ""}`.toLowerCase().includes(query)))
-        .sort((left, right) => right.updated_at.localeCompare(left.updated_at) || right.id.localeCompare(left.id));
-      return { ...project, rows, updated_at: entries.reduce((latest, entry) => entry.updated_at > latest ? entry.updated_at : latest, "") };
+        .sort(compareSessions);
+      return { ...project, rows, lastDialogueTime: entries.reduce((latest, entry) => Math.max(latest, dialogueTime(entry)), -Infinity) };
     }).filter(project => !project.id || project.manual || (!query && sessionFilter === "all") || project.rows.length)
-      .sort((left, right) => !left.id ? 1 : !right.id ? -1 : right.updated_at.localeCompare(left.updated_at) || left.id - right.id);
+      .sort((left, right) => !left.id ? 1 : !right.id ? -1 : left.lastDialogueTime === right.lastDialogueTime ? left.id - right.id : right.lastDialogueTime - left.lastDialogueTime);
     const running = model.history.filter(entry => ACTIVE.has(entry.stage) || entry.busy).length;
     return h(CardBox, { title: "会话", className: "app-card session-panel", extra: h(Typography.Text, { type: "secondary" }, `${running} 个执行中`) },
       h(Button, { type: "primary", block: true, onClick: newSession, disabled: stopped }, "新建会话"),
@@ -1679,10 +1696,11 @@ function WorkflowApp() {
               h(Tag, { className: "session-project-count" }, project.rows.length)),
               children: h(List, { dataSource: project.rows, locale: { emptyText: "暂无会话，可移入未启动的会话" }, renderItem: entry => {
                 const selected = model.selectedSessionId === entry.id;
+                const inactive = Boolean(entry.last_user_message_at && sessionNow - Date.parse(entry.last_user_message_at) > 120 * 60 * 60 * 1000);
                 const canMove = entry.can_move_project && !stopped && !requestsPending[entry.id];
                 const cannotDelete = stopped || entry.working || entry.busy || entry.handoff_pending || ACTIVE.has(entry.stage) || entry.stage === "等待人工回答" || entry.stage === "资料读取中";
                 const open = () => selectSession(entry.id, ["资料已读取", "资料读取失败"].includes(entry.stage) ? "items" : "plan");
-                return h(List.Item, { key: entry.id, className: `session-entry${selected ? " selected" : ""}`, onClick: open, draggable: Boolean(canMove),
+                return h(List.Item, { key: entry.id, className: `session-entry${selected ? " selected" : ""}${inactive ? " inactive" : ""}`, onClick: open, draggable: Boolean(canMove),
                   title: entry.project_move_reason || "可拖动到其他项目分区",
                   onDragStart: event => { event.dataTransfer.setData("application/x-workflow-session", entry.id); event.dataTransfer.effectAllowed = "move"; setDragSessionId(entry.id); },
                   onDragEnd: () => { setDragSessionId(null); setDropProjectId(null); },
@@ -1690,8 +1708,9 @@ function WorkflowApp() {
                   h("div", { className: "session-entry-body" },
                     h("div", { className: "session-entry-custom-title", title: entry.title }, entry.title),
                     h("div", { className: "session-entry-title", title: itemLabel(entry) }, sessionItems(entry).map(item => h("div", { key: itemKey(item) }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
-                    h("div", { className: "session-entry-status" }, stageTag(entry.stage), entry.busy && h(Spin, { size: "small" })),
-                    h("div", { className: "session-entry-foot" }, h("span", { className: "muted" }, timeLabel(entry.updated_at)),
+                    h("div", { className: "session-entry-status" }, stageTag(entry.stage), entry.busy && h(Spin, { size: "small" }),
+                      inactive && h(Tag, { className: "session-inactive-tag", title: `用户最后发言：${timeLabel(entry.last_user_message_at)}` }, "超过5天未对话")),
+                    h("div", { className: "session-entry-foot" }, h("span", { className: "muted", title: "最近对话时间" }, entry.last_dialogue_at ? timeLabel(entry.last_dialogue_at) : "尚无对话"),
                       h("span", { className: "session-entry-actions", onClick: event => event.stopPropagation() },
                       h(Button, { type: "text", size: "small", disabled: stopped || entry.deleting || Boolean(requestsPending[entry.id]),
                         "aria-label": "修改会话标题", onClick: () => renameSession(entry) }, "改名"),
