@@ -43,7 +43,7 @@ COOKIE_NAME = "zentao_workflow_session"
 
 def session_activity(state):
     last_dialogue, last_user = None, None
-    for entry in state["history"]:
+    for entry in state.get("history", []):
         if entry["role"] not in {"用户", "Codex"}:
             continue
         time = datetime.fromisoformat(entry["time"]).astimezone(timezone.utc)

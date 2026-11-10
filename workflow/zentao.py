@@ -262,6 +262,13 @@ class ZentaoClient:
             items, total = data.get(key), data.get("total")
             if not isinstance(items, list) or type(total) is not int or total < 0:
                 raise WorkflowError("禅道产品或需求列表格式不符合预期，已停止。")
+            if key == "stories":
+                kind = parameters["type"]
+                allowed_types = REQUIREMENT_KINDS[REQUIREMENT_KINDS.index(kind):]
+                if any(item.get("type") not in allowed_types for item in items):
+                    raise WorkflowError("禅道返回的需求类型与请求不一致，已停止。")
+                # 禅道列表会追加下级需求，但 total 只统计请求类型；分页和去重只计算本级。
+                items = [item for item in items if item["type"] == kind]
             ids = {identifier(item.get("id")) for item in items}
             if any(item_id <= 0 for item_id in ids):
                 raise WorkflowError("禅道产品或需求编号无效，已停止。")
@@ -283,8 +290,6 @@ class ZentaoClient:
                 parameters = {"product": identifier(product["id"]), "type": kind, "status": "all",
                               "branch": "all", "order": "id_asc"}
                 for item in self._pages("api.php/v1/stories", "stories", parameters):
-                    if item.get("type") != kind:
-                        raise WorkflowError("禅道返回的需求类型与请求不一致，已停止。")
                     item_id = identifier(item["id"])
                     if (kind, item_id) in seen:
                         continue

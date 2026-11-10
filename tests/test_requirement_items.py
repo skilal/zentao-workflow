@@ -80,15 +80,61 @@ class RequirementItemsChecks(TestCase):
                 with self.assertRaises(WorkflowError):
                     list(self.client._pages("api.php/v1/products", "products", {}))
 
-    def test_incomplete_requirement_pages_and_type_mismatch_stop(self):
+    def test_incomplete_requirement_pages_and_invalid_types_stop(self):
         for pages in ([{"total": 2, "stories": [self.item("epic")]},
                        {"total": 2, "stories": [self.item("epic")]}],
-                      [{"total": 1, "stories": [self.item("story")]}],
+                      [{"total": 1, "stories": [self.item("epic", type="task")]}],
                       [{"total": 1, "stories": {}}]):
             with self.subTest(pages=pages), patch.object(self.client, "_fetch", side_effect=[
                     {"total": 1, "products": [{"id": 1}]}, *pages]):
                 with self.assertRaises(WorkflowError):
                     self.client.list_items("epic")
+
+    def test_appended_children_do_not_count_toward_requirement_pagination(self):
+        pages = [{"total": 1, "products": [{"id": 1}]},
+                 {"total": 3, "stories": [self.item("epic", 7), self.item("requirement", 101),
+                                            self.item("story", 201), self.item("epic", 8)]},
+                 {"total": 3, "stories": [self.item("epic", 9), self.item("requirement", 102),
+                                            self.item("story", 202)]}]
+        with patch.object(self.client, "_fetch", side_effect=pages) as fetch:
+            items = self.client.list_items("epic")
+        self.assertEqual([(item["kind"], item["id"]) for item in items], [("epic", 7), ("epic", 8), ("epic", 9)])
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(parse_qs(urlparse(fetch.call_args.args[0]).query)["page"], ["2"])
+
+    def test_all_requirement_kinds_keep_their_own_records_when_children_are_appended(self):
+        pages = [{"total": 1, "products": [{"id": 1}]},
+                 {"total": 1, "stories": [self.item("epic", 7), self.item("requirement", 8), self.item("story", 9)]},
+                 {"total": 1, "stories": [self.item("requirement", 8), self.item("story", 9)]},
+                 {"total": 1, "stories": [self.item("story", 9)]}]
+        with patch.object(self.client, "_fetch", side_effect=pages) as fetch:
+            items = self.client.list_requirements()
+        self.assertEqual([(item["kind"], item["id"]) for item in items], [("epic", 7), ("requirement", 8), ("story", 9)])
+        self.assertEqual(fetch.call_count, 4)
+
+    def test_children_do_not_hide_repeated_or_missing_parent_pages(self):
+        for final_page in ([self.item("epic", 7), self.item("requirement", 102)], [self.item("story", 202)]):
+            with self.subTest(final_page=final_page), patch.object(self.client, "_fetch", side_effect=[
+                    {"total": 1, "products": [{"id": 1}]},
+                    {"total": 2, "stories": [self.item("epic", 7), self.item("requirement", 101)]},
+                    {"total": 2, "stories": final_page}]) as fetch:
+                with self.assertRaisesRegex(WorkflowError, "分页提前结束"):
+                    self.client.list_items("epic")
+                self.assertEqual(fetch.call_count, 3)
+
+    def test_unknown_missing_and_ancestor_types_still_stop_without_retry(self):
+        for requested, returned in (("epic", None), ("epic", "unknown"),
+                                    ("requirement", "epic"), ("story", "requirement")):
+            item = self.item("story")
+            if returned is None:
+                item.pop("type")
+            else:
+                item["type"] = returned
+            with self.subTest(requested=requested, returned=returned), patch.object(self.client, "_fetch", side_effect=[
+                    {"total": 1, "products": [{"id": 1}]}, {"total": 1, "stories": [item]}]) as fetch:
+                with self.assertRaisesRegex(WorkflowError, "需求类型与请求不一致"):
+                    self.client.list_items(requested)
+                self.assertEqual(fetch.call_count, 2)
 
     def test_api_error_stops_without_retry_or_type_switch(self):
         with patch.object(self.client, "_fetch", side_effect=[

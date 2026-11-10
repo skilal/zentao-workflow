@@ -48,6 +48,7 @@ class SessionActivityChecks(SessionActivityFixture):
         self.assertEqual(state, original)
 
     def test_no_user_or_no_dialogue_has_explicit_empty_times(self):
+        self.assertEqual(session_activity({}), {"last_dialogue_at": None, "last_user_message_at": None})
         self.assertEqual(session_activity({"history": []}), {"last_dialogue_at": None, "last_user_message_at": None})
         self.assertEqual(session_activity({"history": [{"role": "系统", "time": "2026-11-10T00:00:00+00:00"}]}),
                          {"last_dialogue_at": None, "last_user_message_at": None})
