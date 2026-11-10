@@ -13,7 +13,7 @@ DOMPurify.addHook("afterSanitizeAttributes", node => {
 });
 const TYPE_NAMES = { epic: "业务需求", requirement: "用户需求", story: "研发需求", task: "任务", bug: "Bug" };
 const STATUS_NAMES = { wait: "未开始", doing: "进行中", pause: "已暂停", done: "已完成", closed: "已关闭", cancel: "已取消", active: "已激活", draft: "草稿", reviewing: "评审中", changing: "变更中", resolved: "已解决", confirmed: "已确认", postponed: "已延期", delay: "已逾期" };
-const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"]);
+const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "核对改动中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"]);
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
   items: ["工作项与资料", "可从指派给你的需求、任务和 Bug 中选择处理对象，也可新建会话直接输入需求。"],
@@ -1489,6 +1489,8 @@ function WorkflowApp() {
             !model.stream && !processRunning && ["准备工作区中", "计划中", "实施中", "修复中", "续聊处理中", "编译修复中", "编译分析中"].includes(stage) &&
               h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }),
                 stage === "准备工作区中" ? " 正在准备工作区…" : " 模型正在处理中…"),
+            stage === "核对改动中" && h("div", { className: "stream-indicator", role: "status" },
+              h(Spin, { size: "small" }), " 正在核对代码差异与修改归属…"),
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
               model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream })))),
           h(ChangedFiles, { key: state.id, sessionId: state.id, revision: model.revision,

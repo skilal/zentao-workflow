@@ -57,7 +57,7 @@ FINDING_SCHEMA = deepcopy(LEGACY_FINDING_SCHEMA)
 FINDING_SCHEMA["properties"]["commit_messages"] = COMMIT_MESSAGE_SCHEMA
 FINDING_SCHEMA["required"].append("commit_messages")
 
-ACTIVE = {"识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"}
+ACTIVE = {"识别分支中", "刷新分支中", "拉取分支中", "准备工作区中", "计划中", "实施中", "核对改动中", "审查中", "修复中", "续聊处理中", "编译检查中", "编译修复中", "编译分析中"}
 COMPLETE = {"已完成（静态审查）", "已完成（未审查）"}
 PHASE_STAGE = {"branch": "识别分支中", "plan": "计划中", "implement": "实施中", "review": "审查中", "fix": "修复中", "followup": "续聊处理中", "compile_fix": "编译修复中", "compile_analysis": "编译分析中"}
 
@@ -939,6 +939,8 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
 
     def _begin_review(self):
         state = self.state
+        state["stage"] = "核对改动中"
+        self.save()
         self._guard_compile()
         state.pop("baseline_review_pending", None)
         state["review_manifest"] = manifest(state["repos"])
