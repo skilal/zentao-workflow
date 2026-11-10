@@ -189,9 +189,11 @@ class ModelSessionChecks(TestCase):
             engine.ensure_rpc()
             rpc.start.assert_called_once_with("model-a")
             self.assertEqual(rpc.request.call_args.args[0], "thread/start")
+            self.assertIn("report_change_locations", rpc.request.call_args.args[1]["config"]["mcp_servers"]["workflow"]["enabled_tools"])
             engine.rpc = None
             engine.ensure_rpc()
             self.assertEqual(rpc.request.call_args.args[0], "thread/resume")
+            self.assertIn("report_change_locations", rpc.request.call_args.args[1]["config"]["mcp_servers"]["workflow"]["enabled_tools"])
             self.assertEqual(rpc.request.call_args.args[1]["model"], "model-a")
             engine.rpc = None
 

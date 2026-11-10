@@ -13,6 +13,7 @@ from workflow.change_locations import (LOCATION_INSTRUCTIONS, begin_location_tur
 from workflow.engine import Workflow
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
+from workflow.rpc import thread_parameters
 from workflow.settings import ROOT, WorkflowError
 from workflow.store import SessionStore
 from workflow.web import public_state
@@ -233,3 +234,12 @@ class ChangeLocationsChecks(TestCase):
         self.assertIn(LOCATION_INSTRUCTIONS, prompt)
         self.assertTrue(journal_path(self.flow.store, self.state).exists())
         self.assertIn("report_change_locations", {name for name, _, _ in TOOLS})
+
+    def test_every_edit_phase_exposes_required_reporting_tool(self):
+        for phase in ("implement", "followup", "fix", "compile_fix"):
+            with self.subTest(phase=phase):
+                self.state["phase"] = phase
+                params = thread_parameters(self.state, "模拟模型", {})
+                server = params["config"]["mcp_servers"]["workflow"]
+                self.assertTrue(server["enabled"])
+                self.assertIn("report_change_locations", server["enabled_tools"])
