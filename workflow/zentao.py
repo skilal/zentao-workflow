@@ -133,7 +133,17 @@ def project_context(*records):
         for entry in linked:
             linked_id = identifier(entry.get("id"))
             if linked_id:
-                projects[linked_id] = {"id": linked_id, "name": str(entry.get("name", "")).strip()}
+                project = projects.setdefault(linked_id, {"id": linked_id, "name": ""})
+                if entry.get("name"):
+                    project["name"] = str(entry["name"]).strip()
+        # 执行编号和名称不代表项目；这里只采用禅道明确返回的所属项目字段。
+        executions = record.get("executions") or []
+        if isinstance(executions, dict):
+            executions = executions.values()
+        for execution in executions:
+            project_id = identifier(execution.get("project"))
+            if project_id:
+                projects.setdefault(project_id, {"id": project_id, "name": ""})
     candidates = list(projects.values())
     if len(candidates) == 1:
         project = candidates[0]
@@ -321,6 +331,39 @@ class ZentaoClient:
                                     "priority": item.get("pri", ""), "assigned_to": self.account})
         return records
 
+    def resolve_item_projects(self, items, on_progress=None):
+        details = {}
+        for item in items:
+            project = project_context(item, {"projects": item.get("project_candidates", [])})
+            if item["kind"] in REQUIREMENT_KINDS and not project["id"] and not project["candidates"]:
+                key = (item["kind"], item["id"])
+                if key not in details:
+                    if on_progress:
+                        on_progress(f"正在读取{KINDS[item['kind']][0]} #{item['id']} 的项目关联")
+                    details[key] = self.detail(*key)
+                project = project_context(item, details[key])
+            item.update(project_id=project["id"], project_name=project["name"], project_candidates=project["candidates"])
+        names = {project["id"]: project["name"] for item in items for project in item["project_candidates"] if project["name"]}
+        missing = sorted({project["id"] for item in items for project in item["project_candidates"] if project["id"] not in names})
+        for index, project_id in enumerate(missing, 1):
+            if on_progress:
+                on_progress(f"正在补齐所属项目名称：第 {index}/{len(missing)} 个")
+            names[project_id] = self._project_name(project_id)
+        for item in items:
+            for project in item["project_candidates"]:
+                project["name"] = names[project["id"]]
+            if item["project_id"]:
+                item["project_name"] = names[item["project_id"]]
+            item["project"] = item["project_name"] or item["project_id"]
+        return items
+
+    def _project_name(self, project_id):
+        data = self._fetch(f"api.php/v1/projects/{project_id}")
+        if (identifier(data.get("id")) != project_id or not isinstance(data.get("name"), str)
+                or not data["name"].strip()):
+            raise WorkflowError("所属项目信息不符合预期。")
+        return data["name"].strip()
+
     def list_projects(self):
         self.require_login()
         page, projects = 1, {}
@@ -367,10 +410,7 @@ class ZentaoClient:
             primary = self.detail(item["kind"], item["id"])
             project = project_context({**item, "projects": item.get("project_candidates", [])}, primary)
             if project["id"] and not project["name"]:
-                data = self._fetch(f"api.php/v1/projects/{project['id']}")
-                if identifier(data.get("id")) != project["id"] or not data.get("name"):
-                    raise WorkflowError("所属项目信息不符合预期。")
-                project["name"] = data["name"]
+                project["name"] = self._project_name(project["id"])
                 project["candidates"] = [{"id": project["id"], "name": project["name"]}]
             projects.append(project)
             documents.append({"kind": item["kind"], "data": primary, "selected": True})

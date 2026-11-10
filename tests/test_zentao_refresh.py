@@ -24,7 +24,8 @@ class ZentaoRefreshFixture(TestCase):
 
     def item(self, kind, number, **changes):
         return {"id": number, "type": kind, "title": f"示例{kind}{number}", "name": f"示例任务{number}",
-                "assignedTo": "测试账号", "status": "active", "deleted": False, "pri": 2, **changes}
+                "assignedTo": "测试账号", "status": "active", "deleted": False, "pri": 2,
+                "project": 41, "projectName": "示例项目", **changes}
 
 
 class AssignedListChecks(ZentaoRefreshFixture):

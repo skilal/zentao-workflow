@@ -26,6 +26,7 @@ function itemKey(item) { return item ? `${item.kind}:${item.id}` : ""; }
 function sessionItems(state) { return state.items || [state.item]; }
 function itemLabel(state) { return sessionItems(state).map(item => `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`).join("；") || state.title || "新会话"; }
 function timeLabel(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : ""; }
+function itemProjectLabel(item) { return item.project_name || (item.project_id > 0 ? `项目 #${item.project_id}` : "待确认项目"); }
 function dialogueTime(entry) { return entry.last_dialogue_at ? Date.parse(entry.last_dialogue_at) : -Infinity; }
 function compareSessions(left, right) {
   const leftTime = dialogueTime(left), rightTime = dialogueTime(right);
@@ -1110,7 +1111,7 @@ function WorkflowApp() {
 
   function renderItems() {
     const projects = [...new Map(model.items.map(item => [item.project_id, {
-      value: item.project_id, label: item.project_name || (item.project_id > 0 ? `项目 #${item.project_id}` : "未关联项目")
+      value: item.project_id, label: itemProjectLabel(item)
     }])).values()];
     const rows = model.items.filter(item => (filter === "all" || item.kind === filter) &&
       (itemProject === "all" || item.project_id === itemProject) &&
@@ -1130,7 +1131,7 @@ function WorkflowApp() {
       { title: "编号", dataIndex: "id", width: 90, render: value => h(Typography.Text, { code: true }, `#${value}`) },
       { title: "标题", dataIndex: "title", render: value => h("span", { className: "table-title" }, value) },
       { title: "状态", dataIndex: "status", width: 100, render: value => h(Tag, null, STATUS_NAMES[value] || value) },
-      { title: "所属项目", dataIndex: "project", width: 120, render: value => /^\d+$/.test(String(value)) ? `项目 #${value}` : String(value || "—") },
+      { title: "所属项目", dataIndex: "project", width: 120, render: (_, item) => itemProjectLabel(item) },
       { title: "优先级", dataIndex: "priority", width: 80, render: value => value ? `P${value}` : "—" }
     ];
     const snapshot = selectionMatches ? state?.snapshot : null;

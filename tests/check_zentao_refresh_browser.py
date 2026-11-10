@@ -24,9 +24,9 @@ def run():
     now = datetime.now(timezone.utc).replace(microsecond=0)
     assigned_gate, requirements_gate = Event(), Event()
     failed = [False]
-    assigned = [{"kind": kind, "id": 1, "title": f"新列表{kind}", "status": "active", "project_id": 41}
+    assigned = [{"kind": kind, "id": 1, "title": f"新列表{kind}", "status": "active", "project_id": 41, "project_name": "示例项目"}
                 for kind in ("story", "task", "bug")]
-    requirements = [{"kind": kind, "id": 1, "title": f"新列表{kind}", "status": "active", "project_id": 41}
+    requirements = [{"kind": kind, "id": 1, "title": f"新列表{kind}", "status": "active", "project_id": 41, "project_name": "示例项目"}
                     for kind in ("epic", "requirement")]
     def read_assigned(on_progress):
         on_progress("正在读取研发需求、任务、Bug：第 1 页")

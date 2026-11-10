@@ -186,10 +186,12 @@ class RequirementWorkflowChecks(TestCase):
 
     def test_refresh_publishes_all_kinds_together(self):
         flow = self.application.sessions.connection
-        requirements = [{"kind": kind, "id": 7, "title": KINDS[kind][0]} for kind in ("epic", "requirement")]
+        requirements = [{"kind": kind, "id": 7, "title": KINDS[kind][0], "project_id": 41, "project_name": "示例项目"}
+                        for kind in ("epic", "requirement")]
         client = self.application.sessions.zentao
         with patch.object(client, "list_requirements", return_value=requirements) as listed, \
-                patch.object(client, "list_assigned_items", return_value=[{"kind": kind, "id": 7} for kind in ("story", "task", "bug")]) as other:
+                patch.object(client, "list_assigned_items", return_value=[{"kind": kind, "id": 7, "project_id": 41,
+                                                                         "project_name": "示例项目"} for kind in ("story", "task", "bug")]) as other:
             flow.refresh()
         self.assertEqual(listed.call_args.args, (("epic", "requirement"),))
         listed.assert_called_once()

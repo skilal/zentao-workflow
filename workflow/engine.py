@@ -335,7 +335,7 @@ class Workflow(WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFl
             with self.zentao_lock:
                 assigned = self.zentao.list_assigned_items(on_progress=report)
                 requirements = self.zentao.list_requirements(("epic", "requirement"), on_progress=report)
-            items = [*requirements, *assigned]
+                items = self.zentao.resolve_item_projects([*requirements, *assigned], on_progress=report)
         except WorkflowError as error:
             self.emit("items_sync", {"status": "failed", "message": str(error), "started_at": started_at,
                                      "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
