@@ -38,7 +38,7 @@ from workflow.workspace_reuse import WorkspaceReuseFlow
 from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.workspace_release import WorkspaceReleaseFlow
 from workflow.shared_changes import (SCOPE_SCHEMA, initialize_session, select_scope, snapshot_review)
-from workflow.zentao import ZentaoClient, project_context
+from workflow.zentao import KINDS, ZentaoClient, project_context
 
 
 LEGACY_FINDING_SCHEMA = {"type": "object", "properties": {
@@ -330,31 +330,35 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
     def connect(self):
         self.refresh(reconnect=True)
 
-    def refresh(self, reconnect=False):
+    def refresh(self, reconnect=False, kind="all"):
         started, started_at, requests = monotonic(), timestamp(), 0
+        kinds = ("story", "task", "bug") if kind == "all" else (kind,)
+        label = "快速待办" if kind == "all" else KINDS[kind][0]
         def report(message):
             nonlocal requests
             requests += 1
             self.emit("items_sync", {"status": "loading", "message": message, "started_at": started_at,
-                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
-        self.emit("items_sync", {"status": "loading", "message": "正在连接禅道" if reconnect else "正在刷新工作项",
-                                 "started_at": started_at, "elapsed_seconds": 0, "list_requests": 0})
+                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
+        self.emit("items_sync", {"status": "loading", "message": "正在连接禅道" if reconnect else f"正在刷新{label}",
+                                 "started_at": started_at, "elapsed_seconds": 0, "list_requests": 0, "kinds": kinds})
         try:
             if reconnect:
                 with self.zentao_lock:
                     profile = self.zentao.login()
                 self.emit("connected", profile)
             with self.zentao_lock:
-                assigned = self.zentao.list_assigned_items(on_progress=report)
-                requirements = self.zentao.list_requirements(("epic", "requirement"), on_progress=report)
-                items = self.zentao.resolve_item_projects([*requirements, *assigned], on_progress=report)
+                if kind in ("epic", "requirement"):
+                    items = self.zentao.list_requirements(kinds, on_progress=report)
+                else:
+                    items = self.zentao.list_assigned_items(kinds, on_progress=report)
+                items = self.zentao.resolve_item_projects(items, on_progress=report)
         except WorkflowError as error:
             self.emit("items_sync", {"status": "failed", "message": str(error), "started_at": started_at,
-                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
+                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
             raise
-        self.emit("items", items)
+        self.emit("items_batch", {"kinds": kinds, "items": items})
         self.emit("items_sync", {"status": "complete", "message": f"已更新 {len(items)} 项工作项", "started_at": started_at,
-                                 "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests})
+                                 "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
 
     def collect(self, items):
         if self.state and not self.editable():

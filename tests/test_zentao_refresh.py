@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 import test_previews as previews
 from workflow.settings import WorkflowError
+from workflow.web import WebApplication
 from workflow.zentao import REQUIREMENT_KINDS
 
 
@@ -74,7 +75,7 @@ class AssignedListChecks(ZentaoRefreshFixture):
 
 
 class RefreshFlowChecks(ZentaoRefreshFixture):
-    def test_refresh_reduces_requests_and_preserves_all_five_kinds(self):
+    def test_quick_refresh_does_not_scan_products_and_preserves_loaded_requirements(self):
         calls = []
         def fetch(path):
             parsed = urlparse(path)
@@ -108,29 +109,35 @@ class RefreshFlowChecks(ZentaoRefreshFixture):
             calls.clear()
             self.flow.refresh()
         self.assertEqual(previous_requests, 63)
-        self.assertEqual(len(calls), 6)
+        self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][1]["fields"], "story,task,bug")
-        self.assertTrue(all(query["type"] != "story" and query["status"] == "assignedtome"
-                            for path, query in calls if path == "api.php/v1/stories"))
-        items = self.application.items
-        self.assertEqual([item["kind"] for item in items], ["epic", "requirement", "epic", "requirement", "story", "story", "task", "bug"])
+        self.assertEqual([item["kind"] for item in self.application.items], ["story", "story", "task", "bug"])
+        with patch.object(self.client, "_fetch", side_effect=fetch):
+            self.flow.refresh(kind="requirement")
+            self.assertEqual(len(calls), 4)
+            requirement_calls = [query for path, query in calls if path == "api.php/v1/stories"]
+            self.assertTrue(all(query["type"] == "requirement" and query["status"] == "assignedtome" for query in requirement_calls))
+            self.flow.refresh()
+        self.assertEqual(len(calls), 5)
+        self.assertEqual([item["kind"] for item in self.application.items], ["requirement", "requirement", "story", "story", "task", "bug"])
         sync = self.application.snapshot()["items_sync"]
         self.assertEqual(sync["status"], "complete")
-        self.assertEqual(sync["list_requests"], 6)
+        self.assertEqual(sync["list_requests"], 1)
+        self.assertTrue(self.application.items_loads["requirement"]["loaded"])
+        self.assertNotIn("epic", self.application.items_loads)
         self.assertGreaterEqual(sync["elapsed_seconds"], 0)
         self.assertNotIn("Token", str(sync))
 
     def test_failure_keeps_previous_complete_list_and_reports_failed_stage(self):
         previous = deepcopy(self.application.items)
-        with patch.object(self.client, "_fetch", side_effect=[
-                {"story": {"total": 0, "stories": []}, "task": {"total": 0, "tasks": []}, "bug": {"total": 0, "bugs": []}},
-                WorkflowError("需求读取超时")]) as fetch:
+        with patch.object(self.client, "_fetch", side_effect=WorkflowError("需求读取超时")) as fetch:
             with self.assertRaisesRegex(WorkflowError, "需求读取超时"):
-                self.flow.refresh()
+                self.flow.refresh(kind="requirement")
         self.assertEqual(self.application.items, previous)
         self.assertEqual(self.application.items_sync["status"], "failed")
-        self.assertEqual(self.application.items_sync["list_requests"], 2)
-        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(self.application.items_sync["list_requests"], 1)
+        self.assertFalse(self.application.items_loads["requirement"]["loaded"])
+        self.assertEqual(fetch.call_count, 1)
         self.assertFalse(any(b"event: items\n" in packet for _, packet in self.application.events))
 
     def test_connect_logs_in_once_and_uses_the_same_optimized_refresh(self):
@@ -140,13 +147,14 @@ class RefreshFlowChecks(ZentaoRefreshFixture):
             self.flow.connect()
         login.assert_called_once()
         assigned.assert_called_once()
-        self.assertEqual(requirements.call_args.args, (("epic", "requirement"),))
+        self.assertEqual(assigned.call_args.args, (("story", "task", "bug"),))
+        requirements.assert_not_called()
         self.assertTrue(self.application.connected)
         self.assertEqual(self.application.items_sync["status"], "complete")
 
     def test_repeated_refresh_is_rejected_while_request_is_running(self):
         entered, release = Event(), Event()
-        def assigned(**kwargs):
+        def assigned(kinds, **kwargs):
             kwargs["on_progress"]("正在读取研发需求、任务、Bug：第 1 页")
             entered.set()
             release.wait(5)
@@ -164,3 +172,63 @@ class RefreshFlowChecks(ZentaoRefreshFixture):
                 release.set()
                 self.flow.executor.submit(lambda: None).result(timeout=5)
         self.assertEqual(self.application.items_sync["status"], "complete")
+
+    def test_empty_requirement_result_is_cached_until_explicit_refresh(self):
+        with patch.object(self.client, "list_requirements", return_value=[]) as request:
+            self.application.dispatch(self.fixture.request("refresh", data={"kind": "requirement", "force": False}))
+            self.flow.executor.submit(lambda: None).result(timeout=5)
+            cached = self.application.dispatch(self.fixture.request("refresh", data={"kind": "requirement", "force": False}))
+            self.assertTrue(cached["cached"])
+            request.assert_called_once()
+            self.application.dispatch(self.fixture.request("refresh", data={"kind": "requirement"}))
+            self.flow.executor.submit(lambda: None).result(timeout=5)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args.args, (("requirement",),))
+        self.assertTrue(self.application.snapshot()["items_loads"]["requirement"]["loaded"])
+
+    def test_failed_manual_refresh_keeps_cached_kind_and_other_kinds(self):
+        items = [{"kind": "requirement", "id": 7, "project_id": 41, "project_name": "示例项目"}]
+        with patch.object(self.client, "list_requirements", return_value=items):
+            self.flow.refresh(kind="requirement")
+        previous = deepcopy(self.application.items)
+        with patch.object(self.client, "list_requirements", side_effect=WorkflowError("刷新失败")):
+            with self.assertRaisesRegex(WorkflowError, "刷新失败"):
+                self.flow.refresh(kind="requirement")
+        self.assertEqual(self.application.items, previous)
+        self.assertTrue(self.application.items_loads["requirement"]["loaded"])
+        self.assertEqual(self.application.items_loads["requirement"]["status"], "failed")
+
+    def test_unknown_kind_or_invalid_force_does_not_start_work(self):
+        for data in ({"kind": "unknown"}, {"kind": None}, {"kind": []}, {"kind": "epic", "force": "true"}):
+            with self.subTest(data=data), patch.object(self.flow, "refresh") as refresh:
+                with self.assertRaisesRegex(WorkflowError, "工作项分类"):
+                    self.application.dispatch(self.fixture.request("refresh", data=data))
+                refresh.assert_not_called()
+                self.assertIsNone(self.application.busy)
+
+    def test_same_account_reconnect_preserves_cache_but_new_service_starts_unloaded(self):
+        with patch.object(self.client, "list_requirements", return_value=[]):
+            self.flow.refresh(kind="requirement")
+        with patch.object(self.client, "login", return_value={"account": "测试账号"}), \
+                patch.object(self.client, "list_assigned_items", return_value=[]), \
+                patch.object(self.client, "list_requirements") as requirements:
+            self.flow.connect()
+        requirements.assert_not_called()
+        self.assertTrue(self.application.snapshot()["items_loads"]["requirement"]["loaded"])
+        restarted = WebApplication(self.fixture.settings)
+        self.addCleanup(restarted.close)
+        self.assertEqual(restarted.snapshot()["items_loads"], {})
+
+    def test_changing_site_or_account_clears_all_cached_kinds(self):
+        with patch.object(self.client, "list_requirements", return_value=[]):
+            self.flow.refresh(kind="requirement")
+        settings_root = self.fixture.root / "settings-root"
+        (settings_root / "prompts").mkdir(parents=True)
+        data = {"base_url": "http://example.invalid/zentao", "account": "新账号", "password": "模拟密码",
+                "max_fix_rounds": 3, "review_prompt": "模拟审查指令", "model": "示例模型", "reasoning_effort": "high"}
+        with patch("workflow.web.ROOT", settings_root), patch("workflow.web.save_settings"), patch("workflow.web.save_password"):
+            self.application.update_settings(data)
+        self.assertEqual(self.application.items, [])
+        self.assertEqual(self.application.items_loads, {})
+        self.assertIsNone(self.application.items_sync)
+        self.assertFalse(self.application.connected)

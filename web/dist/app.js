@@ -538,6 +538,7 @@ function WorkflowApp() {
   const [selectedItems, setSelectedItems] = useState([]);
   const selectionRequest = useRef("");
   const [filter, setFilter] = useState("all");
+  const requestedItemKinds = useRef(new Set());
   const [query, setQuery] = useState("");
   const [itemProject, setItemProject] = useState("all");
   const [itemPagination, setItemPagination] = useState({ current: 1, pageSize: 10 });
@@ -853,6 +854,7 @@ function WorkflowApp() {
     fetch("/api/bootstrap", { credentials: "same-origin", cache: "no-store" }).then(readResponse).then(data => {
       if (disposed) return;
       if (data.preview_supported !== true) throw new Error("本地服务版本过旧，请停止并重新启动本地服务，再刷新页面。当前服务不支持临时查看资料。");
+      if (!data.items_loads) throw new Error("本地服务版本过旧，请停止并重新启动本地服务，再刷新页面。当前服务不支持按需读取需求。");
       csrf.current = data.csrf_token;
       const saved = sessionStorage.getItem("workflow-session");
       const selectedSessionId = saved === null ? data.default_session_id : saved;
@@ -861,7 +863,7 @@ function WorkflowApp() {
       eventSource.current = events;
       events.onopen = () => setOnline(true);
       events.onerror = () => setOnline(false);
-      for (const kind of ["state", "preview", "items", "items_sync", "connected", "connection", "conversation", "delta", "progress", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
+      for (const kind of ["state", "preview", "items", "items_sync", "items_loads", "connected", "connection", "conversation", "delta", "progress", "operation_error", "questions", "busy", "settings", "snapshot", "session_deleted", "projects"]) {
         events.addEventListener(kind, event => {
           if (disposed) return;
           const value = JSON.parse(event.data);
@@ -885,6 +887,7 @@ function WorkflowApp() {
           else if (kind === "projects") applyModel({ ...current, project_partitions: value.project_partitions });
           else if (kind === "items") applyModel({ ...current, items: value });
           else if (kind === "items_sync") applyModel({ ...current, items_sync: value });
+          else if (kind === "items_loads") applyModel({ ...current, items_loads: value });
           else if (kind === "connected") applyModel({ ...current, connected: true, profile: value });
           else if (kind === "connection") applyModel({ ...current, ...value });
           else if (kind === "busy") {
@@ -945,6 +948,15 @@ function WorkflowApp() {
   }, []);
 
   useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
+  useEffect(() => {
+    if (!model?.connected) requestedItemKinds.current.clear();
+  }, [model?.connected]);
+  useEffect(() => {
+    if (page !== "items" || !["epic", "requirement"].includes(filter) || !model?.connected || stopped ||
+        model.global_busy || requestsPending.global || model.items_loads?.[filter] || requestedItemKinds.current.has(filter)) return;
+    requestedItemKinds.current.add(filter);
+    act("refresh", { kind: filter, force: false });
+  }, [page, filter, model?.connected, model?.global_busy, model?.items_loads, requestsPending.global, stopped]);
   useEffect(() => { setHandoffRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_handoffs?.length]);
   useEffect(() => { setReleaseRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_release_history?.length]);
 
@@ -1148,6 +1160,9 @@ function WorkflowApp() {
   }
 
   function renderItems() {
+    const load = model.items_loads[filter];
+    const sync = filter === "all" ? model.items_sync : load;
+    const unloadedRequirement = ["epic", "requirement"].includes(filter) && !load?.loaded;
     const projects = [...new Map(model.items.map(item => [item.project_id, {
       value: item.project_id, label: itemProjectLabel(item)
     }])).values()];
@@ -1174,9 +1189,17 @@ function WorkflowApp() {
     ];
     const snapshot = selectionMatches ? state?.snapshot : null;
     return h("div", { className: "card-stack" },
-      h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, { onClick: () => act("refresh"), disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表")) },
-        model.items_sync && h(ItemsSyncStatus, { sync: model.items_sync }),
-        h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => { setFilter(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => ({ value, label: `${label} ${model.items.filter(item => item.kind === value).length}` }))] }),
+      h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, {
+        onClick: () => act("refresh", { kind: filter }), title: filter === "all" ? "刷新研发需求、任务和 Bug；保留已加载的业务、用户需求" : "重新读取当前分类",
+        disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表")) },
+        sync && h(ItemsSyncStatus, { sync }),
+        h(Typography.Paragraph, { type: "secondary", style: { marginBottom: 12 } }, "业务、用户需求首次打开时读取，本次服务运行中复用。“全部”汇总已加载分类，刷新时仅更新研发需求、任务和 Bug。"),
+        h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => { setFilter(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => {
+          const entry = model.items_loads[value];
+          const count = ["epic", "requirement"].includes(value) && !entry?.loaded ?
+            entry?.status === "loading" ? "读取中" : entry?.status === "failed" ? "读取失败" : "未加载" : model.items.filter(item => item.kind === value).length;
+          return { value, label: `${label} ${count}` };
+        })] }),
           h(Space, { wrap: true },
             h(Select, { "aria-label": "筛选所属项目", value: itemProject, showSearch: true, optionFilterProp: "label", style: { width: 180 },
               options: [{ value: "all", label: "全部项目" }, ...projects],
@@ -1187,7 +1210,8 @@ function WorkflowApp() {
           ...itemPagination, current: Math.min(itemPagination.current, Math.max(1, Math.ceil(rows.length / itemPagination.pageSize))),
           showSizeChanger: true, pageSizeOptions: [10, 20, 50], showTotal: total => `共 ${total} 项`,
           onChange: (current, pageSize) => setItemPagination({ current: pageSize === itemPagination.pageSize ? current : 1, pageSize }) },
-          scroll: { x: 700 }, locale: { emptyText: model.connected ? "暂无符合条件的待处理工作项" : "连接禅道后显示待处理工作项" }, rowClassName: "item-row",
+          scroll: { x: 700 }, locale: { emptyText: !model.connected ? "连接禅道后显示待处理工作项" : unloadedRequirement ?
+            load?.status === "failed" ? "读取失败，请点击“刷新列表”重试" : load?.status === "loading" ? "正在读取当前分类…" : "尚未读取当前分类" : "暂无符合条件的待处理工作项" }, rowClassName: "item-row",
           rowSelection: { type: "checkbox", selectedRowKeys: selectedItems, preserveSelectedRowKeys: true, hideSelectAll: filter !== "task", onChange: chooseItems,
             getCheckboxProps: () => ({ disabled: selectionDisabled }) },
           onRow: record => ({ onClick: event => {

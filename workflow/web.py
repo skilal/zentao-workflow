@@ -132,6 +132,7 @@ class WebApplication:
         self.csrf_token = token_urlsafe(32)
         self.items = []
         self.items_sync = None
+        self.items_loads = {}
         self.connected = False
         self.profile = None
         self.busy = None
@@ -246,9 +247,19 @@ class WebApplication:
                 self.items = deepcopy(value)
                 self._publish("items", self.items)
                 self._publish("projects", {"project_partitions": self.projects()})
+            elif kind == "items_batch":
+                self.items = [item for item in self.items if item["kind"] not in value["kinds"]] + deepcopy(value["items"])
+                order = list(KINDS)
+                self.items.sort(key=lambda item: (order.index(item["kind"]), item["id"]))
+                self._publish("items", self.items)
+                self._publish("projects", {"project_partitions": self.projects()})
             elif kind == "items_sync":
                 self.items_sync = deepcopy(value)
+                for item_kind in value["kinds"]:
+                    loaded = self.items_loads.get(item_kind, {}).get("loaded", False) or value["status"] == "complete"
+                    self.items_loads[item_kind] = {**deepcopy(value), "loaded": loaded}
                 self._publish("items_sync", self.items_sync)
+                self._publish("items_loads", deepcopy(self.items_loads))
             elif kind == "connected":
                 self.connected, self.profile = True, value
                 self._publish("connected", value)
@@ -296,6 +307,7 @@ class WebApplication:
     def snapshot(self):
         with self.lock:
             return {"preview_supported": True, "items": deepcopy(self.items), "items_sync": deepcopy(self.items_sync), "default_session_id": self.default_session_id,
+                    "items_loads": deepcopy(self.items_loads),
                     "connected": self.connected, "profile": self.profile, "busy": self.busy,
                     "cursor": self.sequence, "settings": self.public_settings(),
                     "project_partitions": self.projects(),
@@ -620,9 +632,11 @@ class WebApplication:
             self.connected, self.profile = False, None
             self.items = []
             self.items_sync = None
+            self.items_loads = {}
             self._publish("settings", self.public_settings())
             self._publish("items", [])
             self._publish("items_sync", None)
+            self._publish("items_loads", {})
             self._publish("connection", {"connected": False})
             self._publish("projects", {"project_partitions": self.projects()})
 
@@ -744,7 +758,16 @@ class WebApplication:
             if action == "connect":
                 operation, arguments, affects = engine.connect, (), False
             elif action == "refresh":
-                operation, arguments, affects = engine.refresh, (), False
+                item_kind, force = data.get("kind", "all"), data.get("force", True)
+                if not isinstance(item_kind, str) or item_kind not in {"all", *KINDS} or type(force) is not bool:
+                    raise WorkflowError("请选择有效的工作项分类和刷新方式。")
+                if item_kind in ("epic", "requirement") and not force and self.items_loads.get(item_kind, {}).get("loaded"):
+                    result = {"accepted": True, "cached": True, "request_id": request_id, "session_id": None}
+                    self.requests[request_key] = result
+                    while len(self.requests) > 512:
+                        self.requests.popitem(last=False)
+                    return result
+                operation, arguments, affects = engine.refresh, (False, item_kind), False
             elif action == "new_conversation":
                 project_id = data.get("project_id", 0)
                 if session_id or preview_id or type(project_id) is not int or project_id < 0:

@@ -184,17 +184,22 @@ class RequirementWorkflowChecks(TestCase):
         self.addCleanup(self.fixture.doCleanups)
         self.application = self.fixture.application
 
-    def test_refresh_publishes_all_kinds_together(self):
+    def test_refresh_loads_quick_items_and_requirement_kinds_separately(self):
         flow = self.application.sessions.connection
         requirements = [{"kind": kind, "id": 7, "title": KINDS[kind][0], "project_id": 41, "project_name": "示例项目"}
                         for kind in ("epic", "requirement")]
         client = self.application.sessions.zentao
-        with patch.object(client, "list_requirements", return_value=requirements) as listed, \
+        with patch.object(client, "list_requirements", side_effect=lambda kinds, **kwargs: [item for item in requirements if item["kind"] in kinds]) as listed, \
                 patch.object(client, "list_assigned_items", return_value=[{"kind": kind, "id": 7, "project_id": 41,
                                                                          "project_name": "示例项目"} for kind in ("story", "task", "bug")]) as other:
             flow.refresh()
-        self.assertEqual(listed.call_args.args, (("epic", "requirement"),))
-        listed.assert_called_once()
+            listed.assert_not_called()
+            self.assertEqual([item["kind"] for item in self.application.items], ["story", "task", "bug"])
+            flow.refresh(kind="requirement")
+            self.assertEqual(listed.call_args.args, (("requirement",),))
+            flow.refresh(kind="epic")
+            self.assertEqual(listed.call_args.args, (("epic",),))
+        self.assertEqual(listed.call_count, 2)
         other.assert_called_once()
         self.assertEqual([item["kind"] for item in self.application.items], list(KINDS))
 
