@@ -7,7 +7,8 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from workflow.change_locations import SUMMARY_INSTRUCTIONS, collect_change_summary
+from workflow import prompt_templates, prompts
+from workflow.change_locations import SUMMARY_INSTRUCTIONS, SUMMARY_POLICY, collect_change_summary
 from workflow.engine import Workflow
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
@@ -140,3 +141,24 @@ class ChangeSummaryChecks(TestCase):
             self.flow._start_turn("继续原阶段")
             prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
             self.assertEqual(SUMMARY_INSTRUCTIONS in prompt, phase in {"review", "followup"})
+            self.assertIn(SUMMARY_POLICY, prompt)
+
+    def test_old_thread_fix_restore_and_answer_replace_legacy_report_requirement(self):
+        self.state["history"].append({"role": "控制器", "text":
+            "实际修改后必须调用 workflow.report_change_locations 登记操作路径。"})
+        self.state["decisions"] = [{"round": 1, "fix_ids": ["R01-01", "R01-02"], "delivery_round": 1}]
+        self.flow.rpc = Mock()
+        self.flow.rpc.model = "模拟模型"
+        self.flow.ensure_rpc = Mock()
+        for text in (prompts.FIX, prompts.RESTORE, prompt_templates.ANSWER_INPUT.format(reply="旧要求已取消，继续修复")):
+            with self.subTest(text=text):
+                self.state["phase"] = "fix"
+                self.flow.rpc.request.return_value = {"turn": {"id": "恢复修复"}}
+                self.flow._start_turn(text)
+                prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
+                self.assertIn(SUMMARY_POLICY, prompt)
+                self.assertNotIn(SUMMARY_INSTRUCTIONS, prompt)
+                self.assertEqual(self.state["decisions"][0]["fix_ids"], ["R01-01", "R01-02"])
+        instructions = thread_parameters(self.state, "模拟模型", {})["developerInstructions"]
+        self.assertIn("此规则替代本线程历史中的", instructions)
+        self.assertIn("缺少整体说明不阻塞修复、审查或提交", instructions)

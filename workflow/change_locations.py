@@ -6,6 +6,15 @@ from workflow.settings import WorkflowError
 
 
 SUMMARY_PHASES = {"review", "followup"}
+SUMMARY_POLICY = (
+    "页面改动说明现行规则（替代本线程历史中的旧要求）："
+    "已废止实际修改后逐次登记操作路径、关联文件和强制报告校验，"
+    "workflow.report_change_locations 已移除，不调用、不要求恢复，也不将其作为实施或修复的前置条件。"
+    "实施、Review 修复及编译修复阶段无需登记；全部修改完成后由 Review 汇总一份页面位置及简短描述，"
+    "关闭自动 Review 的续聊在实际修改结束时汇总，纯问答不更新。"
+    "仅在汇总阶段使用 workflow.set_change_summary；缺少整体说明不阻塞修复、审查或提交。"
+    "此规则更新不改变已有计划、选中修复项及人工授权。"
+)
 SUMMARY_INSTRUCTIONS = (
     "结合本次需求全部已完成改动，按业务页面合并为整体说明，"
     "调用 workflow.set_change_summary(pages)，每项仅含 page（页面或菜单位置）和 description（一句话改动说明）。"

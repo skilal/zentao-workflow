@@ -1,5 +1,7 @@
 """执行端与只读目录共用的固定组装模板，不包含任何会话资料。"""
 
+from workflow.change_locations import SUMMARY_POLICY
+
 SCOPE_CONTINUATION = "本次续接未完成任务，结合 continuation_context、原需求和 followup 消息完成本轮剩余工作；已有代码保留。"
 SCOPE_FOLLOWUP = (
     "原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
@@ -16,7 +18,7 @@ MATERIAL_NAMING = (
     "不带类型、编号、引号或解释，多任务后缀由控制器追加。随后继续计划；命名失败不阻塞、不增加回合或循环重试。"
 )
 TURN = (
-    "当前阶段：{phase}。{scope}\n{text}\n{material_instruction}"
+    "当前阶段：{phase}。{scope}\n{text}\n" + SUMMARY_POLICY + "\n{material_instruction}"
     "需要人工决定时调用 workflow.ask_user 后结束回合，等待明确答复。"
     "以下只包含变化字段，未出现的字段沿用本线程上次值。"
     "\n工作流上下文：\n{context}"
