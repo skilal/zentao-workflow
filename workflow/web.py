@@ -341,6 +341,7 @@ class WebApplication:
                 runtime.engine.store.save(state)
                 runtime.engine.state.update(custom_title=state["custom_title"], updated_at=state["updated_at"])
             self.emit(session_id, "state", runtime.engine.state)
+            runtime.engine.queue_codex_title_sync()
             result = self.session_payload(runtime)
             self.requests[key] = result
             while len(self.requests) > 512:

@@ -365,11 +365,12 @@ class BranchWorkflowChecks(TestCase):
         self.flow.start_plan("业务补充")
         rpc = Mock()
         rpc.model, rpc.disabled_mcp = "示例模型", {}
-        rpc.request.side_effect = lambda method, params: {"thread": {"id": "branch-thread"}} if method == "thread/start" else {"turn": {"id": "branch-turn"}}
+        rpc.request.side_effect = lambda method, params: {"thread/start": {"thread": {"id": "branch-thread"}},
+            "thread/name/set": {}, "turn/start": {"turn": {"id": "branch-turn"}}}[method]
         with patch("workflow.engine.AppServer", return_value=rpc):
             Workflow._start_turn(self.flow, "识别分支", BRANCH_SCHEMA)
         thread_params = rpc.request.call_args_list[0].args[1]
-        turn_params = rpc.request.call_args_list[1].args[1]
+        turn_params = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "turn/start")
         self.assertFalse(thread_params["config"]["mcp_servers"]["workflow"]["enabled"])
         self.assertEqual(Path(turn_params["cwd"]).name, self.flow.state["id"])
         self.assertEqual([entry["type"] for entry in turn_params["input"]], ["text"])
@@ -398,12 +399,15 @@ class BranchWorkflowChecks(TestCase):
         self.flow.start_plan("")
         rpc = Mock()
         rpc.model, rpc.disabled_mcp = "示例模型", {}
-        rpc.request.side_effect = lambda method, params: {"thread": {"id": "模拟会话"}} if method == "thread/start" else {"turn": {"id": "模拟轮次"}}
+        rpc.request.side_effect = lambda method, params: {
+            "thread/start": {"thread": {"id": "模拟会话"}}, "thread/resume": {"thread": {"id": "模拟会话"}},
+            "thread/name/set": {}, "turn/start": {"turn": {"id": "模拟轮次"}}}[method]
         with patch("workflow.engine.AppServer", return_value=rpc):
             for phase in ("branch", "plan"):
                 state["phase"] = phase
                 Workflow._start_turn(self.flow, "读取全部任务")
-                text = rpc.request.call_args.args[1]["input"][0]["text"]
+                turn_params = next(call.args[1] for call in reversed(rpc.request.call_args_list) if call.args[0] == "turn/start")
+                text = turn_params["input"][0]["text"]
                 self.assertIn('"items":', text)
                 self.assertIn("示例后端任务", text)
                 self.assertIn("示例前端任务", text)

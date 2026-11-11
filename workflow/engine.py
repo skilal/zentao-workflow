@@ -19,6 +19,7 @@ from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_re
 from workflow.baseline import BaselineFlow
 from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
 from workflow.compile_checks import compile_context, compile_repositories
+from workflow.codex_titles import CodexTitleFlow
 from workflow.change_locations import SUMMARY_PHASES, SUMMARY_INSTRUCTIONS, collect_change_summary
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import apply_followup_replacements, validate_review_request
@@ -112,7 +113,7 @@ def skipped_review_ids(state, delivery_round):
     return skipped
 
 
-class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow):
+class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow, CodexTitleFlow):
     active_stages = ACTIVE
 
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
@@ -127,6 +128,8 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         self.lock = RLock()
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.control_executor = ThreadPoolExecutor(max_workers=1)
+        self.title_executor = ThreadPoolExecutor(max_workers=1)
+        self.title_sync_pending = False
         self.output = {}
         self.plan_stream = ""
         self.completed_plan = ""
@@ -182,6 +185,7 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
                 collect_session_title(self.store, self.state)
                 self.store.save(self.state)
             self.emit("state", loads(dumps(self.state, ensure_ascii=False)))
+            self.queue_codex_title_sync()
 
     def note(self, role, text, **metadata):
         self.store.append(self.state, role, text, **metadata)
@@ -688,13 +692,16 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
                 params = thread_parameters(self.state, self.rpc.model, self.rpc.disabled_mcp)
                 params.update(threadId=self.state["thread_id"], excludeTurns=True)
                 try:
-                    self.rpc.request("thread/resume", params)
+                    data = self.rpc.request("thread/resume", params)
                 except Exception:
                     self._close_rpc()
                     raise
             else:
                 data = self.rpc.request("thread/start", thread_parameters(self.state, self.rpc.model, self.rpc.disabled_mcp))
                 self.state["thread_id"] = data["thread"]["id"]
+            if "codex_title_sync" in self.state:
+                with self.store.lock:
+                    self.state["codex_title_sync"]["threads"][self.state["thread_id"]] = data["thread"].get("name") or ""
             self.state["rpc_connected"] = True
             self.save()
 
@@ -1183,6 +1190,9 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         method, params = message["method"], message.get("params", {})
         if not self.state:
             return
+        if method == "thread/name/updated":
+            self.codex_title_event(params)
+            return
         if params.get("threadId") and self.state.get("thread_id") and params["threadId"] != self.state["thread_id"]:
             return
         if params.get("turnId") and self.state.get("turn_id") and params["turnId"] != self.state["turn_id"]:
@@ -1411,6 +1421,7 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         finally:
             self.executor.shutdown(wait=True, cancel_futures=True)
             self.control_executor.shutdown(wait=True, cancel_futures=True)
+            self.title_executor.shutdown(wait=True, cancel_futures=True)
             if self.state:
                 self.state["rpc_connected"] = False
                 collect_artifacts(self.store, self.state)

@@ -20,7 +20,7 @@ from workflow.gitops import cleanup_workspaces, commit, git, prepare, worktrees
 from workflow.mcp_server import TOOLS, Tools as RawTools
 from review_fixtures import VersionedTools as Tools, scoped_result
 from workflow.settings import ROOT, WorkflowError
-from workflow.store import write_authorized
+from workflow.store import session_title, write_authorized
 from workflow.web import WebApplication, public_state
 
 
@@ -776,6 +776,7 @@ class FollowupChecks(TestCase):
         rpc.process.poll.return_value = None
         rpc.model = "模拟模型"
         rpc.disabled_mcp = {}
+        rpc.request.return_value = {"thread": {"id": "原需求线程", "name": "工作流会话 · " + session_title(self.state)}}
         with patch("workflow.engine.AppServer", return_value=rpc):
             self.engine.ensure_rpc()
         self.assertEqual(rpc.request.call_args.args[0], "thread/resume")

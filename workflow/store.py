@@ -110,6 +110,7 @@ def initial_state(item, record_id):
         "id": record_id, "item": item, "items": [item] if item is not None else [], "custom_title": "", "stage": "资料已读取", "phase": "plan",
         "updated_at": timestamp(), "repos": [],
         "thread_id": None, "turn_id": None, "plan": "", "plan_hash": "",
+        "codex_title_sync": {"threads": {}, "error": ""},
         "approved_plan": "", "approved_hash": "", "supplement": "", "supplement_images": [],
         "plan_round": None, "approval_source": "",
         "pending": None, "history": [], "reviews": [], "decisions": [], "compile_checks": [], "artifacts": [],

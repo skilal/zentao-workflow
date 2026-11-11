@@ -187,14 +187,16 @@ class ModelSessionChecks(TestCase):
             rpc.disabled_mcp = {}
             rpc.request.return_value = {"thread": {"id": "模拟线程"}}
             engine.ensure_rpc()
+            engine.title_executor.submit(lambda: None).result(timeout=3)
             rpc.start.assert_called_once_with("model-a")
-            self.assertEqual(rpc.request.call_args.args[0], "thread/start")
-            self.assertIn("set_change_summary", rpc.request.call_args.args[1]["config"]["mcp_servers"]["workflow"]["enabled_tools"])
+            created = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "thread/start")
+            self.assertIn("set_change_summary", created["config"]["mcp_servers"]["workflow"]["enabled_tools"])
             engine.rpc = None
             engine.ensure_rpc()
-            self.assertEqual(rpc.request.call_args.args[0], "thread/resume")
-            self.assertIn("set_change_summary", rpc.request.call_args.args[1]["config"]["mcp_servers"]["workflow"]["enabled_tools"])
-            self.assertEqual(rpc.request.call_args.args[1]["model"], "model-a")
+            engine.title_executor.submit(lambda: None).result(timeout=3)
+            resumed = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "thread/resume")
+            self.assertIn("set_change_summary", resumed["config"]["mcp_servers"]["workflow"]["enabled_tools"])
+            self.assertEqual(resumed["model"], "model-a")
             engine.rpc = None
 
     def test_legacy_requires_explicit_choice_and_saved_choice_cannot_be_overridden(self):
