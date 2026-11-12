@@ -23,6 +23,12 @@ const PAGES = {
 };
 
 function itemKey(item) { return item ? `${item.kind}:${item.id}` : ""; }
+function sendOnEnter(event, canSend, send) {
+  if (event.key !== "Enter" || event.shiftKey || event.ctrlKey || event.altKey || event.metaKey ||
+      event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+  event.preventDefault();
+  if (canSend && !event.repeat) send();
+}
 function sessionItems(state) { return state.items || [state.item]; }
 function itemLabel(state) { return sessionItems(state).map(item => `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`).join("；") || state.title || "新会话"; }
 function timeLabel(value) { return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : ""; }
@@ -1316,6 +1322,8 @@ function WorkflowApp() {
     const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy && !state.workspace_reuse_request;
     const repositories = state.branch_resolution?.repositories || [];
     const checkout = state.checkout_request;
+    const canStartPlan = editable && (!checkout || ["waiting", "restored"].includes(checkout.status)) && !transfers.length &&
+      Boolean(state.codex || sessionSelection) && (state.item !== null || Boolean(draft.supplement.trim() || state.supplement_images.length));
     const reuse = state.workspace_reuse_request;
     const canReuse = !state.prepare_complete && ["plan", "followup"].includes(state.phase) &&
       ["准备工作区失败", "已停止", "已暂停"].includes(stage) && !state.pending && !state.manual_compile &&
@@ -1414,7 +1422,9 @@ function WorkflowApp() {
         h(CardBox, { title: state.item === null ? "输入需求与验收标准" : "补充需求与验收标准" },
           h("div", { onPaste: supplementEditable ? pasteImages : undefined },
             h(Input.TextArea, { value: draft.supplement, rows: 6, disabled: !supplementEditable,
+              onKeyDown: event => sendOnEnter(event, canStartPlan, startPlan),
               placeholder: state.item === null ? "直接输入需求、问题或修改要求，可粘贴截图或图片，无需关联工作项…" : "补充业务规则、验收标准，可在此粘贴截图或图片…", onChange: event => changeDraft({ supplement: event.target.value }) }),
+            h(Typography.Text, { type: "secondary" }, "Enter 发送，Shift+Enter 换行"),
             h("div", { className: "supplement-image-tools" },
               h("input", { type: "file", ref: imageInput, hidden: true, multiple: true, accept: ".png,.jpg,.jpeg,.gif,.webp,.bmp", onChange: event => {
                 addImages(event.target.files); event.target.value = "";
@@ -1448,8 +1458,7 @@ function WorkflowApp() {
               onChange: event => changeDraft({ compile_check_enabled: event.target.checked }) }, "Review 前自动检查后端编译"),
             h(Typography.Text, { type: "secondary" }, "仅检查有改动的后端模块；前端继续 Review。需要下载依赖时等待人工选择。")),
           ["资料已读取", "准备工作区失败"].includes(stage) && h("div", { className: "data-foot" }, h("span", { className: "muted" }, "开始后固定模型与推理强度；已有改动保留且不提交"),
-            h(Button, { type: "primary", size: "large", disabled: !editable || (checkout && !["waiting", "restored"].includes(checkout.status)) || transfers.length > 0 || (!state.codex && !sessionSelection) ||
-              (state.item === null && !draft.supplement.trim() && !state.supplement_images.length), onClick: startPlan }, stage === "准备工作区失败" ? "重新准备工作区并继续" : state.item === null ? "发送并开始计划" : "开始需求分析与计划"))));
+            h(Button, { type: "primary", size: "large", disabled: !canStartPlan, onClick: startPlan }, stage === "准备工作区失败" ? "重新准备工作区并继续" : state.item === null ? "发送并开始计划" : "开始需求分析与计划"))));
   }
 
   function renderFeedbackImages(images, editable = false, purpose = "followup") {
@@ -1525,6 +1534,7 @@ function WorkflowApp() {
     });
     const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
+    const canSend = canAnswer && answersComplete && !answerTransfers.length && (!continuing || !transfers.length);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
     const entries = [...state.history.map((entry, index) => ({ ...entry, index })),
       ...(state.progress_turns || []).map(turn => ({ process: turn, index: turn.history_index }))]
@@ -1623,8 +1633,10 @@ function WorkflowApp() {
             h(Tooltip, { title: "支持 PDF、Word、文本、图片及 ZIP；ZIP 仅读取目录与 XML" },
               h(Typography.Text, { type: "secondary", className: "muted" }, `可多选或粘贴，单个 ≤ ${model.settings.max_attachment_mb} MB`))),
           h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer,
+            onKeyDown: event => sendOnEnter(event, canSend, answer),
             onPaste: continuing && followupEditable ? event => pasteImages(event, "followup") : undefined,
             placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片和文件…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
+          h(Typography.Text, { type: "secondary" }, "Enter 发送，Shift+Enter 换行"),
           continuing && h(React.Fragment, null,
             renderFeedbackImages(state.followup_images.filter(image => image.history_index === undefined), followupEditable),
             renderFollowupFiles(state.followup_attachments.filter(entry => entry.history_index === undefined), followupEditable),
@@ -1641,7 +1653,7 @@ function WorkflowApp() {
               h(Tooltip, { title: "检查后端并修复相关问题" }, h("label", { className: "followup-option" },
                 h(Switch, { size: "small", checked: draft.followup_compile_enabled, disabled: !followupEditable, "aria-label": "本轮后端编译检查", onChange: checked => changeDraft({ followup_compile_enabled: checked }) }),
                 h("span", null, "后端检查")))),
-            h(Button, { type: "primary", disabled: !canAnswer || !answersComplete || answerTransfers.length > 0 || (continuing && transfers.length > 0), onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明"))),
+            h(Button, { type: "primary", disabled: !canSend, onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明"))),
         h(CardBox, { title: "流程操作" }, h(Space, { wrap: true },
           h(Button, { disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
