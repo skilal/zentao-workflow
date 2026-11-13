@@ -11,6 +11,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from workflow.gitops import acquire_workspace, cleanup_workspaces, commit, ensure_baseline, git, manifest, repository_lock
+from workflow.delivery import previous_task_changes, validate_review_request
 from workflow.mcp_server import Tools
 from workflow.settings import WorkflowError
 from workflow.shared_changes import candidates, initialize, load_record, select_scope, snapshot_review
@@ -172,15 +173,83 @@ class SharedWorkspaceChecks(TestCase):
         commit(self.first["repos"][0], "refactor(共享): 替换重复行", self.review(self.first))
         self.assertEqual(git(self.path, "show", "HEAD:共享.txt"), "本轮新内容")
 
-    def test_overlapping_edit_and_foreign_scope_are_rejected(self):
+    def test_overlapping_edit_is_reviewed_and_committed_with_unrelated_changes_preserved(self):
         self.replace(self.first, "共享.txt", "原始第3行", "甲需求")
-        with self.assertRaisesRegex(WorkflowError, "其他会话重叠"):
-            self.replace(self.second, "共享.txt", "甲需求", "乙需求")
+        self.replace(self.first, "共享.txt", "原始第12行", "甲独立需求")
+        self.replace(self.second, "共享.txt", "甲需求", "乙需求")
         repo = self.second["repos"][0]
+        fragments = candidates(repo)
+        own = next(entry for entry in fragments if "乙需求" in entry["new"])
+        self.assertEqual(own["source"], "本轮")
+        self.assertIn("前端/共享.txt", manifest([repo]))
+        working = (self.path / "共享.txt").read_bytes()
+        committed = commit(repo, "fix(共享): 接续修改", self.review(self.second))
+        text = git(self.path, "show", committed + ":共享.txt")
+        self.assertIn("乙需求", text)
+        self.assertNotIn("甲独立需求", text)
+        self.assertEqual((self.path / "共享.txt").read_bytes(), working)
+
+    def test_foreign_fragment_can_be_included_after_review(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "甲需求")
+        repo = self.second["repos"][0]
+        self.assertEqual(manifest([repo]), {})
+        foreign = candidates(repo)[0]
+        self.assertEqual(foreign["source"], "其他会话")
+        fingerprint = self.review(self.second, [foreign["id"]])
+        committed = commit(repo, "fix(共享): 纳入相关修改", fingerprint)
+        self.assertIn("甲需求", git(self.path, "show", committed + ":共享.txt"))
+
+    def test_overlap_sources_are_retained_and_require_scope_selection(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "甲需求")
+        tool = Tools(self.second["id"])
+        current = tool.call("read_file", {"repository": "前端", "path": "共享.txt"})
+        tool.call("delete_file", {"repository": "前端", "path": "共享.txt", "expected_version": current["version"]})
+        repo = self.second["repos"][0]
+        fragment = candidates(repo)[0]
+        self.assertEqual(fragment["source"], "本轮")
+        self.assertEqual(set(fragment["owners"]), {self.first["id"], self.second["id"]})
         snapshot_review(repo)
-        foreign = candidates(repo)[0]["id"]
-        with self.assertRaisesRegex(WorkflowError, "其他会话"):
-            select_scope([repo], [{"repository": "前端", "include": [foreign], "exclude": []}])
+        with self.assertRaisesRegex(WorkflowError, "本轮修改片段遗漏"):
+            select_scope([repo], [{"repository": "前端", "include": [], "exclude": []}])
+        committed = commit(repo, "fix(共享): 删除相关文件", self.review(self.second))
+        self.assertEqual(git(self.path, "ls-tree", "--name-only", committed, "--", "共享.txt"), "")
+
+    def test_committed_foreign_history_does_not_block_latest_version_write(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "甲需求")
+        commit(self.first["repos"][0], "fix(共享): 完成甲需求", self.review(self.first))
+        tool = Tools(self.second["id"])
+        current = tool.call("read_file", {"repository": "前端", "path": "共享.txt"})
+        tool.call("write_file", {"repository": "前端", "path": "共享.txt", "expected_version": current["version"],
+                                 "content": self.original.replace("原始第3行", "乙需求")})
+        committed = commit(self.second["repos"][0], "fix(共享): 接续已提交代码", self.review(self.second))
+        self.assertIn("乙需求", git(self.path, "show", committed + ":共享.txt"))
+
+    def test_historical_review_request_keeps_foreign_sources_available(self):
+        name = "共同新增.txt"
+        Tools(self.first["id"]).call("write_file", {"repository": "前端", "path": name,
+            "content": "甲需求\n", "expected_version": "missing"})
+        self.replace(self.second, name, "甲需求\n", "甲需求\n乙需求\n")
+        self.second["delivery_round"] = 2
+        repo = self.second["repos"][0]
+        repo.pop("change_record")
+        initialize(self.store, self.second, repo)
+        followup_scope = dumps(["重新审查并提交", []], ensure_ascii=False)
+        self.second.update(phase="followup", stage="续聊处理中", approval_source="followup",
+                           followup={"history_index": 0, "request_id": "历史审查", "text": "重新审查并提交", "images": [],
+                                     "authorization_hash": sha256(followup_scope.encode()).hexdigest()},
+                           history=[{"role": "用户", "text": "重新审查并提交"}])
+        self.assertEqual(candidates(repo)[0]["source"], "归属重叠")
+        self.assertEqual(previous_task_changes(self.second), [
+            {"repository": "前端", "path": name, "unchanged": True}])
+        request = validate_review_request(self.second, {"instruction": "重新审查并提交", "commit_message": "",
+            "include_paths": [{"repository": "前端", "path": name}]})
+        repo["review_paths"] = [name]
+        self.assertEqual(manifest([repo]), request["included_manifest"])
+        snapshot_review(repo)
+        with self.assertRaisesRegex(WorkflowError, "本轮修改片段遗漏"):
+            select_scope([repo], [{"repository": "前端", "include": [], "exclude": []}])
+        committed = commit(repo, "fix(共享): 纳入历史接续修改", self.review(self.second, [candidates(repo)[0]["id"]]))
+        self.assertIn("乙需求", git(self.path, "show", committed + ":" + name))
 
     def test_manual_changes_can_be_selected_after_review(self):
         (self.path / "甲.txt").write_text(self.original.replace("原始第3行", "人工修复"), encoding="utf-8")
@@ -282,13 +351,18 @@ class SharedWorkspaceChecks(TestCase):
         self.assertNotIn("乙需求", git(self.path, "show", "HEAD:共享.txt"))
         self.assertIn("乙需求", (self.path / "共享.txt").read_text(encoding="utf-8"))
 
-    def test_manual_fragment_cannot_be_claimed_by_two_sessions(self):
+    def test_claimed_fragment_can_be_reviewed_by_another_session_but_cannot_be_committed_twice(self):
         (self.path / "甲.txt").write_text("人工修复\n", encoding="utf-8")
         identifier = candidates(self.first["repos"][0])[0]["id"]
         snapshot_review(self.second["repos"][0])
-        self.review(self.first, [identifier])
-        with self.assertRaisesRegex(WorkflowError, "其他会话"):
-            select_scope(self.second["repos"], [{"repository": "前端", "include": [identifier], "exclude": []}])
+        first = self.review(self.first, [identifier])
+        second = select_scope(self.second["repos"], [{"repository": "前端", "include": [identifier], "exclude": []}])
+        self.assertEqual(first, second)
+        commit(self.first["repos"][0], "fix(共享): 纳入人工修复", first)
+        head = git(self.path, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(WorkflowError, "已变化|已被提交"):
+            commit(self.second["repos"][0], "fix(共享): 不重复提交", second)
+        self.assertEqual(git(self.path, "rev-parse", "HEAD"), head)
 
     def test_staged_overlap_stops_before_commit_and_preserves_worktree(self):
         file = self.path / "共享.txt"

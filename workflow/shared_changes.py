@@ -204,6 +204,9 @@ def candidates(repo, paths=None):
             signature = digest([relative, old, new])
             context = [after[max(0, c - 2):c], after[d:d + 2]]
             origin = set().union(*(owners.get(index, ()) for index in range(c, d))) if c != d else deleted[(old, c)]
+            if after_data is None:
+                # 整文件删除前可能已有接续修改，不能只按 HEAD 原文匹配删除记录。
+                origin.update(owner for ownership in deleted.values() for owner in ownership)
             if c == d:
                 for first, last, start, end in replacement_windows:
                     if first <= a < b <= last:
@@ -220,7 +223,8 @@ def candidates(repo, paths=None):
                                      for _, other_record in records if identifier in other_record.get("excluded_claims", []))
             sessions = {owner.rsplit("#", 1)[0] for owner in origin}
             source = "本轮" if record["session"] + "#" + str(record["round"]) in origin else "历史任务" if sessions == {record["session"]} else "其他会话" if origin else "待判断"
-            if len(sessions) > 1:
+            # 本轮接续修改仍进入审查，来源会话保留在 owners 中。
+            if source != "本轮" and len(sessions) > 1:
                 source = "归属重叠"
             result.append({"id": identifier, "path": relative, "old_start": a, "old_end": b,
                            "new_start": c, "new_end": d, "old": old, "new": new, "mode": mode,
@@ -238,13 +242,12 @@ def own_fragments(repo, fragments=None):
             raise WorkflowError("本轮已审查差异已变化或已被提交，请重新 Review。")
         return [lookup[identifier] for identifier in selected]
     return [fragment for fragment in fragments if fragment["source"] == "本轮"
-            or (fragment["path"] in repo.get("review_paths", []) and fragment["source"] in {"历史任务", "待判断"})]
+            or fragment["path"] in repo.get("review_paths", [])]
 
 
 def requested_manifest(repo, paths):
     fragments = candidates(repo)
-    selected = [fragment["id"] for fragment in fragments if fragment["path"] in paths
-                and fragment["source"] not in {"其他会话", "归属重叠"}]
+    selected = [fragment["id"] for fragment in fragments if fragment["path"] in paths]
     return fragment_manifest({**repo, "commit_scope": selected}, fragments)
 
 
@@ -314,22 +317,6 @@ def record_write(repo, relative, before, after):
     save_record(repo["change_record"], record)
 
 
-def check_overlap(repo, relative, before, after):
-    record, records = journals(repo)
-    original, updated = lines(before), lines(after)
-    owners, deleted = line_owners(relative, original, records)
-    claimed = candidates(repo, {relative}) if any(other["session"] != record["session"] and other.get("scope_claims")
-                                                for _, other in records) else []
-    for a, b, c, d in edits(original, updated):
-        foreign = set().union(*(owners[index] for index in range(a, b))) if a != b else set()
-        if {owner.rsplit("#", 1)[0] for owner in foreign} - {record["session"]}:
-            raise WorkflowError(f"修改片段与其他会话重叠，请先明确处理归属：{relative}")
-        for fragment in claimed:
-            if (fragment["path"] == relative and set(fragment["owners"]) - {record["session"]}
-                    and max(a, fragment["new_start"]) < min(b, fragment["new_end"])):
-                raise WorkflowError(f"修改片段与其他会话已确认范围重叠：{relative}")
-
-
 def changes(repo):
     with repository_lock(repo["path"]):
         fragments = candidates(repo)
@@ -342,7 +329,7 @@ def changes(repo):
                           for fragment in owned)
         return {"repository": repo["name"], "baseline": record["head"], "stat": f"本轮 {len(owned)} 个片段；候选 {len(fragments)} 个片段",
                 "patch": patch, "fragments": summaries, "untracked": sorted({f["path"] for f in owned if f["kind"] == "新增"}),
-                "note": "片段编号用于 commit_scope；待判断片段按需用 changes(fragment_ids) 阅读，其他会话片段不能纳入。"}
+                "note": "片段编号用于 commit_scope；来源仅供核对，相关片段经 Review 确认可纳入，无关改动须排除。"}
 
 
 def fragment_details(repo, identifiers):
@@ -376,7 +363,7 @@ def select_locked_scope(repositories, selections):
                 or set(included) & set(excluded) or any(not reason.strip() for reason in excluded.values())):
             raise WorkflowError("提交片段重复、状态冲突或缺少排除原因。")
         own = {identifier for identifier, fragment in frozen.items() if fragment["source"] == "本轮"
-               or (fragment["path"] in repo.get("review_paths", []) and fragment["source"] in {"历史任务", "待判断"})}
+               or fragment["path"] in repo.get("review_paths", [])}
         if not own.issubset(set(included) | set(excluded)):
             raise WorkflowError("本轮修改片段遗漏，请明确纳入或说明排除原因。")
         for identifier in [*included, *excluded]:
@@ -384,8 +371,6 @@ def select_locked_scope(repositories, selections):
                 raise WorkflowError("Review 使用了失效或未知的差异片段。")
             if identifier in included:
                 entry = current[identifier]
-                if entry["source"] in {"其他会话", "归属重叠"}:
-                    raise WorkflowError("不能提交其他会话或归属重叠的差异片段。")
                 if entry["context"] != frozen[identifier]["context"]:
                     raise WorkflowError("Review 期间相关代码上下文已变化，请重新 Review。")
         review_reads_valid(repo)

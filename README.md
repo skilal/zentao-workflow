@@ -211,8 +211,8 @@ Codex 官方协议参考：[App Server](https://learn.chatgpt.com/docs/app-serve
 
 ### 共享工作区与分片提交
 
-每轮保存开始 HEAD、初始差异和暂存状态，MCP 写入独立记录修改前后内容。read_file/read_files 返回 version；write_file/replace_text/delete_file 的 expected_version 使用最近读取或保存返回的版本，新文件使用 missing。版本变化须重读后修改，不能覆盖其他会话。
+每轮保存开始 HEAD、初始差异和暂存状态，MCP 写入独立记录修改前后内容。read_file/read_files 返回 version；write_file/replace_text/delete_file 的 expected_version 使用最近读取或保存返回的版本，新文件使用 missing。版本变化须重读后修改，防止覆盖读取后发生的新修改；读取最新版本后可按本轮授权接续修改其他会话涉及的代码，不再按跨会话归属拦截，也不要求额外交接确认。
 
-Review 沿用现有流程，changes 返回差异片段编号和归属；fragment_ids 可按需读取片段正文。AI 按需求、修改记录及历史判断本轮范围，通过 commit_scope 逐仓库列出 include 和带原因的 exclude；人工及历史修改可核对后纳入，其他会话片段不得认领。控制器以临时索引提交确认片段，同文件的其他修改、人工暂存与未暂存内容保持。共享目录的 HEAD 快进不会单独使会话失效，本轮片段及审查上下文变化仍要求重新 Review。
+Review 沿用现有流程，changes 返回差异片段编号和来源；fragment_ids 可按需读取片段正文。本轮实际修改的片段正常进入审查，同时保留涉及的来源会话记录。AI 按需求、修改记录及历史判断本轮范围，通过 commit_scope 逐仓库列出 include 和带原因的 exclude；人工、历史、其他会话及归属重叠的相关片段均可审查后纳入，无关改动仍须排除。本轮及明确请求审查的片段必须纳入或说明排除原因。控制器以临时索引提交确认片段，同文件无关修改、人工暂存与未暂存内容保持。共享目录的 HEAD 快进不会单独使会话失效，本轮片段及审查上下文变化仍要求重新 Review。
 
 新 Review 使用协议 3；历史结果保持可读，旧审查不能作为共享分片提交授权。提交失败停止，由人工核对后继续，不自动重试或 push。运行中固定 Review 正文保持冻结，内置阶段指令统一精简，用户自定义正文不自动改写。

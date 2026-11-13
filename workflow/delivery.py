@@ -16,8 +16,7 @@ def previous_task_changes(state):
         if repository.get("change_record"):
             from workflow.shared_changes import candidates as current_fragments, file_version, journals
             current, records = journals(repository)
-            eligible = {entry["path"] for entry in current_fragments(repository)
-                        if entry["source"] not in {"其他会话", "归属重叠"}}
+            eligible = {entry["path"] for entry in current_fragments(repository)}
             historical = {}
             for other, record in sorted(records, key=lambda item: item[1]["round"]):
                 if record["session"] == current["session"] and record["round"] < current["round"]:
@@ -43,8 +42,7 @@ def previous_task_changes(state):
     for repository in state["repos"]:
         if repository.get("change_record"):
             from workflow.shared_changes import candidates as current_fragments
-            eligible = {entry["path"] for entry in current_fragments(repository)
-                        if entry["source"] not in {"其他会话", "归属重叠"}}
+            eligible = {entry["path"] for entry in current_fragments(repository)}
             known = {(entry["repository"], entry["path"]) for entry in shared_candidates}
             prefix = repository["name"] + "/"
             for key, version in recorded.items():

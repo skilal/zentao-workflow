@@ -15,7 +15,7 @@ from workflow.context import context_hash, requirement_context
 from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
 from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, repository_lock, safe_file
-from workflow.shared_changes import (check_overlap, file_version, fragment_details, load_record, read_blob,
+from workflow.shared_changes import (file_version, fragment_details, load_record, read_blob,
                                      record_write, remember_read, validate_write)
 from workflow.settings import WorkflowError, load_settings
 from workflow.session_titles import register_session_title, title_generation_context
@@ -283,8 +283,6 @@ class Tools:
             if not path.is_file():
                 raise WorkflowError("删除目标不是普通文件。")
             before = path.read_bytes()
-            if repository.get("change_record"):
-                check_overlap(repository, relative, before, None)
             path.unlink()
             if repository.get("change_record"):
                 record_write(repository, relative, before, None)
@@ -307,8 +305,6 @@ class Tools:
         if len(text.encode("utf-8")) > 4 * 1024 * 1024:
             raise WorkflowError("写入内容超出单文件上限。")
         before = path.read_bytes() if path.is_file() else None
-        if repository.get("change_record"):
-            check_overlap(repository, relative, before, text.encode("utf-8"))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="")
         if repository.get("change_record"):
