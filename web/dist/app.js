@@ -232,6 +232,18 @@ function CodexSelection({ value, onChange, onReady, disabled }) {
     !loading && !error && catalog?.models.length === 0 && h(Alert, { type: "warning", showIcon: true, message: "本机 Codex 未返回可用模型，请检查账号后刷新列表。" }),
     !loading && current && value.reasoning_effort && !valid && h(Alert, { type: "warning", showIcon: true, message: "当前模型不支持已选推理强度，请重新选择。" }));
 }
+function SessionCodexSettings({ selection, busy, onSave, onClose }) {
+  const [value, setValue] = useState(selection);
+  const [ready, setReady] = useState(null);
+  return h(Modal, { title: "更改会话模型", open: true, width: "min(640px, calc(100vw - 32px))",
+    maskClosable: false, onCancel: onClose, footer: h(Space, null,
+      h(Button, { "aria-label": "取消", disabled: busy, onClick: onClose }, "取消"),
+      h(Button, { type: "primary", disabled: busy || !ready, onClick: async () => {
+        if (await onSave(ready)) onClose();
+      } }, "保存会话模型配置")) },
+    h(Typography.Paragraph, { type: "secondary" }, "仅更改当前会话，从下一次模型调用生效；保留原对话、计划和工作区。执行中请先暂停并等待当前操作结束。"),
+    h(CodexSelection, { value, onChange: setValue, onReady: setReady, disabled: busy }));
+}
 function projectCatalog(model) {
   const projects = new Map((model.project_partitions || []).map(project => [project.id, { ...project }]));
   for (const entry of model.history) {
@@ -567,6 +579,7 @@ function WorkflowApp() {
   const settingsEffort = Form.useWatch("reasoning_effort", settingsForm);
   const [settingsSelection, setSettingsSelection] = useState(null);
   const [sessionSelection, setSessionSelection] = useState(null);
+  const [codexEditor, setCodexEditor] = useState(null);
   const feedRef = useRef(null);
   const followBottom = useRef(true);
   const renderTimer = useRef(null);
@@ -989,6 +1002,7 @@ function WorkflowApp() {
   }, [state?.id, answerRequestId]);
   const workspaceBusy = Boolean(stopped || sending || model?.busy || (stage === "已暂停" && model?.working) || state?.cleanup?.removed?.length || state?.cleanup?.finalizing || imagesUploading);
   const busy = workspaceBusy || Boolean(state?.workspaces_released);
+  const codexBusy = busy || Boolean(model?.working) || ACTIVE.has(stage) || stage === "资料读取中" || Boolean(state?.workspace_handoff_request);
   const canPause = ACTIVE.has(stage) || ["等待人工回答", "等待计划补充", "等待计划确认", "等待修复选择", "等待编译选择"].includes(stage);
   const selectedKey = selectedItems.join("|");
   const loadedKey = state ? sessionItems(state).map(itemKey).join("|") : "";
@@ -996,6 +1010,7 @@ function WorkflowApp() {
   useEffect(() => {
     if (!state || state.id === lastSession.current) return;
     lastSession.current = state.id;
+    setCodexEditor(null);
     selectionRequest.current = "";
     const itemKeys = sessionItems(state).map(itemKey);
     const saved = model.selectedSessionId ? sessionStorage.getItem(`workflow-draft:${state.id}`) : null;
@@ -1033,7 +1048,7 @@ function WorkflowApp() {
     }
   }, [model?.settings]);
 
-  async function act(action, data = {}, targetId = modelRef.current.selectedSessionId) {
+  async function act(action, data = {}, targetId = modelRef.current.selectedSessionId, revision) {
     const current = modelRef.current;
     const id = ["connect", "refresh", "settings", "new_conversation"].includes(action) ? null : targetId;
     const previewId = !id && ["collect", "plan"].includes(action) ? current.preview?.preview_id : null;
@@ -1044,7 +1059,7 @@ function WorkflowApp() {
       const result = await fetch("/api/actions", { method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
         body: JSON.stringify({ action, data, request_id: crypto.randomUUID(), session_id: id,
-          preview_id: previewId, revision: previewId ? current.preview.revision : current.sessions[id]?.revision }) }).then(readResponse);
+          preview_id: previewId, revision: revision ?? (previewId ? current.preview.revision : current.sessions[id]?.revision) }) }).then(readResponse);
       if (["collect", "new_conversation"].includes(action) && !id && epoch === viewEpoch.current) {
         if (!previewId) changeDraft({ codex: { model: current.settings.model, reasoning_effort: current.settings.reasoning_effort } });
         lastSession.current = result.preview_id;
@@ -1938,7 +1953,10 @@ function WorkflowApp() {
           h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h("div", { className: workPage ? "session-workspace" : "" }, workPage && renderSessions(), h("div", { className: "session-content" },
           workPage && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
-            h("div", { className: "workflow-strip-actions" }, stageTag(stage), hasProjectInfo && projectInfoHidden &&
+            h("div", { className: "workflow-strip-actions" }, stageTag(stage), model.selectedSessionId && state?.codex &&
+              h(Tooltip, { title: codexBusy ? "请先暂停并等待当前操作结束后更改模型" : "更改当前会话的模型与推理强度" }, h("span", null,
+                h(Button, { size: "small", disabled: codexBusy, onClick: () => setCodexEditor({ sessionId: state.id, revision: model.revision, selection: state.codex }) }, "更改模型"))),
+              hasProjectInfo && projectInfoHidden &&
               h(Button, { size: "small", "aria-controls": "project-info", "aria-expanded": false, onClick: () => {
                 setProjectInfoHidden(false); sessionStorage.setItem("workflow-project-info-hidden", "false");
               } }, "项目信息"), hasImplementationPlan && implementationPlanHidden &&
@@ -1951,6 +1969,10 @@ function WorkflowApp() {
           h("div", { className: `session-body${showSidebar ? " with-sidebar" : ""}` },
             h("div", { className: "workspace-main" }, renderers[page]()), showSidebar &&
               h("div", { className: "session-sidebar card-stack" }, showProjectInfo && renderProjectInfo(), showImplementationPlan && renderImplementationPlan())))), h("div", { className: "page-footer" }, "数据保存在本机 · 关闭页面不会取消已确认的后台任务")))) ,
+    codexEditor && codexEditor.sessionId === state?.id && h(SessionCodexSettings, { key: codexEditor.sessionId,
+      selection: codexEditor.selection, busy: codexBusy,
+      onSave: selection => act("configure_codex", selection, codexEditor.sessionId, codexEditor.revision),
+      onClose: () => setCodexEditor(null) }),
     h(Drawer, { title: "工作项资料", "aria-label": "工作项资料", placement: "right", width: "min(960px, 100vw)", rootClassName: "materials-drawer",
       open: Boolean(materialsOpen && hasWorkItemMaterials), onClose: () => setMaterialsOpen(false), destroyOnClose: true },
       materialsOpen && hasWorkItemMaterials && h("div", { id: "work-item-materials" },

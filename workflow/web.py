@@ -703,7 +703,8 @@ class WebApplication:
             if request_key in self.requests:
                 previous = self.requests[request_key]
                 if previous.get("session_id") in self.sessions.runtimes:
-                    saved = self.sessions.runtimes[previous["session_id"]].engine.state.get("codex")
+                    saved = (previous["codex"] if "codex" in previous else
+                             self.sessions.runtimes[previous["session_id"]].engine.state.get("codex"))
                     if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
                         raise WorkflowError("会话模型配置已经固定，不能通过重复请求修改。")
                 return {**self.requests[request_key], "duplicate": True}
@@ -751,8 +752,8 @@ class WebApplication:
                             and data["compile_check_enabled"] != state.get("compile_check", {}).get("enabled", False)):
                         raise WorkflowError("会话编译检查配置已经固定，不能再次修改。")
                     saved = state.get("codex")
-                    if saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
-                        raise WorkflowError("会话模型配置已经固定，请新建会话使用其他配置。")
+                    if action != "configure_codex" and saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
+                        raise WorkflowError("不能通过当前操作修改会话模型配置，请使用“更改模型”。")
                     if not saved and action not in RELEASE_ACTIONS | {"collect", "pause", "delete_session", "configure_codex", "plan"}:
                         raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
             affects, control = True, action == "pause"
@@ -827,8 +828,8 @@ class WebApplication:
                     engine.store.save(engine.state)
                 operation, arguments = engine.start_plan, (supplement, action == "edit_branches")
             elif action == "configure_codex":
-                if state.get("codex"):
-                    raise WorkflowError("会话模型配置已经固定，不能再次设置。")
+                if state["stage"] in ACTIVE | {"资料读取中"}:
+                    raise WorkflowError("该会话仍在执行，请先暂停并等待操作结束后再更改模型。")
                 selection = validate_selection(self.codex_models(), data.get("model"), data.get("reasoning_effort"))
                 operation, arguments = self.configure_codex, (engine, selection)
             elif action == "confirm_project":
@@ -943,6 +944,8 @@ class WebApplication:
                 raise WorkflowError("不支持该操作。")
             viewing = bool(preview_id) and not session_id
             result = {"accepted": True, "request_id": request_id}
+            if action == "configure_codex":
+                result["codex"] = selection
             if viewing:
                 result["preview_id"] = preview_id
             else:
@@ -980,7 +983,12 @@ class WebApplication:
 
     @staticmethod
     def configure_codex(engine, selection):
+        if engine.state.get("codex") == selection:
+            return
+        engine._close_rpc()
         engine.state["codex"] = selection
+        text = f"会话模型已保存：{selection['model']} · 推理强度：{selection['reasoning_effort']}，从下一次模型调用生效。"
+        engine.note("控制器", text, display_text=text)
         engine.save()
 
     def delete_session(self, session_id, runtime):

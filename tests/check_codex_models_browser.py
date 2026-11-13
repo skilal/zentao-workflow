@@ -118,6 +118,58 @@ def run():
                 expect(page.get_by_text("模型：model-a · 推理强度：高（high）", exact=True)).to_be_visible()
                 page.screenshot(path=str(output / "saved-session.png"), full_page=True)
 
+                # 会话内切换复用现有选择器；取消不保存，强度不支持时不能提交。
+                page.get_by_role("button", name="更改模型", exact=True).click()
+                dialog = page.get_by_role("dialog", name="更改会话模型", exact=True)
+                expect(dialog.get_by_text("实际模型：model-a", exact=True)).to_be_visible()
+                choose("模型", "模型乙")
+                expect(dialog.get_by_role("button", name="保存会话模型配置", exact=True)).to_be_disabled()
+                choose("推理强度", "medium")
+                dialog.get_by_role("button", name="取消", exact=True).click()
+                expect(dialog).not_to_be_visible()
+                assert first.engine.state["codex"] == {"model": "model-a", "reasoning_effort": "high"}
+                page.get_by_role("button", name="更改模型", exact=True).click()
+                expect(dialog.get_by_text("实际模型：model-a", exact=True)).to_be_visible()
+                catalog_mode["value"] = "error"
+                dialog.get_by_role("button", name="刷新模型列表", exact=True).click()
+                expect(dialog.get_by_text("读取模型失败", exact=True)).to_be_visible()
+                expect(dialog.get_by_role("button", name="保存会话模型配置", exact=True)).to_be_disabled()
+                catalog_mode["value"] = "normal"
+                dialog.get_by_role("button", name="刷新模型列表", exact=True).click()
+                expect(dialog.get_by_role("button", name="保存会话模型配置", exact=True)).to_be_enabled()
+                choose("模型", "模型乙")
+                choose("推理强度", "medium")
+                dialog.screenshot(path=str(output / "change-session-model.png"), animations="disabled")
+                dialog.get_by_role("button", name="保存会话模型配置", exact=True).click()
+                expect(dialog).not_to_be_visible()
+                expect(page.get_by_text("模型：model-b · 推理强度：中（medium）", exact=True)).to_be_visible()
+                assert first.engine.state["codex"] == {"model": "model-b", "reasoning_effort": "medium"}
+                page.reload()
+                expect(page.get_by_text("模型：model-b · 推理强度：中（medium）", exact=True)).to_be_visible()
+
+                # 运行中禁用切换；过期弹窗不能覆盖其他页面更新后的会话。
+                first.engine.turn_running = True
+                first.engine.save()
+                expect(page.get_by_role("button", name="更改模型", exact=True)).to_be_disabled()
+                first.engine.turn_running = False
+                first.engine.save()
+                expect(page.get_by_role("button", name="更改模型", exact=True)).to_be_enabled()
+                page.get_by_role("button", name="更改模型", exact=True).click()
+                expect(dialog.get_by_text("实际模型：model-b", exact=True)).to_be_visible()
+                choose("推理强度", "low")
+                first.engine.save()
+                dialog.get_by_role("button", name="保存会话模型配置", exact=True).click()
+                expect(page.get_by_text("页面显示的流程版本已过期，请查看最新内容后再确认。", exact=True)).to_be_visible()
+                expect(dialog).to_be_visible()
+                assert first.engine.state["codex"]["reasoning_effort"] == "medium"
+                dialog.get_by_role("button", name="取消", exact=True).click()
+                page.get_by_role("button", name="更改模型", exact=True).click()
+                expect(dialog.get_by_text("实际模型：model-b", exact=True)).to_be_visible()
+                choose("推理强度", "low")
+                dialog.get_by_role("button", name="保存会话模型配置", exact=True).click()
+                expect(page.get_by_text("模型：model-b · 推理强度：低（low）", exact=True)).to_be_visible()
+                assert app.settings["codex"]["reasoning_effort"] == "medium"
+
                 # 旧会话明确确认一次；保存不会启动真实模型请求。
                 item = {"kind": "task", "id": 9, "title": "历史模型待确认", "project_id": 41, "project_name": "示例项目"}
                 state = app.sessions.store.new(item)
@@ -133,7 +185,10 @@ def run():
                 for width in (1000, 720, 390):
                     page.set_viewport_size({"width": width, "height": 1050})
                     expect(page.get_by_text("模型：model-b · 推理强度：中（medium）", exact=True)).to_be_visible()
-                    page.screenshot(path=str(output / f"session-{width}.png"), full_page=True)
+                    page.get_by_role("button", name="更改模型", exact=True).click()
+                    expect(dialog.get_by_text("实际模型：model-b", exact=True)).to_be_visible()
+                    dialog.screenshot(path=str(output / f"session-{width}.png"), animations="disabled")
+                    dialog.get_by_role("button", name="取消", exact=True).click()
                 assert not errors, errors
                 context.close()
                 browser.close()

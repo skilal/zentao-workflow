@@ -208,8 +208,127 @@ class ModelSessionChecks(TestCase):
         self.app.dispatch(self.request(runtime, "configure_codex", preview=False))
         runtime.engine.executor.submit(lambda: None).result(timeout=5)
         self.assertEqual(self.app.sessions.store.load(state["id"])["codex"], SELECTION)
-        with self.assertRaisesRegex(WorkflowError, "已经固定"):
+        with self.assertRaisesRegex(WorkflowError, "更改模型"):
             self.app.dispatch(self.request(runtime, "resume", {"model": "model-b", "reasoning_effort": "medium"}, preview=False))
+
+    def test_change_closes_connection_and_preserves_thread_plan_and_pending_question(self):
+        runtime = self.start(self.preview())
+        engine, state = runtime.engine, runtime.engine.state
+        state.update(stage="等待人工回答", phase="plan", thread_id="原线程", plan="原计划", plan_hash="原版本",
+                     approved_plan="已确认计划", approved_hash="已确认版本", approval_source="manual",
+                     pending={"id": "原问题", "method": "workflow/ask_user", "turn_completed": True,
+                              "params": {"questions": [{"id": "问题一", "question": "请选择方案"}]}},
+                     thread_input={"thread_id": "原线程", "context_hashes": {"context": "原上下文"}, "images": []})
+        before = deepcopy(state)
+        settings_before = deepcopy(self.settings)
+        rpc = engine.rpc = Mock()
+        selection = {"model": "model-b", "reasoning_effort": "medium"}
+        self.app.dispatch(self.request(runtime, "configure_codex", selection, preview=False))
+        engine.executor.submit(lambda: None).result(timeout=5)
+        rpc.close.assert_called_once()
+        rpc.request.assert_not_called()
+        self.assertIsNone(engine.rpc)
+        self.assertFalse(state["rpc_connected"])
+        self.assertEqual(state["codex"], selection)
+        for key in ("stage", "phase", "thread_id", "thread_input", "plan", "plan_hash", "approved_plan",
+                    "approved_hash", "approval_source", "pending", "repos", "reviews", "commits"):
+            self.assertEqual(state[key], before[key], key)
+        self.assertEqual(self.settings, settings_before)
+        self.assertEqual(self.app.sessions.store.load(state["id"])["codex"], selection)
+        self.assertIn("从下一次模型调用生效", state["history"][-1]["display_text"])
+
+    def test_changed_configuration_resumes_original_thread_and_is_used_by_all_phases(self):
+        runtime = self.start(self.preview())
+        engine, state = runtime.engine, runtime.engine.state
+        state.update(stage="已暂停", thread_id="原线程", project={"id": 41}, branch_resolution={"repositories": []})
+        selection = {"model": "model-b", "reasoning_effort": "medium"}
+        self.app.dispatch(self.request(runtime, "configure_codex", selection, preview=False))
+        engine.executor.submit(lambda: None).result(timeout=5)
+        with patch("workflow.engine.AppServer") as factory:
+            rpc = factory.return_value
+            rpc.model, rpc.disabled_mcp = "model-b", {}
+            rpc.process.poll.return_value = None
+            rpc.request.return_value = {"thread": {"id": "原线程"}, "turn": {"id": "新回合"}}
+            engine.ensure_rpc()
+            engine.title_executor.submit(lambda: None).result(timeout=3)
+            rpc.start.assert_called_once_with("model-b")
+            resumed = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "thread/resume")
+            self.assertEqual(resumed["threadId"], "原线程")
+            self.assertEqual(resumed["model"], "model-b")
+            self.assertEqual(resumed["config"]["model_reasoning_effort"], "medium")
+            self.assertNotIn("thread/start", [call.args[0] for call in rpc.request.call_args_list])
+            for phase in ("branch", "plan", "implement", "review", "fix", "compile_analysis", "compile_fix"):
+                state["phase"] = phase
+                engine._start_turn("检查切换后的配置")
+                actual = rpc.request.call_args.args[1]["collaborationMode"]["settings"]
+                self.assertEqual({key: actual[key] for key in selection}, selection)
+            engine.rpc = None
+        restored = WebApplication(self.settings)
+        self.addCleanup(restored.close)
+        self.assertEqual(restored.sessions.get(state["id"]).engine.state["codex"], selection)
+
+    def test_change_rejects_busy_stale_and_invalid_requests_without_closing_connection(self):
+        runtime = self.start(self.preview())
+        engine = runtime.engine
+        rpc = engine.rpc = Mock()
+        selection = {"model": "model-b", "reasoning_effort": "medium"}
+        for attribute, value in (("busy", "resume"), ("uploads", 1)):
+            original = getattr(runtime, attribute)
+            setattr(runtime, attribute, value)
+            with self.subTest(attribute=attribute), self.assertRaises(WorkflowError):
+                self.app.dispatch(self.request(runtime, "configure_codex", selection, preview=False))
+            setattr(runtime, attribute, original)
+        for attribute in ("jobs", "turn_running"):
+            setattr(engine, attribute, 1)
+            with self.subTest(attribute=attribute), self.assertRaises(WorkflowError):
+                self.app.dispatch(self.request(runtime, "configure_codex", selection, preview=False))
+            setattr(engine, attribute, 0)
+        engine.state["stage"] = "实施中"
+        with self.assertRaisesRegex(WorkflowError, "先暂停"):
+            self.app.dispatch(self.request(runtime, "configure_codex", selection, preview=False))
+        engine.state["stage"] = "已暂停"
+        stale = self.request(runtime, "configure_codex", selection, preview=False)
+        stale["revision"] -= 1
+        with self.assertRaisesRegex(WorkflowError, "版本已过期"):
+            self.app.dispatch(stale)
+        for invalid in ({}, {"model": "unknown", "reasoning_effort": "low"}, {"model": "model-b", "reasoning_effort": "high"}):
+            with self.subTest(selection=invalid), self.assertRaises(WorkflowError):
+                self.app.dispatch(self.request(runtime, "configure_codex", invalid, preview=False))
+        rpc.close.assert_not_called()
+        self.assertEqual(engine.state["codex"], SELECTION)
+
+    def test_change_is_idempotent_and_repeated_old_request_does_not_restore_old_choice(self):
+        runtime = self.start(self.preview())
+        engine = runtime.engine
+        rpc = engine.rpc = Mock()
+        unchanged = self.request(runtime, "configure_codex", preview=False)
+        self.app.dispatch(unchanged)
+        engine.executor.submit(lambda: None).result(timeout=5)
+        rpc.close.assert_not_called()
+        selection = {"model": "model-b", "reasoning_effort": "medium"}
+        request = self.request(runtime, "configure_codex", selection, preview=False)
+        self.app.dispatch(request)
+        engine.executor.submit(lambda: None).result(timeout=5)
+        history_count = len(engine.state["history"])
+        self.assertTrue(self.app.dispatch(request)["duplicate"])
+        self.assertEqual(len(engine.state["history"]), history_count)
+        self.app.dispatch(self.request(runtime, "configure_codex", preview=False))
+        engine.executor.submit(lambda: None).result(timeout=5)
+        self.assertTrue(self.app.dispatch(request)["duplicate"])
+        self.assertEqual(engine.state["codex"], SELECTION)
+        with self.assertRaisesRegex(WorkflowError, "重复请求"):
+            self.app.dispatch({**request, "data": SELECTION})
+
+    def test_close_failure_preserves_previous_model(self):
+        runtime = self.start(self.preview())
+        rpc = runtime.engine.rpc = Mock()
+        rpc.close.side_effect = WorkflowError("模拟通道关闭失败")
+        self.app.dispatch(self.request(runtime, "configure_codex", {"model": "model-b", "reasoning_effort": "medium"}, preview=False))
+        runtime.engine.executor.submit(lambda: None).result(timeout=5)
+        self.assertEqual(runtime.engine.state["codex"], SELECTION)
+        self.assertEqual(self.app.sessions.store.load(runtime.engine.state["id"])["codex"], SELECTION)
+        self.assertIn("模拟通道关闭失败", runtime.engine.state["error"])
+        rpc.close.side_effect = None
 
     def test_settings_save_validates_before_writing_and_preserves_inheritance(self):
         data = {**self.app.public_settings(), "password": "", "model": "", "reasoning_effort": "high"}
