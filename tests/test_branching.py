@@ -343,10 +343,13 @@ class BranchWorkflowChecks(TestCase):
         for phase in ("plan", "implement", "review", "fix"):
             with self.subTest(phase=phase):
                 self.flow.state["phase"] = phase
-                params = thread_parameters(self.flow.state, "示例模型", {})
+                params = thread_parameters(self.flow.state, "示例模型", {
+                    "全局服务": {"command": "全局命令", "enabled": False}})
                 server = params["config"]["mcp_servers"]["workflow"]
                 self.assertTrue(server["enabled"])
                 self.assertEqual(server["command"], python_executable)
+                self.assertNotIn("全局服务", params["config"]["mcp_servers"])
+                self.assertNotIn("features.shell_tool", params["config"])
                 self.assertEqual(Path(params["cwd"]).name, "workspace")
 
     def test_disabling_inherited_mcp_preserves_stdio_and_http_transports(self):

@@ -12,7 +12,7 @@ from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
 from time import monotonic
 
-from workflow.approvals import is_workflow_tool_call
+from workflow.approvals import is_workflow_tool_call, mcp_approval_question
 from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
 from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
@@ -933,6 +933,15 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         if attachments is None:
             answers, attachments = prepare_answer(state, text, answers)
         pending = state.get("pending")
+        approval_result = None
+        if pending and pending["method"] == "mcpServer/elicitation/request":
+            if not state["rpc_connected"] or not self.rpc or pending.get("turn_completed"):
+                raise WorkflowError("工具授权请求已失效，请恢复会话后等待工具重新申请，不能沿用旧授权。")
+            choice = (answers or {}).get("tool_approval", [text.strip()])
+            if attachments or choice not in (["允许本次"], ["拒绝本次"]):
+                raise WorkflowError("工具授权必须明确选择“允许本次”或“拒绝本次”，不接受附件或其他答案。")
+            allowed = choice == ["允许本次"]
+            approval_result = {"action": "accept" if allowed else "decline", "content": {} if allowed else None}
         controlled = pending and pending["method"] == "workflow/ask_user"
         for entry in attachments:
             attachment_file(self.store, state, entry)
@@ -948,14 +957,17 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self.note("用户", reply, attachments=deepcopy(attachments))
         state["supplement"] += "\n\n人工补充：" + reply
         if pending and state["rpc_connected"] and self.rpc and not pending.get("turn_completed"):
-            if pending["method"] != "item/tool/requestUserInput":
+            if approval_result is not None:
+                result = approval_result
+            elif pending["method"] != "item/tool/requestUserInput":
                 raise WorkflowError("不支持对该请求自动补充答案。")
-            result = {"answers": {key: {"answers": value} for key, value in (answers or {}).items()}}
-            if not result["answers"]:
-                questions = pending["params"].get("questions", [])
-                if len(questions) != 1:
-                    raise WorkflowError("多个问题必须逐项回答。")
-                result["answers"] = {questions[0]["id"]: {"answers": [text]}}
+            else:
+                result = {"answers": {key: {"answers": value} for key, value in (answers or {}).items()}}
+                if not result["answers"]:
+                    questions = pending["params"].get("questions", [])
+                    if len(questions) != 1:
+                        raise WorkflowError("多个问题必须逐项回答。")
+                    result["answers"] = {questions[0]["id"]: {"answers": [text]}}
             state["pending"] = None
             state["stage"] = PHASE_STAGE[state["phase"]]
             self.set_progress_status("running")
@@ -1148,6 +1160,8 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             state["stage"] = "等待人工回答"
             self.save()
             return
+        if (state.get("pending") or {}).get("method") == "mcpServer/elicitation/request":
+            state["pending"] = None
         if state.get("pending"):
             state["pending"]["turn_completed"] = True
             state["stage"] = "等待人工回答"
@@ -1214,6 +1228,19 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 self.save()
             self.emit("questions", params.get("questions", []))
             return
+        if method == "mcpServer/elicitation/request" and "id" in message:
+            question = mcp_approval_question(params)
+            if question:
+                with self.lock:
+                    if self.state["phase"] == "plan" and self.state.get("plan_round") is not None:
+                        self.state["plan_round"]["asked"] = True
+                    self.state["pending"] = {"id": message["id"], "method": method,
+                                             "params": {"questions": [question]}}
+                    self.state["stage"] = "等待人工回答"
+                    self.set_progress_status("waiting")
+                    self.save()
+                self.emit("questions", [question])
+                return
         if "id" in message:
             # 已登记的工作流 MCP 调用直接允许，具体业务限制由工具返回原因。
             if "requestApproval" in method and "commandExecution" in method:
@@ -1283,6 +1310,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                     self.sync_artifacts()
                     if self._capture_user_input():
                         self.state["pending"]["turn_completed"] = True
+                    elif (self.state.get("pending") or {}).get("method") == "mcpServer/elicitation/request":
+                        self.state.update(pending=None, stage="已暂停",
+                                          error="工具授权连接已断开，恢复会话后须重新申请，旧授权不再有效。")
                     elif self.state["stage"] in ACTIVE:
                         self.state["stage"] = "已暂停"
                     self.save()

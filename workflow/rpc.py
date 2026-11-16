@@ -1,4 +1,4 @@
-"""Codex App Server 双向 JSONL 通道；不执行模型提出的系统命令。"""
+"""Codex App Server 双向 JSONL 通道；继承原生工具，保留工作流授权边界。"""
 
 from itertools import count
 from collections import deque
@@ -12,6 +12,7 @@ from sys import executable as python_executable
 from threading import Event, Lock, Thread, current_thread
 
 from workflow.branching import BRANCH_INSTRUCTIONS
+from workflow.mcp_server import TOOLS
 from workflow.settings import ROOT, WorkflowError
 
 
@@ -53,9 +54,7 @@ class AppServer:
             raise WorkflowError("找不到配置中的 Codex 命令。请编辑 settings.json 的 codex.command，"
                                 "将第一个元素设为本机 Codex 可执行文件的绝对路径，保存后重启本地服务。")
         command[0] = executable
-        command += ["-c", "features.shell_tool=false", "-c", "features.hooks=false",
-                    "-c", "features.multi_agent=false", "-c", "features.apps=false", "-c", "features.goals=false",
-                    "-c", "features.remote_plugin=false", "-c", 'web_search="disabled"',
+        command += ["-c", "features.hooks=false", "-c", "features.multi_agent=false", "-c", "features.goals=false",
                     "app-server", "--listen", "stdio://"]
         if Path(executable).suffix.lower() in (".cmd", ".bat"):
             # npm 的 Windows 命令包装器需要 cmd；参数全部来自本地配置，不含需求文本或密码。
@@ -75,7 +74,8 @@ class AppServer:
         self.initialized = True
         configuration = self.request("config/read", {"includeLayers": False}).get("config", {})
         self.configuration = configuration
-        # 禁用时仍需保留传输配置；config/read 的未设置字段为 null，不能作为 TOML 覆盖传回。
+        # 只为不调用工具的分支识别线程保留禁用覆盖；业务线程直接继承原生配置。
+        # config/read 的未设置字段为 null，不能作为 TOML 覆盖传回。
         self.disabled_mcp = {name: {**{key: value for key, value in server.items() if value is not None}, "enabled": False}
                              for name, server in configuration.get("mcp_servers", {}).items() if name != "workflow"}
 
@@ -204,15 +204,17 @@ def thread_parameters(state, model, disabled_mcp):
     server = {"command": python_executable,
               "args": [str(ROOT / "mcp.py"), state["id"]], "cwd": str(ROOT),
               "required": True, "enabled": state["phase"] != "branch", "startup_timeout_sec": 30,
-              "enabled_tools": ["task_context", "set_session_title", "read_answer_attachment", "read_followup_attachment", "list_files", "read_file", "read_files", "search_text", "baseline_file", "git_log", "git_files", "git_file", "git_diff", "changes", "ask_user", "request_review", "set_change_summary", "write_file", "replace_text", "delete_file", "create_artifact", "publish_artifact"]}
+              "enabled_tools": [name for name, _, _ in TOOLS]}
     if state["phase"] == "branch":
         return {"cwd": str(session_path), "model": model,
                 "approvalPolicy": "on-request", "sandbox": "read-only",
                 "config": {"model_reasoning_effort": state["codex"]["reasoning_effort"],
+                           "features.shell_tool": False, "features.apps": False,
+                           "features.remote_plugin": False, "web_search": "disabled",
                            "mcp_servers": {**disabled_mcp, "workflow": server}},
                 "developerInstructions": BRANCH_INSTRUCTIONS}
     return {"cwd": str(session_path / "workspace"), "model": model,
             "approvalPolicy": "on-request", "sandbox": "read-only",
             "config": {"model_reasoning_effort": state["codex"]["reasoning_effort"],
-                       "mcp_servers": {**disabled_mcp, "workflow": server}},
+                       "mcp_servers": {"workflow": server}},
             "developerInstructions": (ROOT / "skills" / "zentao-delivery" / "SKILL.md").read_text(encoding="utf-8")}

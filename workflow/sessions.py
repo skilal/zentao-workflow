@@ -43,6 +43,7 @@ class SessionManager:
                 state["scope_review_required"] = True
             question = pending_input(self.store, state)
             native_question = (state.get("pending") or {}).get("method") == "item/tool/requestUserInput"
+            native_approval = (state.get("pending") or {}).get("method") == "mcpServer/elicitation/request"
             interrupted = state["stage"] in ACTIVE | {"等待人工回答", "资料读取中"}
             changed = interrupted or state.get("rpc_connected") or state.get("pending") or state.get("scope_review_required")
             changed = settle_progress(state, "waiting" if question else "interrupted") or changed
@@ -60,6 +61,10 @@ class SessionManager:
                                       "params": {"questions": question["questions"]}})
                 if state["phase"] == "plan" and state.get("plan_round") is not None:
                     state["plan_round"]["asked"] = True
+                changed = True
+            elif native_approval:
+                state.update(stage="已暂停", pending=None, pause_requested=True,
+                             error="上次工具授权已失效，恢复会话后须重新申请。")
                 changed = True
             elif native_question:
                 state.update(stage="等待人工回答", pause_requested=False)

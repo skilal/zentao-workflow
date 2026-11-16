@@ -64,6 +64,14 @@ class CodexCommandChecks(TestCase):
             command = self.connect()
         self.assertEqual(command.count("app-server"), 1)
 
+    def test_native_tools_follow_codex_configuration_without_blanket_disabling(self):
+        with patch("workflow.rpc.which", return_value="C:/Codex/codex.exe"):
+            command = self.connect()
+        for override in ("features.shell_tool=false", "features.apps=false", "features.remote_plugin=false",
+                         'web_search="disabled"'):
+            self.assertNotIn(override, command)
+        self.assertIn("features.hooks=false", command)
+
     def test_state_write_error_is_distinguished_from_malformed_channel_json(self):
         for output, failure, expected in (
             ('{"method":"item/started"}\n', PermissionError("state.json 替换被拒绝"), "事件处理失败"),

@@ -153,3 +153,4 @@ class GitReadChecks(TestCase):
         self.assertTrue(GIT_READ_TOOLS.issubset(enabled))
         definitions = {name: definition for name, _, definition in TOOLS}
         self.assertTrue(GIT_READ_TOOLS.issubset(definitions))
+        self.assertEqual(set(enabled), set(definitions))
