@@ -1,4 +1,4 @@
-"""仅提供工作区文件和需求资料工具的本地 STDIO MCP。"""
+"""提供工作区文件、只读 Git 查询和需求资料工具的本地 STDIO MCP。"""
 
 from fnmatch import fnmatch
 from hashlib import sha256
@@ -15,6 +15,7 @@ from workflow.context import context_hash, requirement_context
 from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
 from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, repository_lock, safe_file
+from workflow.git_read import GIT_READ_TOOLS, GitReader
 from workflow.shared_changes import (file_version, fragment_details, load_record, read_blob,
                                      record_write, remember_read, validate_write)
 from workflow.settings import WorkflowError, load_settings
@@ -56,6 +57,20 @@ TOOLS = [
     }, ("files",))),
     ("search_text", "在指定仓库文本中搜索字面量；最多返回 100 项并明确标记截断。", schema({"repository": STRING, "text": STRING, "pattern": STRING}, ("repository", "text"))),
     ("baseline_file", "按行读取实施前基线；默认 200 行，最多 500 行；返回 next_line；可用 read_files 批量核对。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
+    ("git_log", "只读指定分支或提交的历史，默认 HEAD；可按 path 筛选。默认 20 条、最多 100 条，用 next_offset 续读。仅查询本地已有对象，失败停止，不拉取或切换分支。", schema({
+        "repository": STRING, "ref": STRING, "path": STRING,
+        "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+    }, ("repository",))),
+    ("git_files", "列出指定分支或提交中的文件；path 可指定目录或文件，默认列出全仓库。默认 200 项、最多 2000 项，用 next_offset 续读；返回 commit 可固定后续查询版本。", schema({
+        "repository": STRING, "ref": STRING, "path": STRING,
+        "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 2000}
+    }, ("repository", "ref"))),
+    ("git_file", "只读指定本地分支、远程跟踪分支、标签或提交中的 UTF-8 文件。默认 200 行、最多 500 行，沿 next_line 续读；返回 commit 可固定版本。不同于当前文件及实施前基线，不提供写入版本或登记当前文件已读。", schema({
+        **FILE_ARGS, "ref": STRING, **LINE_ARGS
+    }, ("repository", "path", "ref"))),
+    ("git_diff", "只读 base_ref 到 ref 两个版本的提交差异；可用 path 限定文件或目录。默认 200 行、最多 500 行，沿 next_line 续读并用返回的提交号固定版本。不包含未提交修改、不执行外部差异程序。", schema({
+        "repository": STRING, "base_ref": STRING, "ref": STRING, "path": STRING, **LINE_ARGS
+    }, ("repository", "base_ref", "ref"))),
     ("changes", "读取本轮差异及归属候选；fragment_ids 按编号读取待判断片段。", schema({
         "repository": STRING, "fragment_ids": {"type": "array", "items": STRING, "minItems": 1, "maxItems": 100}}, ("repository",))),
     ("ask_user", "将问题交给控制器并立即结束回合；由网页等待明确答复，禁止 sleep、轮询或默认放行。", schema({
@@ -208,6 +223,8 @@ class Tools:
         repository = repositories.get(arguments.get("repository"))
         if repository is None:
             raise WorkflowError("仓库不属于当前会话的工作区。")
+        if name in GIT_READ_TOOLS:
+            return GitReader(repository, SKIP).call(name, arguments)
         if name == "list_files":
             results = []
             for relative, _ in self.files(repository, arguments.get("pattern", "*")):

@@ -15,6 +15,8 @@ description: 分析人工选定的工作项或直接输入的需求，澄清、�
 
 已知路径直接读取，已知模块缩小搜索范围，多文件优先 read_files。参数和分页上限以工具 Schema 为准，沿 next_line 续读，避免重复整文件读取。item=null 时以 supplement 首条消息及图片为需求，不要求补选工作项。
 
+需要 Git 历史或其他分支内容时，使用只读工具 git_log 查询提交历史、git_files 浏览版本文件、git_file 读取版本文件、git_diff 比较两个版本。ref 可传本地分支、远程跟踪分支、标签或提交号；连续读取沿返回的 commit 固定版本，按 next_line 或 next_offset 续读。工具仅访问当前会话仓库的本地已有 Git 对象，不切换分支、不拉取；引用不存在时如实说明缺失，不自动换分支。版本文件不等于当前文件或实施前基线，修改前仍须用 read_file/read_files 读取当前内容与 version。
+
 附件上传或准备成功不代表已经阅读。按来源工作项、附件编号及 image_references 对应关系读取；readable/issue 说明未读取部分，必要内容缺失再提问，不猜测、不执行附件。
 
 - 问题附件用 read_answer_attachment；续聊附件用 read_followup_attachment。
