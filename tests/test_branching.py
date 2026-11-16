@@ -77,6 +77,7 @@ class BranchWorkflowChecks(TestCase):
             ("workflow.engine.refresh_branches", lambda repository: deepcopy(self.catalogs[repository["role"]])),
             ("workflow.engine.fetch_branch", self.fetch_branch),
             ("workflow.engine.acquire_workspace", self.prepare),
+            ("workflow.repository_selection.inspect_repository", self.inspect_repository),
             ("workflow.engine.save_settings", self.save_settings),
         ):
             patched = patch(target, new=replacement)
@@ -104,6 +105,12 @@ class BranchWorkflowChecks(TestCase):
         state["repos"].append(record)
         store.save(state)
         return record
+
+    def inspect_repository(self, path):
+        repository = next(repo for repo in self.settings["repositories"] if Path(repo["path"]).resolve() == Path(path))
+        branch = self.catalogs[repository["role"]][0]
+        return {"path": path, "branch": branch["name"], "head": branch["commit"], "date": branch["date"],
+                "commit_time": 1, "error": ""}
 
     def save_settings(self, settings):
         (self.root / "settings.json").write_text(dumps(settings, ensure_ascii=False), encoding="utf-8")
@@ -161,7 +168,7 @@ class BranchWorkflowChecks(TestCase):
             self.assertEqual(refresh.call_count, 1)
             self.complete(decision("frontend", "示例档案馆/develop"))
             self.assertEqual(refresh.call_count, 1)
-        self.assertTrue(self.prepared[0]["create"] and self.prepared[0]["track"])
+        self.assertFalse(self.prepared[0]["create"] or self.prepared[0]["track"])
         self.assertEqual(self.fetched, [("frontend", "示例档案馆/develop")])
 
     def test_new_online_branch_is_fetched_before_ai_rechecks_real_commit_metadata(self):

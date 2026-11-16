@@ -58,12 +58,23 @@ class BranchActionChecks(TestCase):
 
     def test_branch_and_project_decisions_reject_stale_revision_or_wrong_session(self):
         for action in ("plan", "edit_branches", "choose_branches", "confirm_project", "smart_checkout", "checkout_resolved",
-                       "preview_baseline", "confirm_baseline", "cancel_baseline"):
+                       "detect_repositories", "choose_repositories", "preview_baseline", "confirm_baseline", "cancel_baseline"):
             with self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request(action, revision=-1))
             with self.assertRaises(WorkflowError):
                 self.application.dispatch(self.request(action, session_id="其他会话"))
         self.runtime.engine.submit.assert_not_called()
+
+    def test_directory_detection_and_choice_are_explicit_versioned_operations(self):
+        detect = self.runtime.engine.detect_repositories = Mock()
+        paths = {"frontend": "D:/wkproj/ais-web-2"}
+        request = self.request("detect_repositories", {"purpose": "baseline", "paths": paths})
+        self.application.dispatch(request)
+        self.application.dispatch(request)
+        detect.assert_called_once_with("baseline", paths)
+        choose = self.runtime.engine.choose_repositories = Mock()
+        self.application.dispatch(self.request("choose_repositories", {"paths": paths}))
+        choose.assert_called_once_with(paths)
 
     def test_baseline_actions_require_explicit_preview_token_and_deduplicate(self):
         operation = self.runtime.engine.change_baseline = Mock()

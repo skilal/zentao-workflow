@@ -1257,7 +1257,7 @@ function WorkflowApp() {
   function renderProjectInfo() {
     const project = state.project || state.snapshot.project || {};
     const repositories = state.branch_resolution?.repositories || [];
-    const editable = ["资料已读取", "准备工作区失败"].includes(stage) && !busy && !state.repos.length;
+    const editable = ["资料已读取", "准备工作区失败", "等待选择目录"].includes(stage) && !busy && !state.repos.length;
     const waiting = stage === "等待选择分支";
     const unresolved = repositories.filter(entry => entry.status === "needs_user");
     const choices = draft.branch_choices || {};
@@ -1289,11 +1289,12 @@ function WorkflowApp() {
             const entry = repositories.find(entry => entry.role === repository.role);
             const workspace = state.repos.find(entry => entry.name === repository.name);
             const branch = workspace?.branch || entry?.branch;
+            const directory = workspace?.path || state.repository_detection?.repositories.find(value => value.role === repository.role)?.path || entry?.path || repository.path;
             return h("section", { className: "project-info-section", key: repository.role },
               h("div", { className: "project-info-section-heading" },
                 h("span", { className: "project-info-label" }, repository.role === "frontend" ? "前端仓库" : "后端仓库"),
                 entry?.source && h(Tag, { color: entry.source === "ai" ? "blue" : "green" }, { ai: "AI 判断", common: "项目常用", human: "人工确认" }[entry.source])),
-              h(Typography.Paragraph, { className: "project-info-path", title: repository.path, copyable: { text: repository.path, tooltips: ["复制仓库路径", "已复制"] } }, repository.path),
+              h(Typography.Paragraph, { className: "project-info-path", title: directory, copyable: { text: directory, tooltips: ["复制仓库路径", "已复制"] } }, directory),
               h("div", { className: "project-info-label" }, "目标分支"),
               waiting && entry?.status === "needs_user" ?
                 h(Select, { className: "full-width project-info-select", "aria-label": `${repository.name}目标分支`, value: choices[entry.role], placeholder: "搜索并选择项目分支", showSearch: true, optionFilterProp: "label", disabled: busy,
@@ -1303,12 +1304,58 @@ function WorkflowApp() {
                 h("div", { className: "project-info-pending" }, entry?.status === "needs_user" ? "等待人工选择" : "开始计划时自动识别"));
           })),
         (editable || waiting) && h("div", { className: "project-info-actions" },
-          editable && !model.preview && h(Button, { block: true, disabled: transfers.length > 0, onClick: () => act("edit_branches", { supplement: draft.supplement }) }, "更换项目常用分支"),
+          editable && !model.preview && h(Button, { block: true, disabled: transfers.length > 0, onClick: () => {
+            changeDraft({ repository_paths: {}, repository_custom_paths: {} });
+            return act("edit_branches", { supplement: draft.supplement });
+          } }, "更换项目常用分支"),
           waiting && h(React.Fragment, null,
             h("p", { className: "project-info-note" }, "人工选择将保存为项目常用分支，后续优先复用。"),
             h(Button, { type: "primary", block: true, disabled: busy || unresolved.some(entry => !entry.catalog.some(branch => branch.name === choices[entry.role])),
               onClick: () => act("choose_branches", { choices: Object.fromEntries(unresolved.map(entry => [entry.role, choices[entry.role]])) }) }, "保存为项目常用分支并继续"),
             h(Button, { type: "text", block: true, disabled: busy || Boolean(state.repos.length), onClick: startPlan }, "重新识别分支")))));
+  }
+
+  function renderRepositoryCandidates(entry, purpose) {
+    const initial = purpose === "prepare";
+    const value = initial ? (draft.repository_paths?.[entry.role] ?? entry.path) || undefined :
+      (draft.baseline_paths?.[entry.name] ?? entry.path) || undefined;
+    return h(React.Fragment, null,
+      h(Select, { className: "full-width", "aria-label": `${entry.name}候选目录`, value, disabled: busy || entry.status === "bound",
+        placeholder: "选择已检测的仓库目录", optionFilterProp: "label", showSearch: true,
+        options: entry.candidates.map(candidate => ({ value: candidate.path,
+          label: `${candidate.path}（${candidate.branch || "未检出分支"}）`,
+          disabled: Boolean(candidate.error) || (initial && candidate.branch !== entry.branch) })),
+        onChange: path => initial ? changeDraft({ repository_paths: { ...draft.repository_paths, [entry.role]: path } }) :
+          changeDraft({ baseline_paths: { ...draft.baseline_paths, [entry.name]: path } }) }),
+      entry.candidates.map(candidate => h("div", { key: candidate.path, style: { marginTop: 12 } },
+        h(Typography.Text, { style: { overflowWrap: "anywhere" } }, candidate.path),
+        candidate.error ? h("div", { className: "muted" }, candidate.error) :
+          h("div", { className: "muted", style: { overflowWrap: "anywhere" } },
+            `${candidate.branch} · ${candidate.head.slice(0, 12)} · ${candidate.date}`))),
+      (!value || value === entry.path) && h("p", { className: "muted" }, entry.reason));
+  }
+
+  function renderRepositorySelection() {
+    const detection = state.repository_detection;
+    if (stage !== "等待选择目录" || detection?.purpose !== "prepare") return null;
+    const entries = detection.repositories;
+    const choices = Object.fromEntries(entries.filter(entry => entry.status !== "bound")
+      .map(entry => [entry.role, draft.repository_paths?.[entry.role] ?? entry.path]));
+    return h(CardBox, { title: "选择仓库目录" },
+      h(Form, { layout: "vertical" }, entries.map(entry =>
+        h(Form.Item, { key: entry.role, label: `${entry.name}（目标分支：${entry.branch}）` },
+          renderRepositoryCandidates(entry, "prepare"),
+          entry.status !== "bound" && h(Input, { "aria-label": `${entry.name}其他仓库目录`, placeholder: "其他仓库绝对目录",
+            value: draft.repository_custom_paths?.[entry.role] || "", disabled: busy,
+            onChange: event => changeDraft({ repository_custom_paths: { ...draft.repository_custom_paths, [entry.role]: event.target.value } }) })))),
+      h("div", { className: "action-bar" },
+        h(Button, { disabled: busy, onClick: () => {
+          changeDraft({ repository_paths: {} });
+          return act("detect_repositories", { purpose: "prepare", paths: Object.fromEntries(
+            Object.entries(draft.repository_custom_paths || {}).filter(([, path]) => path.trim())) });
+        } }, "重新检测目录"),
+        h(Button, { type: "primary", disabled: busy || Object.values(choices).some(path => !path),
+          onClick: () => act("choose_repositories", { paths: choices }) }, "确认目录并继续")));
   }
 
   function renderImplementationPlan() {
@@ -1352,6 +1399,7 @@ function WorkflowApp() {
         entry?.reason || entry?.question || entry?.candidates.length > 0 || entry?.refresh_state || entry?.fetch_state;
     });
     return h("div", { className: "card-stack" },
+      renderRepositorySelection(),
       canReuse && reuseCandidates.length > 0 && h(CardBox, { title: "复用已有工作区" },
         h("p", { className: "muted" }, "原目标分支已在其他工具创建的工作区检出时，可先预览，核对后明确确认复用。其他未完成会话的目录不能接管。"),
         h("div", { className: "action-bar" }, reuseCandidates.map(selection => h(Button, {
@@ -1555,22 +1603,30 @@ function WorkflowApp() {
       ...(state.progress_turns || []).map(turn => ({ process: turn, index: turn.history_index }))]
       .filter(entry => entry.role !== "控制器" || entry.display_text).sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
     const processRunning = state.progress_turns?.at(-1)?.status === "running";
+    const baselineDetection = state.repository_detection?.purpose === "baseline" ? state.repository_detection : null;
+    const baselinePaths = Object.fromEntries(state.repos.map(repo => [repo.name, draft.baseline_paths?.[repo.name] ??
+      (baselineDetection ? baselineDetection.repositories.find(entry => entry.role === repo.role).path : repo.path)]));
     return h("div", { className: "card-stack conversation-layout", key: state.id },
       h(Modal, { title: "变更仓库目录与审查基线", open: baselineDirectoriesOpen,
         onCancel: () => setBaselineDirectoriesOpen(false), footer: h(Space, null,
           h(Button, { disabled: busy, onClick: () => setBaselineDirectoriesOpen(false) }, "取消"),
-          h(Button, { type: "primary", disabled: busy, onClick: async () => {
-            const paths = Object.fromEntries(state.repos.map(repo => [repo.name,
-              draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path]));
-            if (await act("preview_baseline", { paths })) setBaselineDirectoriesOpen(false);
+          h(Button, { type: "primary", disabled: busy || Object.values(baselinePaths).some(path => !path.trim()), onClick: async () => {
+            if (await act("preview_baseline", { paths: baselinePaths })) setBaselineDirectoriesOpen(false);
           } }, "预览目录与基线")) },
         h(Alert, { type: "info", showIcon: true, message: "更换仅对当前会话生效", description:
           "可保留现有目录，或填写其他已检出分支的 Git 仓库根目录。预览并明确确认后，采用所填目录当前分支及 HEAD，更新本会话目标分支与审查基线。同目录保留本轮未提交差异；更换目录时，旧文件留在原处，新目录已有改动按本机保留文件排除。" }),
         h(Form, { layout: "vertical", style: { marginTop: 16 } }, state.repos.map(repo =>
           h(Form.Item, { key: repo.name, label: `${repo.name}仓库目录（原目标分支：${repo.branch}）` },
+            baselineDetection && renderRepositoryCandidates(baselineDetection.repositories.find(entry => entry.role === repo.role), "baseline"),
             h(Input, { "aria-label": `${repo.name}仓库目录`, disabled: busy,
-              value: draft.baseline_paths?.[repo.name] ?? state.baseline_change_request?.repositories.find(entry => entry.name === repo.name)?.path ?? repo.path,
-              onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) }))))),
+              value: baselinePaths[repo.name],
+              onChange: event => changeDraft({ baseline_paths: { ...draft.baseline_paths, [repo.name]: event.target.value } }) })))),
+        h(Button, { disabled: busy, onClick: () => {
+          const paths = Object.fromEntries(state.repos.filter(repo => draft.baseline_paths?.[repo.name]?.trim())
+            .map(repo => [repo.role, draft.baseline_paths[repo.name]]));
+          changeDraft({ baseline_paths: {} });
+          return act("detect_repositories", { purpose: "baseline", paths });
+        } }, "重新检测目录")),
         h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
@@ -1678,7 +1734,11 @@ function WorkflowApp() {
             onClick: () => act("compile_now") }, "立即编译检查"),
           h(Button, { disabled: busy || model.working || !state.prepare_complete || Boolean(state.pending) || Boolean(state.manual_compile) || Object.keys(state.commits || {}).length > 0 ||
             !["已暂停", "已停止", "等待计划确认", "等待计划补充", "等待修复选择", "等待编译选择"].includes(stage),
-            onClick: () => setBaselineDirectoriesOpen(true) }, "变更目录与审查基线"),
+            onClick: () => {
+              changeDraft({ baseline_paths: {} });
+              setBaselineDirectoriesOpen(true);
+              return act("detect_repositories", { purpose: "baseline" });
+            } }, "变更目录与审查基线"),
           h(Button, { disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
             "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。需要澄清时等待明确回答；审查通过后仅本地 commit，不 push。" :

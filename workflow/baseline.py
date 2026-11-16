@@ -16,7 +16,7 @@ BASELINE_STAGES = {"已暂停", "已停止", "等待计划确认", "等待计划
 
 
 class BaselineFlow:
-    def change_baseline(self, token=None, paths=None):
+    def require_baseline_change(self):
         if self.state.get("workspace_handoff_request"):
             raise WorkflowError("请先完成或取消本地开发目录交接，再变更目录与审查基线。")
         state = self.require_state(*BASELINE_STAGES)
@@ -27,6 +27,10 @@ class BaselineFlow:
             raise WorkflowError("请先暂停并等待当前操作结束；仅已准备工作区且没有部分提交的未完成会话可变更基线。")
         if state.get("pending"):
             raise WorkflowError("仍有问题等待答复，请先回答；基线变更不会代替人工回答。")
+        return state
+
+    def change_baseline(self, token=None, paths=None):
+        state = self.require_baseline_change()
         saved = state.get("baseline_change_request")
         if token is not None:
             if not saved or token != saved["token"]:
@@ -105,11 +109,16 @@ class BaselineFlow:
                     repo.pop("checkout_backup", None)
                 if selected["directory_changed"] or selected["branch_changed"]:
                     repo.update(branch=selected["branch"], base="refs/heads/" + selected["branch"], create=False)
-                    for selection in state.get("selections", []):
-                        if selection["name"] == repo["name"]:
+                for selection in state.get("selections", []):
+                    if selection["name"] == repo["name"]:
+                        if selected["directory_changed"] or selected["branch_changed"]:
                             selection.update(path=selected["path"], branch=repo["branch"],
                                              base=repo["base"], create=False, track=False)
+                        if "expected_head" in selection:
+                            selection["expected_head"] = selected["current"]
                 repo["baseline"] = selected["current"]
+                if selected["directory_changed"] or selected["branch_changed"] or selected["previous"] != selected["current"]:
+                    repo["directory_matched"] = True
                 if "checkout_head" in repo:
                     repo["checkout_head"] = selected["current"]
                     repo["handoff_head"] = selected["current"]

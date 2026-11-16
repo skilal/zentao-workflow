@@ -29,6 +29,7 @@ from workflow.followup_documents import current_attachment_images
 from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
+from workflow.repository_selection import RepositorySelectionFlow, repository_catalog
 from workflow.pdf_materials import material_files
 from workflow.rpc import AppServer, CodexRequestError, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
@@ -113,7 +114,7 @@ def skipped_review_ids(state, delivery_round):
     return skipped
 
 
-class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow, CodexTitleFlow):
+class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, BaselineFlow, CompileFlow, ProgressFlow, CodexTitleFlow):
     active_stages = ACTIVE
 
     def __init__(self, settings, emit, store=None, zentao=None, zentao_lock=None, settings_lock=None):
@@ -243,8 +244,9 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         else:
             state.setdefault("deliveries", []).append(archived)
             state["continuation_context"] = None
-        targets = [{"name": repo["name"], "role": repo["role"], "path": repo["source"],
-                    "branch": repo["branch"], "base": "refs/heads/" + repo["branch"], "create": False}
+        targets = [{"name": repo["name"], "role": repo["role"], "path": repo["path"] if repo.get("directory_matched") else repo["source"],
+                    "branch": repo["branch"], "base": "refs/heads/" + repo["branch"], "create": False,
+                    **({"expected_head": git(repo["path"], "rev-parse", "HEAD")} if repo.get("directory_matched") else {})}
                    for repo in state["repos"]]
         history_index = len(state["history"])
         image_ids = {entry["id"] for entry in images}
@@ -395,7 +397,7 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         return bool(state and not project_locked(state))
 
     def start_plan(self, supplement, manual=False):
-        state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支")
+        state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支", "等待选择目录")
         if state.get("workspace_reuse_request"):
             raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
         if not state.get("snapshot"):
@@ -403,12 +405,16 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         if "plan_started_at" not in state:
             state["plan_started_at"] = timestamp()
             self.save()
+        if not manual and state.get("repository_detection", {}).get("purpose") == "prepare":
+            self.detect_repositories()
+            return
         if state["repos"] or (not manual and state["stage"] == "准备工作区失败" and state.get("selections")):
             if manual:
                 raise WorkflowError("工作区已经创建，不能改变当前会话分支。")
             self.prepare_and_plan(state["selections"], supplement)
             return
         self._close_rpc()
+        state.pop("repository_detection", None)
         state.update(phase="branch", thread_id=None, turn_id=None, supplement=supplement.strip(),
                      pause_requested=False, error="", branch_resolution={"repositories": [], "manual": manual})
         if "project" not in state:
@@ -436,7 +442,7 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         if not resolution["repositories"]:
             with self.settings_lock:
                 preferred = dict(saved_branches(self.settings, project))
-            resolution["repositories"] = [{**repository, "catalog": branch_catalog(repository),
+            resolution["repositories"] = [{**repository, "catalog": repository_catalog(repository, branch_catalog, tolerate_errors=True),
                 "status": "needs_user" if resolution["manual"] else "pending", "branch": "",
                 "reason": "请指定项目常用分支。" if resolution["manual"] else "", "question": "",
                 "candidates": [], "source": "", "refreshed": False, "refresh_state": "",
@@ -465,7 +471,7 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         self.state["stage"] = "刷新分支中"
         self.save()
         try:
-            repository["catalog"] = refresh_branches(repository)
+            repository["catalog"] = repository_catalog(repository, refresh_branches)
         except WorkflowError:
             repository["refresh_state"] = "failed"
             self.save()
@@ -494,13 +500,17 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
         self.state["stage"] = "拉取分支中"
         self.save()
         try:
-            metadata = fetch_branch(repository, name)
+            entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
+            sources = entry.get("sources", [{"path": repository["path"], "remote": True}])
+            source = next(source for source in sources if source["remote"])
+            metadata = fetch_branch({**repository, "path": source["path"]}, name)
         except WorkflowError:
             repository["fetch_state"] = "failed"
             self.save()
             raise
-        entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
         entry.update(metadata)
+        if "sources" in entry:
+            source.update(metadata)
         repository.setdefault("fetched_branches", []).append(name)
         repository["fetch_state"] = "done"
         self.state["stage"] = "已暂停" if self.state.get("pause_requested") else "识别分支中"
@@ -529,16 +539,13 @@ class Workflow(WorkspaceReleaseFlow, WorkspaceHandoffFlow, WorkspaceReuseFlow, B
             state["stage"] = "等待选择分支"
             self.save()
         else:
-            selections = []
-            for repository in repositories:
-                branch = next(entry for entry in repository["catalog"] if entry["name"] == repository["branch"])
-                base = ("refs/heads/" if branch["local"] else f"refs/remotes/{repository['remote']}/") + branch["name"]
-                selections.append({"name": repository["name"], "path": repository["path"],
-                    "role": repository["role"], "branch": branch["name"], "base": base,
-                    "create": not branch["local"], "track": not branch["local"]})
-            self._close_rpc()
-            state.update(thread_id=None, turn_id=None, phase="plan", stage="资料已读取")
-            self.prepare_and_plan(selections, state["supplement"])
+            # 已有待选记录须等待明确答复，恢复操作不能重新自动作出选择。
+            if state.get("repository_detection", {}).get("purpose") == "prepare":
+                state["stage"] = "等待选择目录"
+                self.save()
+                return
+            self._detect_repositories("prepare", repositories, {})
+            self._prepare_matched_repositories()
 
     def choose_branches(self, choices):
         state = self.require_state("等待选择分支")

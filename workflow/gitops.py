@@ -309,6 +309,13 @@ def acquire_workspace(selection, destination, store, state):
     claims = workspace_claims(sessions, state["id"])
     session_states = {session["id"]: session for session in sessions}
     entries = worktrees(source)
+    if "expected_head" in selection:
+        if git(source, "branch", "--show-current") != selection["branch"]:
+            raise WorkflowError("所选目录的分支或 HEAD 已变化，请重新检测并选择目录。")
+        # 明确匹配的目录只允许直接复用，不分配其他工作区或切换分支。
+        entries = [entry for entry in entries if Path(entry["worktree"]).resolve() == source]
+        if not entries:
+            raise WorkflowError("所选目录的 Git 工作区登记已变化，请重新检测。")
     available = []
     for entry in entries:
         path = Path(entry["worktree"]).resolve()
@@ -324,6 +331,9 @@ def acquire_workspace(selection, destination, store, state):
             if owner or managed:
                 holders = [session for session in sessions if session["id"] != state["id"]
                            and any(Path(repo["path"]).resolve() == path for repo in session["repos"])]
+                if "expected_head" in selection and any(repo["branch"] != selection["branch"]
+                        for session in holders for repo in session["repos"] if Path(repo["path"]).resolve() == path):
+                    raise WorkflowError("所选目录仍被其他未完成会话按不同目标分支占用，已停止；请先处理原会话目录绑定。")
                 if any(session.get("workspace_handoff_request") or session.get("workspace_release_request")
                        or any(repo.get("workspace_release") for repo in session["repos"]) for session in holders):
                     raise WorkflowError("目标目录正在交接或释放，请完成目录操作后再共享。")
@@ -350,6 +360,8 @@ def acquire_workspace(selection, destination, store, state):
         git(source, "check-ref-format", "--branch", branch)
         baseline = git(source, "rev-parse", "--verify", base + "^{commit}")
         actual = git(source, "rev-parse", "--verify", "refs/heads/" + branch + "^{commit}") if not selection["create"] else baseline
+        if "expected_head" in selection and actual != selection["expected_head"]:
+            raise WorkflowError("所选目录的分支或 HEAD 已变化，请重新检测并选择目录。")
         if not selection["create"] and actual != baseline and entry.get("branch") != "refs/heads/" + branch:
             raise WorkflowError("现有目标分支与所选代码基准不一致，请重新选择。")
         if entry.get("branch") == "refs/heads/" + branch:
@@ -360,8 +372,10 @@ def acquire_workspace(selection, destination, store, state):
             hook_paths = [(Path(configured_hooks) / name).as_posix() for name in HOOK_NAMES]
             if git(path, "ls-tree", "--name-only", baseline, "--", *hook_paths):
                 raise WorkflowError("所选代码基准包含 Git 钩子，切换分支前已停止，不会自动绕过。")
-        preserved = working_paths({"path": str(path)})
+        preserved = checkout_snapshot(path)["paths"] if "expected_head" in selection else working_paths({"path": str(path)})
         switching = entry.get("branch") != "refs/heads/" + branch
+        if "expected_head" in selection and switching:
+            raise WorkflowError("所选目录的分支登记已变化，请重新检测并选择目录。")
         if switching:
             try:
                 switch_branch(path, selection, baseline)
@@ -387,6 +401,8 @@ def acquire_workspace(selection, destination, store, state):
         if request and request["status"] == "restored" and request["selection"] == selection:
             record["checkout_backup"] = request["stash"]
     record.update(name=selection["name"], role=selection["role"])
+    if "expected_head" in selection:
+        record["directory_matched"] = True
     from workflow.shared_changes import initialize
     initialize(store, state, record)
     state["repos"].append(record)

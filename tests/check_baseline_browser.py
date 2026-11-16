@@ -45,6 +45,8 @@ def run():
             expect(preview).to_be_enabled()
             baseline = state["repos"][0]["baseline"]
             preview.click()
+            for repo in state["repos"]:
+                page.get_by_role("textbox", name=f"{repo['name']}仓库目录", exact=True).fill(repo["path"])
             page.get_by_role("button", name="预览目录与基线", exact=True).click()
             confirm = page.get_by_role("button", name="确认变更并保留会话", exact=True)
             expect(confirm).to_be_enabled()
@@ -58,6 +60,8 @@ def run():
             assert state["repos"][0]["baseline"] == baseline
             assert state["repos"][0]["branch"] == "项目分支"
             preview.click()
+            for repo in state["repos"]:
+                page.get_by_role("textbox", name=f"{repo['name']}仓库目录", exact=True).fill(repo["path"])
             page.get_by_role("button", name="预览目录与基线", exact=True).click()
             expect(confirm).to_be_enabled()
             page.reload()

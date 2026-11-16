@@ -55,7 +55,7 @@ class WorkspaceReuseConfirmationChecks(TestCase):
                      selections=deepcopy(self.selections), supplement="保留补充说明",
                      codex={"model": "隔离模型", "reasoning_effort": "high"},
                      snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []},
-                     history=[{"role": "用户", "text": "原始需求", "phase": "plan"}],
+                     history=[{"role": "用户", "text": "原始需求", "phase": "plan", "time": state["created_at"]}],
                      error="历史版本的分支占用提示", max_fix_rounds=3)
         runtime = self.application.sessions.add(state)
         runtime.engine._start_turn = Mock()
