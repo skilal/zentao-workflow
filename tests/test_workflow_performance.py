@@ -9,6 +9,7 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 
 from workflow.approvals import is_workflow_tool_call
+from workflow.change_locations import SUMMARY_POLICY
 from workflow.engine import Workflow
 from workflow.gitops import git
 from workflow.mcp_server import TOOLS, Tools
@@ -187,6 +188,32 @@ class ContextDeliveryChecks(PerformanceFixture):
         with self.assertRaises(WorkflowError):
             self.start()
         self.assertNotIn("thread_input", self.flow.store.load(self.state["id"]))
+
+    def test_policy_is_sent_once_survives_reload_and_updates_with_its_content(self):
+        first = self.start()[0]["text"]
+        self.assertIn(SUMMARY_POLICY, first)
+        self.flow.state = self.flow.store.load(self.state["id"])
+        self.state = self.flow.state
+        second = self.start()[0]["text"]
+        self.assertNotIn(SUMMARY_POLICY, second)
+        self.assertGreater(len(first) - len(second), len(SUMMARY_POLICY))
+        with patch("workflow.engine.SUMMARY_POLICY", "页面说明新规则"):
+            self.assertIn("页面说明新规则", self.start("fix")[0]["text"])
+            self.assertNotIn("页面说明新规则", self.start("fix")[0]["text"])
+            self.state["thread_id"] = "另一线程"
+            self.assertIn("页面说明新规则", self.start()[0]["text"])
+
+    def test_failed_policy_update_is_resent_without_repeating_successful_version(self):
+        self.start()
+        previous = deepcopy(self.state["thread_input"])
+        with patch("workflow.engine.SUMMARY_POLICY", "页面说明新规则"):
+            self.rpc.request.side_effect = WorkflowError("模拟请求停止")
+            with self.assertRaises(WorkflowError):
+                self.start()
+            self.assertEqual(self.flow.store.load(self.state["id"])["thread_input"], previous)
+            self.rpc.request.side_effect = None
+            self.assertIn("页面说明新规则", self.start()[0]["text"])
+            self.assertNotIn("页面说明新规则", self.start()[0]["text"])
 
     def test_materials_are_explicit_normalized_and_versioned_without_changing_snapshot(self):
         before = deepcopy(self.state["snapshot"])

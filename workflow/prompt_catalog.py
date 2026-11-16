@@ -2,7 +2,7 @@
 
 from workflow import prompt_templates as templates, prompts
 from workflow.branching import BRANCH_INSTRUCTIONS
-from workflow.change_locations import SUMMARY_PHASES, SUMMARY_INSTRUCTIONS
+from workflow.change_locations import SUMMARY_PHASES, SUMMARY_INSTRUCTIONS, SUMMARY_POLICY
 from workflow.commit_messages import COMMIT_INSTRUCTIONS
 from workflow.settings import ROOT, WorkflowError
 
@@ -42,6 +42,7 @@ def prompt_catalog(settings):
             text += templates.REVIEW_SKIPPED.format(skipped_ids="【本轮不修复编号 JSON】")
             text += "\n" + COMMIT_INSTRUCTIONS
         return templates.TURN.format(phase=phase, scope="【需求范围说明：按条件选择一项】", text=text,
+                                     policy_instruction="【页面说明规则：首次或变更时发送】",
                                      material_instruction="【资料读取指令：按条件选择一项】", context="【变化上下文 JSON】")
 
     def variant(key, title, phase, text, condition):
@@ -126,16 +127,19 @@ def prompt_catalog(settings):
          "content": templates.TURN}], [
              fragment("skill", "线程级通用规则原文", skill, skill_source, "非分支识别线程"),
              fragment("turn", "回合级组装格式", templates.TURN, "workflow/prompt_templates.py · TURN", "非分支识别模型回合"),
+             fragment("summary_policy", "历史页面说明规则更新", SUMMARY_POLICY, "workflow/change_locations.py · SUMMARY_POLICY",
+                      "当前线程首次发送或规则内容变更时发送；成功启动回合后记录，恢复及后续回合不重复"),
              *scope_fragments, *material_fragments, summary, *review_fragments],
-          notes="上下文只发送变化字段；图片以 localImage 输入按内容去重，不在文本模板中展开。输出 JSON Schema 和工具定义属于接口约束，不是提示词正文。本页不包含模型服务内部系统提示或业务仓库规则原文。")
+          notes="上下文只发送变化字段；图片以 localImage 输入按内容去重，不在文本模板中展开。通用规则中的提问等待和变化字段约定不在每回合重复；历史页面说明规则仅首次或内容变化时发送。阶段职责、授权和审查约束仍逐回合提供。输出 JSON Schema 和工具定义属于接口约束，不是提示词正文。本页不包含模型服务内部系统提示或业务仓库规则原文。")
     return {"stages": stages, "placeholders": [
         {"name": "【需求范围说明：按条件选择一项】", "description": "按续接未完成任务、普通续聊、直接需求、关联工作项的条件选择唯一范围说明。"},
         {"name": "【资料读取指令：按条件选择一项】", "description": "自动命名优先，否则按资料版本选择首次读取或复用资料。"},
         {"name": "【变化上下文 JSON】", "description": "动态需求、仓库、计划、授权决定、附件引用及 compile_checks（含诊断与修复范围）等，仅发送变化字段，不在本页读取实际值。"},
+        {"name": "【页面说明规则：首次或变更时发送】", "description": "当前线程未接收或内容变化时发送历史页面说明规则及换行；其余回合为空。"},
         {"name": "【分支上下文 JSON】", "description": "所属项目、工作项、补充说明、正文及待识别仓库的分支元数据。"},
         {"name": "【上轮审查结果 JSON；首次为 null】／【可引用旧编号 JSON】／【本轮不修复编号 JSON】／【交付轮次】", "description": "来自当前交付审查记录，不在本页读取或代入。"},
         {"name": "【选中问题 JSON】／【人工修复说明】／【人工补充回答】", "description": "来自人工选择和输入，不在本页读取或代入。"},
-        {"name": "{phase}／{scope}／{text}／{material_instruction}／{context}", "description": "源码模板槽位，依次为阶段标识、唯一范围说明、阶段指令及附加规则、唯一资料读取指令、变化上下文 JSON。"},
+        {"name": "{phase}／{scope}／{text}／{policy_instruction}／{material_instruction}／{context}", "description": "源码模板槽位，依次为阶段标识、唯一范围说明、阶段指令及附加规则、按版本去重的页面说明规则、唯一资料读取指令、变化上下文 JSON。"},
         {"name": "{prompt}／{review}／{previous}", "description": "Review 文件原文（已有会话可采用快照）、审查职责、上轮审查 JSON；首次上轮结果为 null。"},
         {"name": "{fix}／{chosen}／{note}／{reply}", "description": "修复职责、选中问题 JSON、人工修复说明、人工补充回答。"},
         {"name": "{delivery_round}／{previous_ids}／{skipped_ids}", "description": "当前交付轮次、可引用旧问题编号 JSON、本轮不修复编号 JSON，编号列表可为空。"},

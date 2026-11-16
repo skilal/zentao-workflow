@@ -13,7 +13,7 @@ import test_auto_delivery as delivery
 import test_previews as previews
 from workflow import prompt_templates, prompts
 from workflow.branching import BRANCH_INSTRUCTIONS
-from workflow.change_locations import SUMMARY_INSTRUCTIONS
+from workflow.change_locations import SUMMARY_INSTRUCTIONS, SUMMARY_POLICY
 from workflow.commit_messages import COMMIT_INSTRUCTIONS
 from workflow.prompt_catalog import prompt_catalog
 from workflow.settings import ROOT, WorkflowError
@@ -104,6 +104,7 @@ class PromptCatalogChecks(TestCase):
                 variant = next(entry for entry in stages[stage_id]["templates"] if entry["id"] == variant_id)
                 expected = variant["content"].replace("【需求范围说明：按条件选择一项】", prompt_templates.SCOPE_ITEMS)
                 expected = expected.replace("【资料读取指令：按条件选择一项】", prompt_templates.MATERIAL_CHANGED)
+                expected = expected.replace("【页面说明规则：首次或变更时发送】", SUMMARY_POLICY + "\n")
                 expected = expected.replace("【变化上下文 JSON】", context).replace("【交付轮次】", "1")
                 expected = expected.replace("【可引用旧编号 JSON】", "[]").replace("【本轮不修复编号 JSON】", "[]")
                 self.assertEqual(sent, expected)

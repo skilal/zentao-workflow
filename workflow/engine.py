@@ -20,7 +20,7 @@ from workflow.baseline import BaselineFlow
 from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
 from workflow.compile_checks import compile_context, compile_repositories
 from workflow.codex_titles import CodexTitleFlow
-from workflow.change_locations import SUMMARY_PHASES, SUMMARY_INSTRUCTIONS, collect_change_summary
+from workflow.change_locations import SUMMARY_PHASES, SUMMARY_INSTRUCTIONS, SUMMARY_POLICY, collect_change_summary
 from workflow.context import context_hash, requirement_context
 from workflow.delivery import apply_followup_replacements, validate_review_request
 from workflow.commit_messages import COMMIT_INSTRUCTIONS, COMMIT_MESSAGE_SCHEMA, prepare_commit_messages
@@ -413,9 +413,10 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 raise WorkflowError("工作区已经创建，不能改变当前会话分支。")
             self.prepare_and_plan(state["selections"], supplement)
             return
+        branch_thread_id = state.get("thread_id") if state["phase"] == "branch" else None
         self._close_rpc()
         state.pop("repository_detection", None)
-        state.update(phase="branch", thread_id=None, turn_id=None, supplement=supplement.strip(),
+        state.update(phase="branch", thread_id=branch_thread_id, turn_id=None, supplement=supplement.strip(),
                      pause_requested=False, error="", branch_resolution={"repositories": [], "manual": manual})
         if "project" not in state:
             state["project"] = project_context(state["item"], state["snapshot"]["sources"][0]["raw"])
@@ -790,6 +791,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         previous_input = state.get("thread_input", {})
         if previous_input.get("thread_id") != state["thread_id"]:
             previous_input = {}
+        policy_hash = context_hash(SUMMARY_POLICY)
+        policy_instruction = (SUMMARY_POLICY + "\n"
+                              if previous_input.get("summary_policy_hash") != policy_hash else "")
         image_hashes = set(previous_input.get("images", []))
         image_inputs = []
         if phase != "branch":
@@ -817,6 +821,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         if naming:
             material_instruction = prompt_templates.MATERIAL_NAMING.format(max_length=naming["max_length"])
         prompt = prompt_templates.TURN.format(phase=phase, scope=scope, text=text,
+                                              policy_instruction=policy_instruction,
                                               material_instruction=material_instruction, context=dumps(changed, ensure_ascii=False))
         if phase == "branch":
             context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
@@ -846,7 +851,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.start_progress(state["turn_id"])
             if phase != "branch":
                 state["thread_input"] = {"thread_id": state["thread_id"], "context_hashes": hashes,
-                                         "images": sorted(image_hashes)}
+                                         "images": sorted(image_hashes), "summary_policy_hash": policy_hash}
             self.save()
 
     def approve_plan(self):

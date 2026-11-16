@@ -397,6 +397,32 @@ class BranchWorkflowChecks(TestCase):
         self.flow._event({"method": "client/error", "params": {"message": "旧识别连接的迟到事件"}}, epoch)
         self.assertEqual(self.flow.state["error"], "")
 
+    def test_restarting_branch_detection_resumes_its_thread_with_latest_input(self):
+        self.flow._start_turn = Workflow._start_turn.__get__(self.flow)
+        rpc = Mock(model="示例模型", disabled_mcp={})
+        rpc.process.poll.return_value = None
+        rpc.request.side_effect = lambda method, params: {
+            "thread/start": {"thread": {"id": "branch-thread"}},
+            "thread/resume": {"thread": {"id": "branch-thread"}},
+            "thread/name/set": {}, "turn/start": {"turn": {"id": "branch-turn"}}}[method]
+        with patch("workflow.engine.AppServer", return_value=rpc):
+            self.flow.start_plan("原补充")
+            epoch = self.flow.connection_epoch
+            self.flow.turn_running = False
+            self.complete(decision("frontend", status="needs_user"), decision("backend", "feature/示例"))
+            self.flow.start_plan("本次新补充")
+        methods = [call.args[0] for call in rpc.request.call_args_list]
+        self.assertEqual(methods.count("thread/start"), 1)
+        self.assertEqual(methods.count("thread/resume"), 1)
+        resumed = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "thread/resume")
+        self.assertEqual(resumed["threadId"], "branch-thread")
+        self.assertFalse(resumed["config"]["mcp_servers"]["workflow"]["enabled"])
+        sent = next(call.args[1]["input"][0]["text"] for call in reversed(rpc.request.call_args_list)
+                    if call.args[0] == "turn/start")
+        self.assertEqual(loads(sent.split("\n", 1)[1])["supplement"], "本次新补充")
+        self.flow._event({"method": "client/error", "params": {"message": "旧连接迟到事件"}}, epoch)
+        self.assertEqual(self.flow.state["error"], "")
+
     def test_configuration_requires_exactly_one_repository_per_role(self):
         settings = deepcopy(self.settings)
         settings["repositories"][1]["role"] = "frontend"

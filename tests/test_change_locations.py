@@ -141,7 +141,7 @@ class ChangeSummaryChecks(TestCase):
             self.flow._start_turn("继续原阶段")
             prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
             self.assertEqual(SUMMARY_INSTRUCTIONS in prompt, phase in {"review", "followup"})
-            self.assertIn(SUMMARY_POLICY, prompt)
+            self.assertEqual(SUMMARY_POLICY in prompt, phase == "implement")
 
     def test_old_thread_fix_restore_and_answer_replace_legacy_report_requirement(self):
         self.state["history"].append({"role": "控制器", "text":
@@ -152,6 +152,7 @@ class ChangeSummaryChecks(TestCase):
         self.flow.ensure_rpc = Mock()
         for text in (prompts.FIX, prompts.RESTORE, prompt_templates.ANSWER_INPUT.format(reply="旧要求已取消，继续修复")):
             with self.subTest(text=text):
+                self.state.pop("thread_input", None)
                 self.state["phase"] = "fix"
                 self.flow.rpc.request.return_value = {"turn": {"id": "恢复修复"}}
                 self.flow._start_turn(text)
