@@ -99,7 +99,7 @@ def compile_context(state):
     result = {key: batch[key] for key in ("status", "fix_round", "limit")}
     result["repositories"] = [{key: entry[key] for key in
                                ("name", "status", "modules", "summary", "diagnostics", "failure_reasons", "analysis",
-                                "compiler_diagnostics", "diagnostics_complete", "repair_category")
+                                "compiler_diagnostics", "diagnostics_complete", "repair_category", "failure_services")
                                if key in entry}
                               for entry in batch["repositories"] if entry["name"] in backend_names]
     if batch.get("analysis_repository") in backend_names:
@@ -278,28 +278,49 @@ def failure_reasons(repository, output):
     return reasons
 
 
+def failure_services(repository, output, diagnostics):
+    """只根据 Maven 失败项目或诊断文件所属模块确定报错服务。"""
+    services = {match[1] for match in finditer(r"\bon project\s+([\w.-]+)\s*:", output)}
+    if services:
+        return sorted(services)
+    for diagnostic in diagnostics:
+        directory = safe_file(repository, diagnostic["path"]).parent
+        root = Path(repository["path"]).resolve()
+        while directory != root and not (directory / "pom.xml").is_file():
+            directory = directory.parent
+        pom = directory / "pom.xml"
+        if pom.is_file():
+            document = ElementTree.parse(pom)
+            artifact = document.findtext("m:artifactId", namespaces=NS)
+            service = artifact.strip() if artifact else directory.relative_to(root).as_posix()
+            if service != ".":
+                services.add(service)
+    return sorted(services)
+
+
 def classify(repository, returncode, output):
     lower = output.lower()
     if not returncode:
         return {"status": "passed", "summary": "编译检查通过。", "diagnostics": []}
     reasons = failure_reasons(repository, output)
+    parsed = compiler_diagnostics(repository, output)
+    details = {"failure_reasons": reasons, "failure_services": failure_services(repository, output, parsed["items"])}
     if any(marker in lower for marker in ENVIRONMENT_ERRORS):
         return {"status": "blocked", "summary": "环境、网络或工具配置异常，具体原因见下方；处理后可重新检查。",
-                "diagnostics": [], "failure_reasons": reasons, "failure_kind": "environment"}
+                "diagnostics": [], **details, "failure_kind": "environment"}
     if any(marker in lower for marker in DEPENDENCY_ERRORS) or (
             "offline" in lower and any(marker in lower for marker in ("cannot access", "cannot resolve"))):
         return {"status": "dependencies", "summary": "本机缺少依赖或 Maven 插件，可选择补齐依赖并重新检查；下载须明确授权。",
-                "diagnostics": [], "failure_reasons": reasons, "failure_kind": "dependencies"}
+                "diagnostics": [], **details, "failure_kind": "dependencies"}
     has_code_error = any(marker in lower for marker in CODE_ERRORS) or search(
         r"(?m)^\s*\[ERROR\][^\r\n]*\.java[:\s]*[\[(:]\d+", output.replace("\\", "/"))
-    parsed = compiler_diagnostics(repository, output)
     has_code_error = has_code_error or bool(parsed["items"])
     evidence = code_diagnostics(repository, output, parsed) if has_code_error else []
     if evidence:
         return {"status": "code_error", "summary": "编译诊断明确指向本轮修改的代码。", "diagnostics": evidence,
-                "failure_reasons": reasons}
+                **details}
     return {"status": "blocked", "summary": "检查未通过，尚不能确认属于本次引入的代码错误，可先分析失败原因。",
-            "diagnostics": [], "failure_reasons": reasons,
+            "diagnostics": [], **details,
             "compiler_diagnostics": parsed["items"], "diagnostics_complete": parsed["complete"],
             "analysis_required": bool(reasons or parsed["items"]), "failure_kind": "code" if has_code_error else "unknown"}
 
@@ -315,15 +336,15 @@ class DiagnosticOutput:
         self.context = 0
 
     def append(self, chunk):
-        self.tail.append(chunk)
         lines = (self.remaining + chunk).split(b"\n")
         self.remaining = lines.pop()
         for line in lines:
             self.capture(line)
 
     def capture(self, line):
-        text = sub(r"\x1b\[[0-9;]*[A-Za-z]", "", line.decode("utf-8", errors="replace"))
-        error = bool(search(r"^\s*\[(?:ERROR|FATAL)\]|\.java[:(].*\berror\s*:", text, IGNORECASE))
+        self.tail.append(line)
+        text = sub(br"\x1b\[[0-9;]*[A-Za-z]", b"", line)
+        error = bool(search(br"^\s*\[(?:ERROR|FATAL)\]|\.java[:(].*\berror\s*:", text, IGNORECASE))
         if error:
             self.context = 4
         if (error or self.context) and self.error_bytes + len(line) < 128 * 1024:
@@ -335,7 +356,10 @@ class DiagnosticOutput:
         if self.remaining:
             self.capture(self.remaining)
             self.remaining = b""
-        return (b"\n".join(self.errors) + b"\n" + b"".join(self.tail)).decode("utf-8", errors="replace")
+        try:
+            return b"\n".join([*self.errors, *self.tail]).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise WorkflowError("诊断输出未使用约定的 UTF-8 编码，已停止解析；请核对检查工具的输出编码后重新检查。") from error
 
 
 class CompileRunner:
@@ -359,6 +383,10 @@ class CompileRunner:
             raise WorkflowError("编译工具路径或参数包含不支持的命令字符，请人工处理。")
         environment = dict(environ)
         environment["CI"] = "true"
+        # 仅约束本次子进程输出；不更改业务源码编码或本机环境配置。
+        environment["JAVA_TOOL_OPTIONS"] = (environment.get("JAVA_TOOL_OPTIONS", "") +
+            " -Dstdout.encoding=UTF-8 -Dstderr.encoding=UTF-8"
+            " -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8 -Djansi.encoding=UTF-8").strip()
         streams = [DiagnosticOutput(), DiagnosticOutput()]
         with self.lock:
             if self.cancelled.is_set():

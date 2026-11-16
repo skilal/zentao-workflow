@@ -271,6 +271,29 @@ class CompileChecks(TestCase):
         self.assertEqual(result["status"], "blocked")
         self.assertTrue(result["failure_reasons"])
 
+    def test_failed_service_comes_from_maven_project_not_all_checked_modules(self):
+        output = (f"[ERROR] {self.repo['path']}/档案服务/业务.java:[1,12] 找不到符号\n"
+                  "[ERROR] Failed to execute goal compiler:compile on project archives-server: Compilation failure\n")
+        result = classify(self.repo, 1, output)
+        self.assertEqual(result["failure_services"], ["archives-server"])
+        self.assertNotIn("技术组件", result["failure_services"])
+        self.start([result])
+        self.assertEqual(compile_context(self.state)[0]["repositories"][0]["failure_services"], ["archives-server"])
+
+    def test_failed_service_can_be_located_from_source_module_without_maven_summary(self):
+        self.change("档案服务/pom.xml", POM.format("<artifactId>archives-server</artifactId>"))
+        output = f"[ERROR] {self.repo['path']}/档案服务/业务.java:[1,12] 找不到符号"
+        self.assertEqual(classify(self.repo, 1, output)["failure_services"], ["archives-server"])
+        unknown = classify(self.repo, 1, "[ERROR] 工具异常，未定位服务")
+        self.assertEqual(unknown["failure_services"], [])
+
+    def test_multiple_failed_projects_are_deduplicated_even_with_garbled_old_paths(self):
+        output = ("[ERROR] /����/业务.java:[1,12] �Ҳ�������\n"
+                  "[ERROR] Failed to execute goal compiler:compile on project archives-server: Compilation failure\n"
+                  "[ERROR] Failed to execute goal compiler:compile on project archives-server: Compilation failure\n"
+                  "[ERROR] Failed to execute goal compiler:compile on project platform-server: Compilation failure\n")
+        self.assertEqual(classify(self.repo, 1, output)["failure_services"], ["archives-server", "platform-server"])
+
     def test_unrelated_plugin_failure_does_not_turn_java_warning_into_repair(self):
         output = f"[WARNING] {self.repo['path']}/档案服务/业务.java:[1,12] deprecated\n[ERROR] unknown plugin failure"
         self.assertEqual(classify(self.repo, 1, output)["status"], "blocked")
@@ -305,6 +328,27 @@ class CompileChecks(TestCase):
         result = classify(self.repo, 1, capture.text())
         self.assertEqual(result["status"], "code_error")
         self.assertIn("缺少的方法", result["diagnostics"][0]["message"])
+
+    def test_chinese_diagnostic_split_across_bytes_and_tail_retains_complete_characters(self):
+        capture = DiagnosticOutput()
+        output = (f"[ERROR] {self.repo['path']}/档案服务/业务.java:[1,12] 找不到符号\n"
+                  "[ERROR] 符号: 方法 缺少的方法()\n")
+        for byte in output.encode("utf-8"):
+            capture.append(bytes([byte]))
+        for _ in range(40):
+            capture.append("后续进度\n".encode("utf-8"))
+        text = capture.text()
+        self.assertNotIn("\uFFFD", text)
+        self.assertIn("找不到符号", text)
+        result = classify(self.repo, 1, text)
+        self.assertEqual(result["diagnostics"][0]["path"], "档案服务/业务.java")
+        self.assertIn("缺少的方法", result["diagnostics"][0]["message"])
+
+    def test_incompatible_diagnostic_encoding_stops_without_saving_replacement_characters(self):
+        capture = DiagnosticOutput()
+        capture.append("[ERROR] 找不到符号\n".encode("gb18030"))
+        with self.assertRaisesRegex(WorkflowError, "UTF-8 编码"):
+            capture.text()
 
     def test_unprefixed_environment_error_and_truncated_location_are_not_lost(self):
         result = classify(self.repo, 1, "The JAVA_HOME environment variable is not defined correctly")
@@ -511,9 +555,15 @@ class CompileChecks(TestCase):
         runner = CompileRunner()
         process = Mock(stdout=BytesIO(b""), stderr=BytesIO(b""), returncode=0)
         process.poll.return_value = 0
-        with patch("workflow.compile_checks.ProcessTree") as tree, patch("workflow.compile_checks.Popen", return_value=process) as popen:
+        with patch("workflow.compile_checks.ProcessTree") as tree, patch("workflow.compile_checks.Popen", return_value=process) as popen, \
+                patch.dict("workflow.compile_checks.environ", {"JAVA_TOOL_OPTIONS": "-Xmx512m"}):
             runner.execute(["mvn.cmd", "-o", "compile"], self.repo["path"], False)
             self.assertEqual(popen.call_args.kwargs["env"]["CI"], "true")
+            options = popen.call_args.kwargs["env"]["JAVA_TOOL_OPTIONS"]
+            self.assertTrue(options.startswith("-Xmx512m "))
+            for option in ("stdout.encoding", "stderr.encoding", "sun.stdout.encoding", "sun.stderr.encoding", "jansi.encoding"):
+                self.assertIn(f"-D{option}=UTF-8", options)
+            self.assertNotIn("-Dfile.encoding", options)
             tree.return_value.attach.assert_called_once_with(process)
             tree.return_value.close.assert_called_once()
         tree = Mock()

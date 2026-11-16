@@ -29,7 +29,14 @@ def check():
         app.codex_catalog = CATALOG
         variants = [("历史失败", BLOCKED), ("缺少插件", {**MISSING, "failure_reasons": [
             "Cannot resolve plugin org.example:compiler:1 in offline mode"]}),
-            ("代码错误", fixture.code_error())]
+            ("代码错误", fixture.code_error()),
+            ("乱码诊断", {**BLOCKED, "failure_reasons": ["/����/业务.java:[37,21] �Ҳ�������",
+                "Failed to execute goal compiler:compile on project archives-server: Compilation failure"],
+                "analysis": "旧诊断路径 /����/业务.java"}),
+            ("中文诊断", {**BLOCKED, "modules": ["平台服务", "技术组件", "档案服务"],
+                "failure_services": ["archives-server"], "failure_reasons": ["找不到符号：方法 检查()"],
+                "compiler_diagnostics": [{"path": "档案服务/src/main/java/中国/业务.java", "line": 37,
+                                           "message": "找不到符号；符号：方法 检查()"}]})]
         for number, (title, result) in enumerate(variants):
             state = deepcopy(fixture.state)
             state.update(id=f"compile-browser-{number}", custom_title=title, plan_started_at=state["updated_at"])
@@ -103,6 +110,20 @@ def check():
             runtime = app.sessions.get("compile-browser-2")
             assert runtime.engine.state["phase"] == "compile_fix"
             assert runtime.engine.state["compile_checks"][-1]["repair_paths"] == ["档案服务/业务.java"]
+
+            page.get_by_text("乱码诊断", exact=True).first.click()
+            expect(page.get_by_text("报错服务：", exact=True)).to_be_visible()
+            expect(page.get_by_text("报错服务：archives-server", exact=True)).to_be_visible()
+            expect(page.get_by_text("历史诊断含乱码，无法还原文件路径和错误详情，请重新检查。", exact=True)).to_be_visible()
+            assert "\uFFFD" not in page.locator(".compile-checks").inner_text()
+            page.reload()
+            expect(page.get_by_text("报错服务：archives-server", exact=True)).to_be_visible()
+
+            page.get_by_text("中文诊断", exact=True).first.click()
+            expect(page.get_by_text("报错服务：archives-server", exact=True)).to_be_visible()
+            expect(page.get_by_text("检查范围：平台服务、技术组件、档案服务（含所需模块）", exact=True)).to_be_visible()
+            expect(page.get_by_text("档案服务/src/main/java/中国/业务.java:37 · 找不到符号；符号：方法 检查()", exact=True)).to_be_visible()
+            page.screenshot(path=str(ROOT / ".local" / "compile-diagnostics-qa.png"), full_page=True)
             assert not errors, errors
             browser.close()
     finally:

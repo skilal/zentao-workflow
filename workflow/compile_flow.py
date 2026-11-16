@@ -206,7 +206,7 @@ class CompileFlow:
                 entry.update(source_hash=snapshot_hash(repository), dependency_hash=dependency_hash(repository),
                              status="running", summary="正在进行编译检查。", diagnostics=[], failure_reasons=[], analysis="",
                              compiler_diagnostics=[], diagnostics_complete=False, analysis_required=False,
-                             repair_category="")
+                             repair_category="", failure_services=[])
                 self.save()
                 entry["modules"] = backend_modules(repository)
                 result = self.compile_runner.check(repository, entry["modules"], entry["name"] == download_name)

@@ -1794,17 +1794,29 @@ function WorkflowApp() {
                 batch.id === latest.id && batch.delivery_round === state.delivery_round && state.phase === "compile" &&
                 ["等待编译选择", "已暂停", "已停止"].includes(stage) && !["passed", "skipped", "excluded"].includes(entry.status);
               const choose = decision => act("compile_decision", { batch_id: batch.id, repository: entry.name, decision });
+              const reasons = entry.failure_reasons || [];
+              const services = entry.failure_services?.length ? entry.failure_services : [...new Set(reasons.flatMap(reason =>
+                [...reason.matchAll(/\bon project\s+([\w.-]+)\s*:/g)].map(match => match[1])))];
+              const garbled = reasons.some(reason => reason.includes("\uFFFD"));
+              const readableReasons = reasons.filter(reason => !reason.includes("\uFFFD"));
               return h("div", { className: "question", key: entry.name },
                 h(Space, null, h("strong", null, entry.name), h(Tag, { color: entry.status === "passed" ? "success" : entry.status === "skipped" ? "default" : "gold" }, statusNames[entry.status] || entry.status)),
-                h("p", null, entry.summary),
+                h("p", null, entry.summary.includes("\uFFFD") ? "历史诊断含乱码，请重新检查以获取完整错误信息。" : entry.summary),
+                ["blocked", "dependencies", "code_error"].includes(entry.status) && h("p", null,
+                  h("strong", null, "报错服务："), services.length ? services.join("、") : "当前诊断未定位到具体服务"),
                 ["blocked", "dependencies", "code_error"].includes(entry.status) &&
                   (entry.failure_reasons?.length > 0 || !entry.diagnostics?.length) && h(Alert, {
                   type: "warning", showIcon: true, message: "失败原因", description: entry.failure_reasons?.length > 0 ?
-                    h("ul", { className: "markdown-body" }, entry.failure_reasons.map((reason, number) => h("li", { key: number }, reason))) :
+                    h(React.Fragment, null,
+                      garbled && h("p", null, "历史诊断含乱码，无法还原文件路径和错误详情，请重新检查。"),
+                      readableReasons.length > 0 && h("ul", { className: "markdown-body" }, readableReasons.map((reason, number) => h("li", { key: number }, reason)))) :
                     entry.failure_reasons ? "本次未提取到具体诊断，可先分析失败原因。" : "该历史记录未保存具体失败原因，请重新检查以取得诊断。" }),
-                entry.modules.length > 0 && h(Typography.Paragraph, { type: "secondary" }, `模块：${entry.modules.join("、")}（含所需模块）`),
-                entry.diagnostics?.map((diagnostic, number) => h("p", { key: number }, `${diagnostic.path}:${diagnostic.line} · ${diagnostic.message}`)),
-                entry.analysis && h("div", null, h("strong", null, "失败分析"), h(Markdown, { text: entry.analysis })),
+                entry.modules.length > 0 && h(Typography.Paragraph, { type: "secondary" }, `检查范围：${entry.modules.join("、")}（含所需模块）`),
+                (entry.diagnostics?.length ? entry.diagnostics : entry.compiler_diagnostics)?.map((diagnostic, number) =>
+                  h("p", { key: number }, `${diagnostic.path}:${diagnostic.line} · ${diagnostic.message}`.includes("\uFFFD") ?
+                    "历史文件诊断含乱码，请重新检查。" : `${diagnostic.path}:${diagnostic.line} · ${diagnostic.message}`)),
+                entry.analysis && h("div", null, h("strong", null, "失败分析"), h(Markdown, {
+                  text: entry.analysis.includes("\uFFFD") ? "历史分析引用了乱码诊断，请重新检查后再分析。" : entry.analysis })),
                 retired && h(Button, { disabled: busy, onClick: () => choose("retry") }, "前端检查已取消，继续后端流程"),
                 current && h(Space, { wrap: true },
                   entry.status === "dependencies" && h(Button, { type: "primary", disabled: busy, onClick: () => choose("download") }, "补齐依赖并重新检查（允许下载）"),
