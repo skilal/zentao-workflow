@@ -70,6 +70,102 @@ class CompileAutomationChecks(TestCase):
             self.assertEqual(self.state["compile_checks"][-1]["fix_round"], 0)
             self.assertNotIn("repair_paths", self.state["compile_checks"][-1])
 
+    def test_authorized_original_error_without_structured_diagnostics_is_repaired_and_rechecked(self):
+        self.caller_failure()
+        failure = {**BLOCKED, "failure_reasons": ["调用方.java: 找不到方法 旧方法"],
+                   "analysis": "基线原有错误，调用方仍使用旧方法；结构化诊断不完整。"}
+        self.fixture.start([failure])
+        self.fixture.decide("fix").assert_not_called()
+        self.assertTrue(compile_context(self.state)[0]["manual_repair"])
+        self.flow.save()
+        tools = Tools(self.state["id"])
+        tools.store = self.flow.store
+        with self.assertRaisesRegex(WorkflowError, "当前阶段禁止修改"):
+            tools.call("replace_text", {"repository": "后端", "path": "技术组件/调用方.java",
+                                        "old": "旧方法()", "new": "新方法()"})
+        self.flow._compile_analyzed(self.analysis("original_code", repairs=[{
+            "path": "技术组件/调用方.java", "source_excerpt": "Object 值 = 旧方法();",
+            "related_path": "技术组件/调用方.java", "reason": "原有调用方引用了不存在的方法，与失败诊断一致。"}]))
+        batch = self.state["compile_checks"][-1]
+        self.assertEqual(batch["repair_paths"], ["技术组件/调用方.java"])
+        self.assertEqual(compile_context(self.state)[0]["repositories"][0]["repair_category"], "original_code")
+        self.flow.save()
+        with self.assertRaisesRegex(WorkflowError, "授权的本次错误文件"):
+            tools.call("replace_text", {"repository": "后端", "path": "档案服务/业务.java",
+                                        "old": "值 = 错误", "new": "值 = 1"})
+        tools.call("replace_text", {"repository": "后端", "path": "技术组件/调用方.java",
+                                    "old": "旧方法()", "new": "新方法()"})
+        with patch.object(CompileRunner, "check", return_value=deepcopy(PASSED)) as runner:
+            self.flow._compile_repaired()
+        self.assertEqual(runner.call_count, 1)
+        self.assertFalse(runner.call_args.args[2])
+        self.assertEqual(self.state["phase"], "review")
+        self.assertNotIn("manual_repair", batch)
+
+    def test_original_repairs_require_explicit_authorization_and_source_evidence(self):
+        failure = self.caller_failure()
+        repair = {"path": "技术组件/调用方.java", "source_excerpt": "旧方法()",
+                  "related_path": "技术组件/调用方.java", "reason": "原有代码调用了不存在的方法。"}
+        self.fixture.start([failure])
+        with self.assertRaisesRegex(WorkflowError, "非本轮任务"):
+            self.flow._compile_analyzed(self.analysis("original_code", repairs=[repair]))
+        for changes in ({"source_excerpt": "不存在的源码"}, {"path": "../调用方.java"},
+                        {"path": "pom.xml"}, {"related_path": "档案服务/业务.java"}):
+            self.fixture.start([BLOCKED])
+            self.fixture.decide("fix")
+            with self.assertRaises(WorkflowError):
+                self.flow._compile_analyzed(self.analysis("original_code", repairs=[{**repair, **changes}]))
+            self.assertNotIn("repair_paths", self.state["compile_checks"][-1])
+
+    def test_original_repair_does_not_authorize_preserved_java_in_shared_workspace(self):
+        self.caller_failure()
+        self.repo["preserved_paths"].append("技术组件/调用方.java")
+        self.fixture.start([BLOCKED])
+        self.fixture.decide("fix")
+        with self.assertRaisesRegex(WorkflowError, "本机保留改动"):
+            self.flow._compile_analyzed(self.analysis("original_code", repairs=[{
+                "path": "技术组件/调用方.java", "source_excerpt": "旧方法()",
+                "related_path": "技术组件/调用方.java", "reason": "原有代码问题"}]))
+        self.assertNotIn("repair_paths", self.state["compile_checks"][-1])
+
+    def test_manual_authorization_does_not_allow_environment_download_or_uncertain_repairs(self):
+        for category in ("environment", "dependencies", "unknown"):
+            self.fixture.start([BLOCKED])
+            self.fixture.decide("fix")
+            with patch.object(CompileRunner, "check") as runner:
+                self.flow._compile_analyzed(self.analysis(category))
+            runner.assert_not_called()
+            batch = self.state["compile_checks"][-1]
+            self.assertEqual(self.state["stage"], "等待编译选择")
+            self.assertEqual(batch["fix_round"], 0)
+            self.assertNotIn("repair_paths", batch)
+
+    def test_manual_repair_authorization_survives_resume_but_expires_with_source(self):
+        self.fixture.start([BLOCKED])
+        self.fixture.decide("fix")
+        self.flow.pause()
+        self.flow.resume()
+        self.assertTrue(compile_context(self.state)[0]["manual_repair"])
+        self.flow.save()
+        restored = self.flow.store.load(self.state["id"])
+        self.assertTrue(restored["compile_checks"][-1]["manual_repair"])
+        self.fixture.change("档案服务/业务.java", "class 业务 { int 值 = 2; }\n")
+        with self.assertRaisesRegex(WorkflowError, "分析期间代码"):
+            self.flow._compile_analyzed(self.analysis("original_code"))
+        self.assertEqual(self.state["phase"], "compile")
+        self.assertNotIn("repair_paths", self.state["compile_checks"][-1])
+
+    def test_blocked_failure_requires_explicit_extra_round_after_limit(self):
+        self.fixture.start([BLOCKED])
+        batch = self.state["compile_checks"][-1]
+        batch["fix_round"] = batch["limit"]
+        with self.assertRaisesRegex(WorkflowError, "修复上限"):
+            self.fixture.decide("fix")
+        self.fixture.decide("add_round").assert_not_called()
+        self.assertEqual(batch["limit"], 4)
+        self.assertEqual(batch["fix_round"], 3)
+        self.assertTrue(batch["manual_repair"])
+
     def test_analysis_does_not_expand_scope_or_overwrite_preserved_files(self):
         failure = self.caller_failure()
         variants = [

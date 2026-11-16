@@ -344,8 +344,9 @@ class CompileChecks(TestCase):
         self.assertEqual(entry["status"], "blocked")
         self.assertIn("缺少配置项", entry["analysis"])
         self.assertNotIn("不应保存", dumps(self.state, ensure_ascii=False))
-        with self.assertRaisesRegex(WorkflowError, "已明确诊断"):
-            self.decide("fix")
+        self.decide("fix").assert_not_called()
+        self.assertEqual(self.state["phase"], "compile_analysis")
+        self.assertTrue(self.state["compile_checks"][-1]["manual_repair"])
 
     def test_analysis_result_does_not_apply_to_changed_source(self):
         self.start([BLOCKED])

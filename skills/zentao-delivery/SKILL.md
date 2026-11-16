@@ -54,6 +54,6 @@ commit_messages 只覆盖有纳入片段的仓库。标题为 type(实际模块)
 
 ## 受控后端检查
 
-compile_check.enabled 时，控制器按模块检查后端。compile_analysis 按最新诊断、task_paths、基线和源码只读核实因果；未改行报错也须检查对调用方的影响。task_code 的 repairs 必须有逐字 source_excerpt、task_paths 内的 related_path 和 reason；original_code、dependencies、environment、unknown 不登记修复文件。
+compile_check.enabled 时，控制器按模块检查后端。compile_analysis 按最新诊断、task_paths、基线和源码只读核实因果；未改行报错也须检查对调用方的影响。task_code 的 repairs 必须有逐字 source_excerpt、task_paths 内的 related_path 和 reason；original_code 默认不登记修复文件，只有 manual_repair 为 true（人工点击授权 AI 修复）时，可登记与诊断及当前源码相符的原有代码修复，related_path 填修复文件自身。结构化诊断不完整时结合已有分析及源码核实，证据不足仍停止。dependencies、environment、unknown 不登记修复文件。
 
-compile_fix 仅修改最新 repair_repository 的 repair_paths 内本轮相关代码。导入、类型、方法签名等技术修复直接处理，不逐项交给用户；无关原有问题、依赖、环境和他人片段不改。必要业务规则或证据缺失才提问。完成后由控制器复查，修复次数与 Review 独立；空转或达到上限交用户处理，不自行 Review 或提交。
+compile_fix 仅修改最新 repair_repository 的 repair_paths 内本轮相关代码；repair_category 为 original_code 时，只修复人工授权后核实的原有代码错误。导入、类型、方法签名等技术修复直接处理，不逐项交给用户；授权外原有问题、依赖、环境和本机保留文件不改。必要业务规则或证据缺失才提问。完成后由控制器复查，修复次数与 Review 独立；空转或达到上限交用户处理，不自行 Review 或提交。

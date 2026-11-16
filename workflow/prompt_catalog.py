@@ -82,7 +82,7 @@ def prompt_catalog(settings):
             fragment("manual", "人工分析指令", prompts.COMPILE_MANUAL_ANALYSIS, "workflow/prompts.py · COMPILE_MANUAL_ANALYSIS", "人工分析入口"),
             *scope_fragments, *material_fragments], controller=True,
           notes="实际编译由控制器执行，无独立模型提示词；编译诊断通过变化上下文中的 compile_checks 提供。查看本页不会启动编译。")
-    stage("compile_fix", "编译问题修复", "仅修复已确认与本轮任务有关的诊断与受影响调用方。", [
+    stage("compile_fix", "编译问题修复", "修复本轮任务相关错误、受影响调用方及人工授权后核实的原有代码错误。", [
         variant("compile_fix", "编译问题修复", "compile_fix", prompts.COMPILE_FIX, "控制器确认任务相关修复范围后")], [
             fragment("compile_fix", "编译修复指令", prompts.COMPILE_FIX, "workflow/prompts.py · COMPILE_FIX", "编译修复阶段"),
             *scope_fragments, *material_fragments])

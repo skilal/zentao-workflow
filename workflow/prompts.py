@@ -18,8 +18,9 @@ REVIEW = (
 FIX = "只修复以下选中问题，保留未选项和无关原有问题。超出授权先提问；完成后由控制器复审，不自行提交。"
 RESTORE = "先核对 task_context 和当前代码，按原阶段继续；确认中断前实际状态，不跳过待答问题或计划授权。"
 COMPILE_FIX = (
-    "按最新 compile_checks 的 repair_repository/repair_paths 修复本轮相关错误及已确认受影响调用方。"
-    "结合基线、差异和诊断核实因果，范围内技术修复直接处理；不改依赖、环境及无关原有问题。"
+    "按最新 compile_checks 的 repair_repository/repair_paths 修复本轮相关错误及已确认受影响调用方；"
+    "repair_category 为 original_code 时，只修复人工明确授权且已经核实的原有代码错误。"
+    "结合基线、差异和诊断核实因果，范围内技术修复直接处理；不改依赖、环境及授权外的原有问题。"
     "必要业务资料缺失或需扩大范围才提问；完成后控制器复查，不执行命令、不自行审查提交。"
 )
 COMPILE_ANALYSIS = (
@@ -27,6 +28,9 @@ COMPILE_ANALYSIS = (
     "报错行未修改不代表无关，须检查本轮签名、类型、字段、导入变更对调用方的影响。"
     "有任务因果和源码证据时用 task_code；repairs 限诊断或任务文件，逐字提供 source_excerpt、related_path 和 reason。"
     "原有问题、下载依赖、环境、证据不足分别用 original_code/dependencies/environment/unknown，repairs 为空。"
+    "唯一例外：manual_repair 为 true 表示人工点击授权 AI 修复；此时可为 original_code 提供 repairs，"
+    "须结合失败诊断及当前源码确认代码错误，逐字提供 source_excerpt，related_path 填修复文件自身，reason 说明诊断与修复的对应关系。"
+    "诊断乱码或结构化诊断缺失时，结合已有分析和源码核实，不能据此直接拒绝修复，也不能猜测错误；无法核实仍用 unknown。"
     "不修改文件、不执行命令或安装依赖。按 Schema 返回 JSON，summary 用中文。"
 )
 COMPILE_MANUAL_ANALYSIS = (

@@ -1809,10 +1809,11 @@ function WorkflowApp() {
                 current && h(Space, { wrap: true },
                   entry.status === "dependencies" && h(Button, { type: "primary", disabled: busy, onClick: () => choose("download") }, "补齐依赖并重新检查（允许下载）"),
                   entry.status === "code_error" && batch.fix_round < batch.limit && h(Button, { type: "primary", disabled: busy, onClick: () => choose("fix") }, "修复代码并重新检查"),
+                  entry.status === "blocked" && batch.fix_round < batch.limit && h(Button, { type: "primary", disabled: busy, onClick: () => choose("fix") }, "授权 AI 修复并重新检查"),
                   ["blocked", "dependencies", "code_error"].includes(entry.status) && h(Button, { disabled: busy, onClick: () => choose("analyze") }, "分析失败原因"),
                   h(Button, { disabled: busy, onClick: () => choose("retry") }, "重新检查"),
                   h(Button, { disabled: busy, onClick: () => choose("skip") }, "跳过该仓库本轮检查"),
-                  entry.status === "code_error" && batch.fix_round >= batch.limit && h(Button, { disabled: busy, onClick: () => choose("add_round") }, "追加一轮编译修复"),
+                  ["blocked", "code_error"].includes(entry.status) && batch.fix_round >= batch.limit && h(Button, { disabled: busy, onClick: () => choose("add_round") }, "追加一轮编译修复"),
                   h(Button, { disabled: busy, onClick: () => choose("pause") }, "暂停")));
             })),
         }));

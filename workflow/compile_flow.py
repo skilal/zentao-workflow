@@ -205,7 +205,8 @@ class CompileFlow:
                     raise WorkflowError("下载开始前代码或依赖配置发生变化，原授权已失效，请重新检查。")
                 entry.update(source_hash=snapshot_hash(repository), dependency_hash=dependency_hash(repository),
                              status="running", summary="正在进行编译检查。", diagnostics=[], failure_reasons=[], analysis="",
-                             compiler_diagnostics=[], diagnostics_complete=False, analysis_required=False)
+                             compiler_diagnostics=[], diagnostics_complete=False, analysis_required=False,
+                             repair_category="")
                 self.save()
                 entry["modules"] = backend_modules(repository)
                 result = self.compile_runner.check(repository, entry["modules"], entry["name"] == download_name)
@@ -301,9 +302,10 @@ class CompileFlow:
             entry.update(status="pending", diagnostics=[], summary="修复后等待重新检查。")
         self._run_compile()
 
-    def _analyze_compile(self, entry, automatic=False):
+    def _analyze_compile(self, entry, automatic=False, manual_repair=False):
         batch = self._compile_batch()
-        batch.update(status="analyzing", analysis_repository=entry["name"], automatic_analysis=automatic)
+        batch.update(status="analyzing", analysis_repository=entry["name"], automatic_analysis=automatic,
+                     manual_repair=manual_repair)
         self.state["phase"] = "compile_analysis"
         if automatic:
             self._start_turn(prompts.COMPILE_ANALYSIS,
@@ -323,6 +325,7 @@ class CompileFlow:
             self.save()
             raise WorkflowError("分析期间代码或依赖配置发生变化，请重新检查后再处理。")
         automatic = batch.pop("automatic_analysis", False)
+        manual_repair = batch.pop("manual_repair", False)
         if automatic:
             # 自动决策仅接收约定结构，格式不匹配时明确停止，不猜测模型意图。
             batch.pop("analysis_repository")
@@ -337,7 +340,8 @@ class CompileFlow:
                         or not isinstance(result["repairs"], list) or len(result["repairs"]) > 12):
                     raise WorkflowError("自动编译分析结果不符合约定结构，已停止，未扩大修复范围。")
                 entry["analysis"] = redact(result["summary"])[:6000]
-                if result["category"] != "task_code":
+                original_repair = manual_repair and result["category"] == "original_code"
+                if result["category"] != "task_code" and not original_repair:
                     if result["repairs"]:
                         raise WorkflowError("非本轮任务代码问题不能登记自动修复文件。")
                     if result["category"] == "dependencies":
@@ -348,7 +352,8 @@ class CompileFlow:
                     return
                 task_paths = set(batch.get("task_paths", {}).get(entry["name"], []))
                 allowed = task_paths | {item["path"] for item in entry.get("compiler_diagnostics", [])}
-                protected = set() if repository.get("change_record") else {path.casefold() for path in repository.get("preserved_paths", [])}
+                protected = (set() if repository.get("change_record") and not original_repair else
+                             {path.casefold() for path in repository.get("preserved_paths", [])})
                 repairs = []
                 if not result["repairs"]:
                     raise WorkflowError("本轮任务代码分析未提供修复文件及源码证据，已停止。")
@@ -357,15 +362,18 @@ class CompileFlow:
                             or any(not isinstance(value, str) or not value.strip() for value in repair.values())):
                         raise WorkflowError("自动修复须提供文件、当前源码摘录、关联任务文件和因果说明。")
                     relative = repair["path"]
-                    if (relative not in allowed or not relative.endswith(".java") or relative.casefold() in protected
-                            or repair["related_path"] not in task_paths):
+                    if (not relative.endswith(".java") or relative.casefold() in protected
+                            or (original_repair and repair["related_path"] != relative)
+                            or (not original_repair and (relative not in allowed or repair["related_path"] not in task_paths))):
                         raise WorkflowError("自动修复文件不属于本轮任务及受影响调用方，或包含本机保留改动，已停止。")
                     source = safe_file(repository, relative).read_text(encoding="utf-8-sig")
                     if repair["source_excerpt"] not in source:
                         raise WorkflowError("自动分析引用的源码证据与当前文件不一致，已停止。")
                     repairs.append({"path": relative, "line": source[:source.index(repair["source_excerpt"])].count("\n") + 1,
                                     "message": redact(repair["reason"])[:600]})
-                entry.update(status="code_error", diagnostics=repairs, summary="AI 已确认本轮任务相关代码问题，正在自动修复。")
+                entry.update(status="code_error", diagnostics=repairs, repair_category=result["category"],
+                             summary="AI 已核实人工授权的原有代码问题，正在修复。" if original_repair else
+                             "AI 已确认本轮任务相关代码问题，正在自动修复。")
                 self.note("Codex", entry["analysis"])
                 if batch["fix_round"] < batch["limit"]:
                     self._repair_compile(entry)
@@ -403,11 +411,12 @@ class CompileFlow:
                 raise WorkflowError("代码或依赖配置已变化，请重新检查后再选择。")
         if decision == "download" and entry["status"] != "dependencies":
             raise WorkflowError("当前失败不是缺少依赖，不能授权下载。")
-        if decision == "add_round" and (entry["status"] != "code_error" or batch["fix_round"] < batch["limit"]):
+        if decision == "add_round" and (entry["status"] not in {"blocked", "code_error"} or batch["fix_round"] < batch["limit"]):
             raise WorkflowError("只有代码修复达到上限时才能追加一轮。")
-        if decision == "fix" and (entry["status"] != "code_error" or not entry["diagnostics"]
+        if decision == "fix" and (entry["status"] not in {"blocked", "code_error"}
+                                  or (entry["status"] == "code_error" and not entry["diagnostics"])
                                   or batch["fix_round"] >= batch["limit"]):
-            raise WorkflowError("只有已明确诊断的本轮代码错误且未达修复上限时才能修复。")
+            raise WorkflowError("只有代码错误或待核实的问题且未达修复上限时才能授权修复。")
         if decision == "analyze" and entry["status"] not in {"blocked", "dependencies", "code_error"}:
             raise WorkflowError("请选择当前失败的编译仓库进行分析。")
         batch["decisions"].append({"repository": name, "decision": decision, "time": timestamp(),
@@ -419,13 +428,13 @@ class CompileFlow:
         if decision == "analyze":
             self._analyze_compile(entry)
             return
-        if decision == "fix":
+        if decision in {"fix", "add_round"}:
+            if decision == "add_round":
+                batch["limit"] += 1
             batch["repair_attempts"] = []
-            self._repair_compile(entry)
-            return
-        if decision == "add_round":
-            batch["limit"] += 1
-            batch["repair_attempts"] = []
+            if entry["status"] == "blocked":
+                self._analyze_compile(entry, automatic=True, manual_repair=True)
+                return
             self._repair_compile(entry)
             return
         if decision == "retry":

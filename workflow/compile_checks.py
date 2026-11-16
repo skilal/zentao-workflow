@@ -99,12 +99,13 @@ def compile_context(state):
     result = {key: batch[key] for key in ("status", "fix_round", "limit")}
     result["repositories"] = [{key: entry[key] for key in
                                ("name", "status", "modules", "summary", "diagnostics", "failure_reasons", "analysis",
-                                "compiler_diagnostics", "diagnostics_complete")
+                                "compiler_diagnostics", "diagnostics_complete", "repair_category")
                                if key in entry}
                               for entry in batch["repositories"] if entry["name"] in backend_names]
     if batch.get("analysis_repository") in backend_names:
         result["analysis_repository"] = batch["analysis_repository"]
         result["automatic_analysis"] = batch.get("automatic_analysis", False)
+        result["manual_repair"] = batch.get("manual_repair", False)
         result["task_paths"] = batch.get("task_paths", {})
     if batch.get("repair_repository") in backend_names:
         result.update(repair_repository=batch["repair_repository"], repair_paths=batch["repair_paths"])

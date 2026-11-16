@@ -1173,7 +1173,8 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         if state["phase"] == "compile_analysis":
             batch = self._compile_batch()
             entry = next(entry for entry in batch["repositories"] if entry["name"] == batch["analysis_repository"])
-            self._analyze_compile(entry, automatic=batch.get("automatic_analysis", False))
+            self._analyze_compile(entry, automatic=batch.get("automatic_analysis", False),
+                                  manual_repair=batch.get("manual_repair", False))
             return
         if state["phase"] == "compile_fix":
             batch = self._compile_batch()

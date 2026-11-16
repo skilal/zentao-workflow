@@ -61,12 +61,22 @@ def check():
             page.goto(server.origin)
             expect(page.get_by_text("该历史记录未保存具体失败原因，请重新检查以取得诊断。", exact=True)).to_be_visible()
             expect(page.get_by_role("button", name="修复代码并重新检查", exact=True)).to_have_count(0)
+            expect(page.get_by_role("button", name="授权 AI 修复并重新检查", exact=True)).to_be_visible()
             page.get_by_role("button", name="分析失败原因", exact=True).click()
             expect(page.get_by_text("失败分析", exact=True)).to_be_visible()
             expect(page.get_by_role("button", name="分析失败原因", exact=True)).to_be_enabled()
             runner.assert_not_called()
             page.reload()
             expect(page.get_by_text("失败分析", exact=True)).to_be_visible()
+
+            runtime = app.sessions.get("compile-browser-0")
+            runtime.engine._start_turn = Mock(side_effect=lambda *_: (
+                runtime.engine.state.update(stage=PHASE_STAGE[runtime.engine.state["phase"]]), runtime.engine.save()))
+            page.get_by_role("button", name="授权 AI 修复并重新检查", exact=True).click()
+            expect(page.get_by_role("button", name="授权 AI 修复并重新检查", exact=True)).to_have_count(0)
+            assert runtime.engine.state["phase"] == "compile_analysis"
+            assert runtime.engine.state["compile_checks"][-1]["manual_repair"]
+            runner.assert_not_called()
 
             page.get_by_text("缺少插件", exact=False).first.click()
             expect(page.get_by_text("Cannot resolve plugin org.example:compiler:1 in offline mode", exact=True)).to_be_visible()
