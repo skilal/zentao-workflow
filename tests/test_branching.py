@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from workflow.branching import BRANCH_SCHEMA, branch_context, configured_repositories, saved_branches
+from workflow.branching import BRANCH_SCHEMA, KEYWORD_SCHEMA, branch_context, configured_repositories, saved_branches, validate_keywords
 from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import branch_catalog, fetch_branch, git, prepare, refresh_branches
 from workflow.rpc import AppServer, thread_parameters
@@ -22,6 +22,26 @@ def decision(role, branch="", status="selected", candidates=None):
 
 
 class BranchContextChecks(TestCase):
+    def test_keyword_step_does_not_send_any_branch_catalog_to_model(self):
+        state = {"project": {"id": 41, "name": "绍兴档案馆（二期馆藏）（售后）"}, "item": None,
+                 "supplement": "", "snapshot": {"sources": [{"title": "需求", "content": "项目资料"}]},
+                 "branch_resolution": {"step": "keywords", "repositories": [
+                     {"status": "pending", "catalog": [{"name": "无关分支"}] * 2000}]}}
+        context = branch_context(state)
+        self.assertEqual(context["step"], "keywords")
+        self.assertEqual(context["repositories"], [])
+        self.assertNotIn("无关分支", dumps(context, ensure_ascii=False))
+
+    def test_keywords_are_grounded_and_administrative_suffixes_are_normalized(self):
+        state = {"project": {"name": "绍兴市档案馆"}, "supplement": "资阳市与传化集团项目",
+                 "snapshot": {"sources": []}}
+        result = {"keywords": ["绍兴市", "绍兴", "资阳市", "传化集团"], "reason": "资料明确给出主体。", "question": ""}
+        self.assertEqual(validate_keywords(result, state), ["绍兴", "资阳", "传化"])
+        for words in (["长沙"], ["dev"], ["绍兴", "绍兴"], ["绍兴 "]):
+            with self.subTest(words=words), self.assertRaises(WorkflowError):
+                validate_keywords({**result, "keywords": words}, state)
+        self.assertEqual(validate_keywords({**result, "keywords": [], "question": "请明确项目地区。"}, state), [])
+
     def test_compact_catalog_restores_every_source_and_distinct_metadata(self):
         metadata = {"name": "项目分支", "local": True, "remote": True, "commit": "a" * 40,
                     "date": "2026-11-17", "subject": "项目修改", "metadata_available": True}
@@ -109,9 +129,9 @@ class BranchWorkflowChecks(TestCase):
         self.fetched = []
         for target, replacement in (
             ("workflow.store.LOCAL", self.root),
-            ("workflow.engine.branch_catalog", lambda repository: deepcopy(self.catalogs[repository["role"]])),
+            ("workflow.engine.branch_catalog", self.read_catalog),
             ("workflow.engine.branch_history", lambda repository, name: {"path": repository["path"], "name": name, "refs": [{"ref": name, "commits": [{"subject": "项目长期维护"}]}]}),
-            ("workflow.engine.refresh_branches", lambda repository: deepcopy(self.catalogs[repository["role"]])),
+            ("workflow.engine.refresh_branches", self.read_catalog),
             ("workflow.engine.fetch_branch", self.fetch_branch),
             ("workflow.engine.acquire_workspace", self.prepare),
             ("workflow.repository_selection.inspect_repository", self.inspect_repository),
@@ -132,6 +152,14 @@ class BranchWorkflowChecks(TestCase):
         self.flow._start_turn = self.turns
         self.prepared = []
         self.branch_answers = {}
+
+    def read_catalog(self, repository):
+        entries = deepcopy(self.catalogs[repository["role"]])
+        if "branch_names" in repository:
+            return [entry for entry in entries if entry["name"] in repository["branch_names"]]
+        if "branch_keywords" in repository:
+            return [entry for entry in entries if any(word.casefold() in entry["name"].casefold() for word in repository["branch_keywords"])]
+        return entries
 
     def fetch_branch(self, repository, name):
         self.fetched.append((repository["role"], name))
@@ -154,6 +182,7 @@ class BranchWorkflowChecks(TestCase):
         (self.root / "settings.json").write_text(dumps(settings, ensure_ascii=False), encoding="utf-8")
 
     def complete(self, *decisions):
+        self.keywords()
         if len({entry["role"] for entry in decisions}) != len(decisions):
             raise WorkflowError("AI 分支角色重复。")
         self.branch_answers.update({entry["role"]: entry for entry in decisions})
@@ -173,9 +202,41 @@ class BranchWorkflowChecks(TestCase):
                 else:
                     return
 
+    def keywords(self):
+        if self.flow.state["branch_resolution"].get("step") == "keywords":
+            self.flow._complete_branches(dumps({"keywords": ["示例"], "reason": "项目名称明确包含示例。", "question": ""}, ensure_ascii=False))
+
+    def test_keyword_filter_excludes_unrelated_branches_before_shortlist(self):
+        self.catalogs["frontend"].append({**self.catalogs["frontend"][0], "name": "资阳/develop"})
+        self.flow.start_plan("")
+        self.assertEqual(branch_context(self.flow.state)["repositories"], [])
+        self.keywords()
+        repository = self.flow.state["branch_resolution"]["repositories"][0]
+        self.assertEqual([entry["name"] for entry in repository["catalog"]], ["示例档案馆/develop"])
+        self.assertNotIn("资阳/develop", dumps(branch_context(self.flow.state), ensure_ascii=False))
+
+    def test_keyword_miss_refreshes_once_then_waits_without_full_catalog_analysis(self):
+        self.flow.start_plan("本次明确属于汶川项目")
+        with patch("workflow.engine.refresh_branches", return_value=[]) as refresh:
+            self.flow._complete_branches(dumps({"keywords": ["汶川"], "reason": "人工补充明确地区。", "question": ""}))
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(self.turns.call_count, 1)
+        self.assertEqual(self.flow.state["stage"], "等待选择分支")
+        self.assertTrue(all(entry["status"] == "needs_user" for entry in self.flow.state["branch_resolution"]["repositories"]))
+        self.assertTrue(self.flow.state["branch_resolution"]["repositories"][0]["catalog"])
+        self.assertEqual(self.prepared, [])
+
+    def test_uncertain_keywords_wait_for_explicit_selection_without_refresh(self):
+        self.flow.start_plan("")
+        with patch("workflow.engine.refresh_branches") as refresh:
+            self.flow._complete_branches(dumps({"keywords": [], "reason": "项目主体不明确。", "question": "请选择所属地区的分支。"}))
+        refresh.assert_not_called()
+        self.assertEqual(self.turns.call_count, 1)
+        self.assertEqual(self.flow.state["stage"], "等待选择分支")
+
     def test_both_repositories_are_prepared_even_for_backend_task(self):
         self.flow.start_plan("补充规则")
-        self.assertEqual(self.turns.call_args.args[1], BRANCH_SCHEMA)
+        self.assertEqual(self.turns.call_args.args[1], KEYWORD_SCHEMA)
         self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
         self.assertEqual([entry["branch"] for entry in self.prepared], ["示例档案馆/develop", "feature/示例"])
         self.assertEqual(self.flow.state["phase"], "plan")
@@ -228,21 +289,21 @@ class BranchWorkflowChecks(TestCase):
 
     def test_new_online_branch_is_fetched_before_ai_rechecks_real_commit_metadata(self):
         self.flow.start_plan("")
-        online = {"name": "新项目分支", "local": False, "remote": True, "commit": "c" * 40,
+        online = {"name": "新示例项目分支", "local": False, "remote": True, "commit": "c" * 40,
                   "date": "", "subject": "", "metadata_available": False}
         self.catalogs["frontend"] = [{**online, "date": "2026-11-02", "subject": "目标项目修改", "metadata_available": True}]
         with patch("workflow.engine.refresh_branches", return_value=[deepcopy(online)]):
             self.complete(decision("frontend", status="not_found"), decision("backend", "feature/示例"))
         self.assertFalse(self.fetched)
-        self.complete(decision("frontend", "新项目分支"))
+        self.complete(decision("frontend", "新示例项目分支"))
         repository = self.flow.state["branch_resolution"]["repositories"][0]
-        self.assertEqual(self.fetched, [("frontend", "新项目分支")])
+        self.assertEqual(self.fetched, [("frontend", "新示例项目分支")])
         self.assertEqual(repository["status"], "pending")
         self.assertEqual(repository["catalog"][0]["subject"], "目标项目修改")
         self.assertEqual(self.prepared, [])
-        self.complete(decision("frontend", "新项目分支"))
+        self.complete(decision("frontend", "新示例项目分支"))
         self.assertEqual(len(self.fetched), 1)
-        self.assertEqual(self.prepared[0]["branch"], "新项目分支")
+        self.assertEqual(self.prepared[0]["branch"], "新示例项目分支")
 
     def test_manual_remote_choice_fetches_only_chosen_branch(self):
         self.catalogs["frontend"][0]["local"] = False
@@ -254,6 +315,7 @@ class BranchWorkflowChecks(TestCase):
     def test_targeted_fetch_failure_stops_without_workspace_creation_or_automatic_retry(self):
         self.catalogs["frontend"][0]["local"] = False
         self.flow.start_plan("")
+        self.keywords()
         self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop")]})
         with patch("workflow.engine.fetch_branch", side_effect=WorkflowError("目标分支拉取失败")) as fetch:
             self.flow.submit(self.flow._completed, {"status": "completed"},
@@ -303,6 +365,7 @@ class BranchWorkflowChecks(TestCase):
 
     def test_refresh_failure_stops_without_preparing_workspaces(self):
         self.flow.start_plan("")
+        self.keywords()
         self.flow.last_message = dumps({"repositories": [decision("frontend", status="not_found")]})
         with patch("workflow.engine.refresh_branches", side_effect=WorkflowError("远程鉴权失败")):
             self.flow.submit(self.flow._completed, {"status": "completed"}, self.flow.state["id"], self.flow.connection_epoch).result()
@@ -427,6 +490,7 @@ class BranchWorkflowChecks(TestCase):
 
     def test_structured_rpc_completion_enters_a_separate_business_plan(self):
         self.flow.start_plan("业务补充")
+        self.keywords()
         rpc = Mock()
         rpc.model, rpc.disabled_mcp = "示例模型", {}
         rpc.request.side_effect = lambda method, params: {"thread/start": {"thread": {"id": "branch-thread"}},
@@ -546,6 +610,32 @@ class GitBranchChecks(TestCase):
         git(self.source, "push", "origin", "HEAD:refs/heads/项目/远程分支")
         self.repository = {"name": "示例", "path": str(self.source), "role": "frontend", "remote": "origin"}
 
+    def test_keyword_filter_reads_metadata_only_for_matching_real_refs(self):
+        for name in ("绍兴市档案馆/develop", "feature/绍兴内网", "专题/修复/资阳", "达州/develop"):
+            git(self.source, "branch", name)
+        with patch("workflow.gitops.git", wraps=git) as command:
+            catalog = branch_catalog({**self.repository, "branch_keywords": ["绍兴", "资阳"]})
+        self.assertEqual({entry["name"] for entry in catalog}, {"绍兴市档案馆/develop", "feature/绍兴内网", "专题/修复/资阳"})
+        metadata = [call for call in command.call_args_list if any("%(objectname)" in str(arg) for arg in call.args)]
+        self.assertEqual(len(metadata), 1)
+        self.assertFalse(any("达州" in str(arg) for arg in metadata[0].args))
+        self.assertNotIn("refs/heads", metadata[0].args)
+
+    def test_names_only_catalog_does_not_read_commit_metadata(self):
+        with patch("workflow.gitops.git", wraps=git) as command:
+            catalog = branch_catalog({**self.repository, "names_only": True})
+        self.assertTrue(catalog)
+        self.assertTrue(all(not entry["metadata_available"] and "commit" not in entry for entry in catalog))
+        self.assertEqual(len(command.call_args_list), 1)
+
+    def test_remote_refresh_keeps_only_keyword_matches_and_exact_read_is_explicit(self):
+        self.remote_commit("绍兴/develop", b"shaoxing")
+        self.remote_commit("资阳/develop", b"ziyang")
+        catalog = refresh_branches({**self.repository, "branch_keywords": ["绍兴"]})
+        self.assertEqual([entry["name"] for entry in catalog], ["绍兴/develop"])
+        exact = branch_catalog({**self.repository, "branch_keywords": ["绍兴"], "branch_names": ["主目录分支"]})
+        self.assertEqual([entry["name"] for entry in exact], ["主目录分支"])
+
     def test_metadata_merges_local_and_remote_and_skips_symbolic_refs(self):
         git(self.source, "branch", "项目/远程分支", "refs/remotes/origin/项目/远程分支")
         git(self.source, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/项目/远程分支")
@@ -599,13 +689,13 @@ class GitBranchChecks(TestCase):
     def test_refresh_reads_online_names_and_hashes_without_fetching_objects_or_reusing_old_subjects(self):
         old = git(self.source, "rev-parse", "refs/remotes/origin/项目/远程分支")
         updated = self.remote_commit("项目/远程分支", b"changed target")
-        added = self.remote_commit("新项目分支", b"new project")
+        added = self.remote_commit("新示例项目分支", b"new project")
         with patch("workflow.gitops.git", wraps=git) as command:
             catalog = {entry["name"]: entry for entry in refresh_branches(self.repository)}
         self.assertFalse(any("fetch" in call.args[1:] for call in command.call_args_list))
         self.assertEqual(catalog["项目/远程分支"]["commit"], updated)
-        self.assertEqual(catalog["新项目分支"]["commit"], added)
-        for name in ("项目/远程分支", "新项目分支"):
+        self.assertEqual(catalog["新示例项目分支"]["commit"], added)
+        for name in ("项目/远程分支", "新示例项目分支"):
             self.assertFalse(catalog[name]["metadata_available"])
             self.assertEqual((catalog[name]["date"], catalog[name]["subject"]), ("", ""))
         self.assertEqual(git(self.source, "rev-parse", "refs/remotes/origin/项目/远程分支"), old)

@@ -138,7 +138,7 @@ class RepositorySelectionFlow:
             if (purpose == "prepare" and entry["status"] == "needs_user"
                     and not any(candidate["error"] or candidate["branch"] == entry["branch"] for candidate in entry["candidates"])):
                 source = next((candidate for candidate in entry["candidates"] if any(
-                    branch["name"] == entry["branch"] for branch in branch_catalog({**configured[role], "path": candidate["path"]}))), None)
+                    branch["name"] == entry["branch"] for branch in branch_catalog({**configured[role], "path": candidate["path"], "branch_names": [entry["branch"]]}))), None)
                 if source:
                     entry.update(status="selected", path=source["path"], head="", action="allocate",
                                  reason="将按顺序切换空闲目录；没有空闲目录时创建独立工作区。")

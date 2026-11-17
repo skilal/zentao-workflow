@@ -78,9 +78,29 @@ def branches(repository):
 
 def branch_catalog(repository):
     remote_prefix = f"refs/remotes/{repository['remote']}/"
-    output = git(repository["path"], "for-each-ref",
+    names_only = repository.get("names_only", False)
+    selected = repository.get("branch_names")
+    keywords = repository.get("branch_keywords") if selected is None else None
+    references = ["refs/heads", remote_prefix]
+    if names_only or keywords is not None or selected is not None:
+        names = git(repository["path"], "for-each-ref", "--format=%(refname)", *references).splitlines()
+        references = []
+        result = {}
+        for ref in names:
+            local = ref.startswith("refs/heads/")
+            name = ref[len("refs/heads/"):] if local else ref[len(remote_prefix):]
+            if name == "HEAD" or (keywords is not None and not any(word.casefold() in name.casefold() for word in keywords)):
+                continue
+            if selected is not None and name not in selected:
+                continue
+            references.append(ref)
+            entry = result.setdefault(name, {"name": name, "local": False, "remote": False, "metadata_available": False})
+            entry["local" if local else "remote"] = True
+        if names_only or not references:
+            return sorted(result.values(), key=lambda entry: entry["name"])
+    output = "\n".join(git(repository["path"], "for-each-ref",
                  "--format=%(refname)%00%(objectname)%00%(committerdate:iso-strict)%00%(contents:subject)%00%(symref)",
-                 "refs/heads", remote_prefix)
+                 *references[index:index + 100]) for index in range(0, len(references), 100))
     result = {}
     for line in output.splitlines():
         ref, commit_id, date, subject, symbolic = line.split("\0", 4)
@@ -88,6 +108,10 @@ def branch_catalog(repository):
             continue
         local = ref.startswith("refs/heads/")
         name = ref[len("refs/heads/"):] if local else ref[len(remote_prefix):]
+        # for-each-ref 的完整引用也可能匹配其下级引用，仍按同一筛选条件核对。
+        if (selected is not None and name not in selected) or (keywords is not None and not any(
+                word.casefold() in name.casefold() for word in keywords)):
+            continue
         entry = result.setdefault(name, {"name": name, "local": False, "remote": False})
         entry["local" if local else "remote"] = True
         entry.setdefault("refs", []).append({"ref": ref, "commit": commit_id, "date": date, "subject": subject})
@@ -98,7 +122,7 @@ def branch_catalog(repository):
 
 @locked_repository
 def branch_history(repository, name):
-    entries = branch_catalog(repository)
+    entries = branch_catalog({**repository, "names_only": False, "branch_names": [name]})
     branch = next(entry for entry in entries if entry["name"] == name)
     histories = []
     for reference in branch["refs"]:
@@ -121,6 +145,9 @@ def refresh_branches(repository):
         if not commit_id or not separator or not ref.startswith("refs/heads/"):
             raise WorkflowError("远程分支清单格式不符合预期，已停止刷新。")
         live[ref[len("refs/heads/"):]] = commit_id
+    if "branch_keywords" in repository:
+        live = {name: commit_id for name, commit_id in live.items()
+                if any(word.casefold() in name.casefold() for word in repository["branch_keywords"])}
     catalog = {entry["name"]: entry for entry in branch_catalog(repository)}
     # 在线提交已变化时清空旧说明，候选分支定向拉取后再读取实际元数据。
     for name, commit_id in live.items():
@@ -141,7 +168,7 @@ def fetch_branch(repository, name):
     git(repository["path"], "check-ref-format", "--branch", name)
     refspec = f"+refs/heads/{name}:refs/remotes/{repository['remote']}/{name}"
     git(repository["path"], "fetch", "--no-tags", "--", repository["remote"], refspec)
-    entry = next(entry for entry in branch_catalog(repository) if entry["name"] == name)
+    entry = next(entry for entry in branch_catalog({**repository, "names_only": False, "branch_names": [name]}) if entry["name"] == name)
     entry["remote_commit"] = git(repository["path"], "rev-parse", f"refs/remotes/{repository['remote']}/{name}")
     return entry
 
@@ -335,7 +362,8 @@ def acquire_workspace(selection, destination, store, state):
             candidates = [*registered_matches, *(path for path in candidates if path not in registered_matches)]
         for path in candidates:
             with repository_lock(path):
-                available = branch_catalog({**selection, "path": path, "remote": selection.get("remote", "origin")})
+                available = branch_catalog({**selection, "path": path, "remote": selection.get("remote", "origin"),
+                                            "branch_names": [selection["branch"]]})
                 branch = next((branch for branch in available if branch["name"] == selection["branch"]), None)
                 if not branch:
                     continue
@@ -358,7 +386,7 @@ def acquire_workspace(selection, destination, store, state):
                     target["automatic_switch"] = True
                 return _acquire_workspace(target, destination, store, state)
         selection = {**selection, "allocate": False, "force_create": True}
-        available = branch_catalog({**selection, "remote": selection.get("remote", "origin")})
+        available = branch_catalog({**selection, "remote": selection.get("remote", "origin"), "branch_names": [selection["branch"]]})
         branch = next((branch for branch in available if branch["name"] == selection["branch"]), None)
         if branch is None:
             raise WorkflowError("目标分支已不存在，请重新识别或人工确认分支后再准备工作区。")

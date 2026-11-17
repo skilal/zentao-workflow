@@ -15,7 +15,7 @@ from time import monotonic
 from workflow.approvals import is_workflow_tool_call, mcp_approval_question
 from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
-from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, branch_context, configured_repositories, saved_branches, validate_result
+from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, KEYWORD_SCHEMA, branch_context, configured_repositories, saved_branches, validate_keywords, validate_result
 from workflow.baseline import BaselineFlow
 from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
 from workflow.compile_checks import compile_context, compile_repositories
@@ -463,7 +463,8 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         if not resolution["repositories"]:
             with self.settings_lock:
                 preferred = dict(saved_branches(self.settings, project))
-            resolution["repositories"] = [{**repository, "catalog": repository_catalog(repository, branch_catalog, tolerate_errors=True),
+            resolution["repositories"] = [{**repository, "names_only": True,
+                "catalog": repository_catalog({**repository, "names_only": True}, branch_catalog, tolerate_errors=True),
                 "status": "needs_user" if resolution["manual"] else "pending", "branch": "",
                 "reason": "请指定项目常用分支。" if resolution["manual"] else "", "question": "",
                 "candidates": [], "source": "", "refreshed": False, "refresh_state": "",
@@ -551,12 +552,22 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.save()
             return
         repositories = state["branch_resolution"]["repositories"]
+        resolution = state["branch_resolution"]
+        if (resolution.get("version") == 2 and not resolution.get("keyword_complete")
+                and any(repository["status"] == "pending" for repository in repositories)):
+            resolution["step"] = "keywords"
+            self._start_turn("先从项目资料提取地名或项目主体关键词，不读取或分析分支清单。", KEYWORD_SCHEMA)
+            return
         for repository in repositories:
+            if repository["status"] != "pending":
+                continue
             if not repository["catalog"] and not repository["refreshed"]:
                 self._refresh_branches(repository)
             if not repository["catalog"]:
-                repository.update(status="needs_user", reason="远程刷新后仍没有可用分支。",
-                                  question="请先在该仓库准备对应项目分支，再重新识别。")
+                repository.update(status="needs_user", reason="远程刷新后仍没有命中项目关键词的分支。",
+                                  question="请人工选择项目分支，或补充明确的项目地名后重新识别。")
+                manual = {key: value for key, value in repository.items() if key != "branch_keywords"}
+                repository["catalog"] = repository_catalog({**manual, "names_only": True}, branch_catalog)
         if state.get("pause_requested"):
             state["stage"] = "已暂停"
             self.save()
@@ -605,6 +616,23 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         state = self.state
         repositories = state["branch_resolution"]["repositories"]
         resolution = state["branch_resolution"]
+        if resolution.get("step") == "keywords":
+            result = loads(text)
+            keywords = validate_keywords(result, state)
+            resolution.update(step="branches", keyword_complete=True, keywords=keywords)
+            for repository in repositories:
+                if repository["status"] != "pending":
+                    continue
+                repository.pop("analysis", None)
+                repository["reason"] = result["reason"]
+                if keywords:
+                    repository.update(branch_keywords=keywords, names_only=False)
+                    repository["catalog"] = repository_catalog(repository, branch_catalog)
+                else:
+                    repository.update(status="needs_user", question=result["question"] or "项目地区或主体不明确，请人工选择项目分支。")
+            self.save()
+            self._advance_branches()
+            return
         results = validate_result(loads(text), repositories, resolution.get("active_role"))
         if resolution.get("version") == 2:
             repository = next(entry for entry in repositories if entry["role"] == resolution["active_role"])
@@ -671,7 +699,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                     return
                 entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
             for source in entry.get("sources", [{"path": repository["path"]}]):
-                current = branch_catalog({**repository, "path": source["path"]})
+                current = branch_catalog({**repository, "path": source["path"], "names_only": False, "branch_names": [name]})
                 if any(branch["name"] == name for branch in current):
                     histories.append(branch_history({**repository, "path": source["path"]}, name))
         analysis.update(step="verify", histories=histories)

@@ -57,7 +57,7 @@ def prompt_catalog(settings):
 
     stage("collect", "资料读取", "读取人工选择工作项的正文、图片及附件。", [], [], controller=True,
           notes="由控制器执行，无独立模型提示词。模型回合中的资料读取指令见通用规则。")
-    stage("branch", "分支识别", "专用线程只分析提供的项目资料与分支元数据。", [
+    stage("branch", "分支识别", "先提取项目地名或主体关键词，再分析本地筛选命中的真实分支及提交历史。", [
         {"id": "branch_thread", "title": "分支线程指令", "layer": "线程级指令", "condition": "新建或恢复分支识别线程",
          "content": BRANCH_INSTRUCTIONS},
         {"id": "branch_input", "title": "分支识别输入", "layer": "回合级输入", "condition": "待识别仓库存在时",

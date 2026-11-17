@@ -238,6 +238,7 @@ class WorkspaceAllocationChecks(TestCase):
     def test_branch_shortlist_then_history_verification(self):
         self.state.update(stage="资料已读取")
         self.engine.start_plan("使用本项目长期开发分支")
+        self.engine._complete_branches(dumps({"keywords": ["项目"], "reason": "项目名称中的主体。", "question": ""}))
         context = branch_context(self.state)
         self.assertEqual(context["repositories"][0]["step"], "shortlist")
         self.assertEqual(context["sources"][0]["content"], "项目需求")
@@ -336,6 +337,7 @@ class WorkspaceAllocationChecks(TestCase):
         self.engine.start_plan("")
         result = {"role": "frontend", "status": "selected", "branch": "项目/develop", "reason": "项目主线优先",
                   "candidates": ["feature/项目-20261117-专题"], "question": ""}
+        self.engine._complete_branches(dumps({"keywords": ["项目"], "reason": "项目名称中的主体。", "question": ""}))
         self.engine._complete_branches(dumps({"repositories": [result]}))
         histories = branch_context(self.state)["repositories"][0]["histories"]
         self.assertEqual({entry["name"] for entry in histories}, {"项目/develop", "feature/项目-20261117-专题"})
