@@ -15,7 +15,7 @@ from time import monotonic
 from workflow.approvals import is_workflow_tool_call, mcp_approval_question
 from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
 from workflow.answer_attachments import attachment_file, prepare_answer, submitted_attachments
-from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, configured_repositories, saved_branches, validate_result
+from workflow.branching import BRANCH_INSTRUCTIONS, BRANCH_SCHEMA, branch_context, configured_repositories, saved_branches, validate_result
 from workflow.baseline import BaselineFlow
 from workflow.compile_flow import COMPILE_ANALYSIS_SCHEMA, CompileFlow
 from workflow.compile_checks import compile_context, compile_repositories
@@ -824,12 +824,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                                               policy_instruction=policy_instruction,
                                               material_instruction=material_instruction, context=dumps(changed, ensure_ascii=False))
         if phase == "branch":
-            context = {"project": state["project"], "items": state.get("items", [state["item"]]), "supplement": state["supplement"],
-                       "sources": [{"title": source["title"], "content": source["content"]}
-                                   for source in state["snapshot"]["sources"]],
-                       "repositories": [{"role": entry["role"], "refreshed": entry["refreshed"], "branches": entry["catalog"]}
-                                        for entry in state["branch_resolution"]["repositories"] if entry["status"] == "pending"]}
-            inputs = [{"type": "text", "text": prompt_templates.BRANCH_INPUT.format(context=dumps(context, ensure_ascii=False))}]
+            context = branch_context(state)
+            inputs = [{"type": "text", "text": prompt_templates.BRANCH_INPUT.format(
+                context=dumps(context, ensure_ascii=False, separators=(",", ":")))}]
         else:
             # 技能已由 thread/start 或 thread/resume 的 developerInstructions 提供。
             inputs = [{"type": "text", "text": prompt}, *image_inputs]

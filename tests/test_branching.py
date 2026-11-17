@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from workflow.branching import BRANCH_SCHEMA, configured_repositories, saved_branches
+from workflow.branching import BRANCH_SCHEMA, branch_context, configured_repositories, saved_branches
 from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import branch_catalog, fetch_branch, git, prepare, refresh_branches
 from workflow.rpc import AppServer, thread_parameters
@@ -19,6 +19,41 @@ from workflow.zentao import ZentaoClient, project_context
 def decision(role, branch="", status="selected", candidates=None):
     return {"role": role, "status": status, "branch": branch, "reason": "依据所属项目和本次任务确定。",
             "candidates": candidates or [], "question": "请明确选择项目分支。" if status == "needs_user" else ""}
+
+
+class BranchContextChecks(TestCase):
+    def test_compact_catalog_restores_every_source_and_distinct_metadata(self):
+        metadata = {"name": "项目分支", "local": True, "remote": True, "commit": "a" * 40,
+                    "date": "2026-11-17", "subject": "项目修改", "metadata_available": True}
+        different = {**metadata, "local": False, "commit": "b" * 40,
+                     "date": "", "subject": "", "metadata_available": False, "remote_commit": "c" * 40}
+        catalog = [{**metadata, "sources": [{**metadata, "path": "目录甲"},
+                                           {**metadata, "path": "目录乙"},
+                                           {**different, "path": "目录丙"}]},
+                   {**metadata, "name": "旧版分支"}, {**metadata, "name": "空来源分支", "sources": []}]
+        state = {"project": {"id": 41}, "item": None, "items": [], "supplement": "补充说明",
+                 "snapshot": {"sources": [{"title": "需求", "content": "全部正文", "raw": "不发送"}]},
+                 "branch_resolution": {"repositories": [
+                     {"role": "frontend", "status": "pending", "refreshed": True, "catalog": catalog},
+                     {"role": "backend", "status": "resolved", "catalog": []}]}}
+        original = deepcopy(state)
+        context = branch_context(state)
+        self.assertEqual(state, original)
+        self.assertEqual(context["sources"], [{"title": "需求", "content": "全部正文"}])
+        self.assertEqual(len(context["repositories"]), 1)
+        repository = context["repositories"][0]
+        self.assertTrue(repository["refreshed"])
+        table = repository["branches"]
+        restored = []
+        for branch in table["branches"]:
+            entry = deepcopy(table["entries"][branch["entry"]])
+            self.assertEqual(branch["name"], entry["name"])
+            if "sources" in branch:
+                entry["sources"] = [{**table["entries"][source["entry"]], "path": source["path"]}
+                                    for source in branch["sources"]]
+            restored.append(entry)
+        self.assertEqual(restored, catalog)
+        self.assertEqual(len(table["entries"]), 4)
 
 
 class ProjectChecks(TestCase):

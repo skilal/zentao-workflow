@@ -1,7 +1,7 @@
 """检查资料去重、局部搜索、分段批量阅读和人工等待的交付边界。"""
 
 from copy import deepcopy
-from json import loads
+from json import dumps, loads
 from os import scandir
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -131,6 +131,30 @@ class FileReadChecks(PerformanceFixture):
 
 
 class ContextDeliveryChecks(PerformanceFixture):
+    def test_large_branch_catalog_is_sent_complete_below_request_limit(self):
+        self.state["project"] = {"id": 41, "name": "示例项目"}
+        repositories = []
+        for role, count in (("frontend", 853), ("backend", 448)):
+            catalog = []
+            for index in range(count):
+                metadata = {"name": f"feature/项目分支-{index}", "local": True, "remote": True,
+                            "commit": f"{index:040x}", "date": "2026-11-17T10:00:00+08:00",
+                            "subject": "项目需求修改" * 10, "metadata_available": True,
+                            "remote_commit": f"{index:040x}"}
+                catalog.append({**metadata, "sources": [{**metadata, "path": f"D:/示例/{role}{suffix}"}
+                                                        for suffix in ("", "-2")]})
+            repositories.append({"role": role, "status": "pending", "refreshed": False, "catalog": catalog})
+        self.state["branch_resolution"] = {"repositories": repositories}
+        self.assertGreater(len(dumps(repositories, ensure_ascii=False)), 1048576)
+        text = self.start("branch")[0]["text"]
+        self.assertLess(len(text), 1048576)
+        context = loads(text.split("\n", 1)[1])
+        for repository, expected in zip(context["repositories"], repositories):
+            table = repository["branches"]
+            self.assertEqual([branch["name"] for branch in table["branches"]],
+                             [branch["name"] for branch in expected["catalog"]])
+            self.assertTrue(all(len(branch["sources"]) == 2 for branch in table["branches"]))
+
     def test_archive_images_reach_model_and_share_existing_deduplication(self):
         image = self.image("包内图片.png", b"archive image")
         self.state["snapshot"]["materials"] = [{"file_id": 99, "archive_entries": [image]}]

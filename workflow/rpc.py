@@ -16,6 +16,9 @@ from workflow.mcp_server import TOOLS
 from workflow.settings import ROOT, WorkflowError
 
 
+MAX_INPUT_CHARACTERS = 1048576
+
+
 class CodexRequestError(WorkflowError):
     """保留服务端错误原文，供调用方识别明确的状态冲突。"""
 
@@ -115,6 +118,11 @@ class AppServer:
             self.process.stdin.flush()
 
     def request(self, method, params):
+        if method == "turn/start":
+            characters = sum(len(entry["text"]) for entry in params["input"] if entry["type"] == "text")
+            if characters > MAX_INPUT_CHARACTERS:
+                raise WorkflowError(f"Codex 本轮输入共 {characters:,} 字符，超过 {MAX_INPUT_CHARACTERS:,} 字符上限，未发送请求。"
+                                    "分支识别阶段可手动选择目标分支；其他阶段请缩小本轮输入范围后继续。未截断资料或自动重试。")
         request_id = next(self.ids)
         waiter = Queue(maxsize=1)
         with self.lock:

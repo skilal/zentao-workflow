@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import Mock, patch
 
-from workflow.rpc import AppServer, CodexRequestError
+from workflow.rpc import MAX_INPUT_CHARACTERS, AppServer, CodexRequestError
 from workflow.settings import ROOT, WorkflowError
 
 
@@ -36,6 +36,29 @@ class CodexCommandChecks(TestCase):
         self.assertIsInstance(caught.exception, WorkflowError)
         self.assertEqual(caught.exception.message, "no active turn to interrupt")
         self.assertEqual(str(caught.exception), "Codex 接口拒绝请求：no active turn to interrupt")
+        self.assertEqual(rpc.waiters, {})
+
+    def test_oversized_turn_stops_before_writing_or_registering_waiter(self):
+        rpc = AppServer(self.settings, Mock())
+        with patch.object(rpc, "_write") as write:
+            with self.assertRaisesRegex(WorkflowError, "1,048,577.*1,048,576.*未发送"):
+                rpc.request("turn/start", {"input": [
+                    {"type": "text", "text": "中" * MAX_INPUT_CHARACTERS},
+                    {"type": "text", "text": "文"}, {"type": "localImage", "path": "图片.png"}]})
+        write.assert_not_called()
+        self.assertEqual(rpc.waiters, {})
+
+    def test_turn_at_character_limit_is_sent_without_truncation(self):
+        rpc = AppServer(self.settings, Mock())
+        params = {"input": [{"type": "text", "text": "中" * MAX_INPUT_CHARACTERS}]}
+
+        def respond(message):
+            self.assertIs(message["params"], params)
+            rpc.waiters[message["id"]].put({"result": {"turn": {"id": "回合"}}})
+
+        with patch.object(rpc, "_write", side_effect=respond) as write:
+            self.assertEqual(rpc.request("turn/start", params), {"turn": {"id": "回合"}})
+        write.assert_called_once()
         self.assertEqual(rpc.waiters, {})
 
     def test_absolute_executable_works_without_path_and_preserves_settings(self):
