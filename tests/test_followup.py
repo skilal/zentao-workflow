@@ -29,7 +29,7 @@ PNG = b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8
 
 class FollowupChecks(TestCase):
     def setUp(self):
-        directory = TemporaryDirectory()
+        directory = TemporaryDirectory(dir=ROOT / ".local")
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         for target in ("workflow.store.LOCAL", "workflow.web.LOCAL"):
@@ -37,6 +37,7 @@ class FollowupChecks(TestCase):
             mocked.start()
             self.addCleanup(mocked.stop)
         self.settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        self.settings["workspace_root"] = str(self.root / "worktrees")
         self.application = WebApplication(self.settings)
         self.addCleanup(self.application.close)
         self.state = self.application.sessions.store.new({"kind": "story", "id": 7, "title": "测试反馈续聊"})
@@ -67,6 +68,8 @@ class FollowupChecks(TestCase):
                 "branch": "项目分支", "base": "refs/heads/项目分支", "baseline": baseline,
                 "workspace_owned": False, "preserved_paths": []})
             self.state["commits"][name] = git(path, "rev-parse", "HEAD")
+        self.settings["repositories"] = [{"name": repo["name"], "role": repo["role"], "path": repo["path"], "remote": "origin"}
+                                         for repo in self.state["repos"]]
         self.state["reviews"] = [{"number": 1, "fix_round": 3, "history_index": 0, "result": {
             "summary": "原有问题已接受", "findings": [{"id": "R01-01", "title": "历史问题", "category": "业务链路问题",
                 "origin": "原有问题", "severity": "P2", "previous_id": "", "repository": "前端", "path": "业务.txt", "line": 1,
@@ -740,6 +743,10 @@ class FollowupChecks(TestCase):
         git(path, "add", "本机.txt")
         index = git(path, "diff", "--cached", binary=True)
         self.send()
+        self.assertEqual(self.state["phase"], "branch")
+        self.assertEqual(git(path, "branch", "--show-current"), "其他分支")
+        self.engine.turn_running = False
+        self.engine._complete_idle(dumps({"files": [{"path": "本机.txt", "impact": "nonfunctional", "reason": "仅本机保留配置"}]}))
         self.assertEqual(git(path, "branch", "--show-current"), "项目分支")
         self.assertIn("本机.txt", self.state["repos"][0]["preserved_paths"])
         with self.assertRaises(WorkflowError):
@@ -837,7 +844,7 @@ class FollowupChecks(TestCase):
         self.engine.store.save(other)
         self.application.dispatch(self.request())
         self.drain()
-        self.assertEqual(self.state["stage"], "已停止")
+        self.assertEqual(self.state["stage"], "准备工作区失败")
         self.assertEqual(len(self.state["repos"]), 1)
         first = deepcopy(self.state["repos"][0])
         self.application.close()

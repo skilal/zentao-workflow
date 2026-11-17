@@ -29,6 +29,8 @@ def load_settings():
     if not isinstance(pdf, dict) or not isinstance(pdf.get("renderer"), str) or not pdf["renderer"].strip():
         raise WorkflowError("pdf.renderer 必须是明确的 pdftoppm 命令名或可执行文件完整路径。")
     settings["pdf"] = pdf
+    from workflow.workspace_paths import DEFAULT_WORKSPACE_ROOT, validate_workspace_root
+    settings["workspace_root"] = validate_workspace_root(settings.get("workspace_root", DEFAULT_WORKSPACE_ROOT))
     return settings
 
 

@@ -37,6 +37,7 @@ from workflow.followup_attachments import attachment_file as followup_attachment
 from workflow.followup_documents import DOCUMENT_EXTENSIONS, attachment_image, prepare_document, preview_document
 from workflow.workspace_handoff import handoff_reason
 from workflow.workspace_release import RELEASE_ACTIONS
+from workflow.workspace_paths import workspace_directory
 
 
 ASSETS = ROOT / "web" / "dist"
@@ -190,7 +191,7 @@ class WebApplication:
                 "directory": str(self.sessions.store.directory(state["id"])),
                 "reused_workspaces": sorted({entry["path"] for entry in repositories if not entry.get("workspace_owned", True)}),
                 "workspaces": sorted({entry["path"] for entry in repositories if entry.get("workspace_owned", True)} |
-                    {str(self.sessions.store.directory(state["id"]) / "workspace" /
+                    {str(workspace_directory(self.sessions.store, state) /
                          (f"repo-{index + 1}" + (f"-delivery-{state['delivery_round']}" if state.get("followup") else "")))
                      for index, selection in enumerate(state.get("selections", []))
                      if selection["name"] not in {entry["name"] for entry in state["repos"]}})}

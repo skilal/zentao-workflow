@@ -8,6 +8,7 @@ from pathlib import Path
 from workflow.gitops import checkout_snapshot, git, reject_hooks, repository_lock, workspace_claims, worktrees
 from workflow.settings import WorkflowError
 from workflow.store import timestamp
+from workflow.workspace_paths import managed_workspace
 
 
 class WorkspaceReuseFlow:
@@ -33,7 +34,7 @@ class WorkspaceReuseFlow:
             raise WorkflowError(f"工作区正被其他未完成会话 {owner} 使用：{path}，不能接管。")
         if "locked" in entry or "prunable" in entry:
             raise WorkflowError(f"工作区被锁定或登记失效，不能复用：{path}")
-        if path == source or path.is_relative_to(self.store.root.resolve()):
+        if path == source or path.is_relative_to(self.store.root.resolve()) or managed_workspace(self.store, path, self.store.sessions()):
             raise WorkflowError("该目录属于原仓库或会话管理工作区，请按原工作区分配流程继续。")
         if not path.is_dir() or Path(git(path, "rev-parse", "--show-toplevel")).resolve() != path:
             raise WorkflowError(f"工作区不是有效的 Git 仓库根目录：{path}")

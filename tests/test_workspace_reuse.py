@@ -19,7 +19,7 @@ from review_fixtures import approve_fragments
 
 class WorkspaceReuseChecks(TestCase):
     def setUp(self):
-        temporary = TemporaryDirectory()
+        temporary = TemporaryDirectory(dir=ROOT / ".local")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         patched = patch("workflow.store.LOCAL", self.root / "local")
@@ -198,6 +198,7 @@ class WorkspaceReuseChecks(TestCase):
             self.acquire("项目分支")
         index = git(self.source, "diff", "--cached", "--binary", binary=True)
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        settings["workspace_root"] = str(self.root / "worktrees")
         flow = Workflow(settings, lambda *args: None, self.store)
         self.addCleanup(flow.close)
         flow.state, flow._start_turn = self.state, Mock()
@@ -225,6 +226,7 @@ class WorkspaceReuseChecks(TestCase):
         self.checkout_request()
         self.state.pop("checkout_request")
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        settings["workspace_root"] = str(self.root / "worktrees")
         flow = Workflow(settings, lambda *args: None, self.store)
         self.addCleanup(flow.close)
         flow.state, flow._resolve_branches = self.state, Mock()
@@ -258,6 +260,7 @@ class WorkspaceReuseChecks(TestCase):
         with self.assertRaisesRegex(WorkflowError, "解决合并冲突"):
             confirm_checkout(self.source, self.store, self.state)
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        settings["workspace_root"] = str(self.root / "worktrees")
         flow = Workflow(settings, lambda *args: None, self.store)
         self.addCleanup(flow.close)
         flow.state, flow._start_turn = self.store.load(self.state["id"]), Mock()
@@ -343,6 +346,7 @@ class WorkspaceReuseChecks(TestCase):
         previous, stash = request["baseline"], request["stash"]
         index = git(self.source, "diff", "--cached", "--binary", binary=True)
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        settings["workspace_root"] = str(self.root / "worktrees")
         flow = Workflow(settings, lambda *args: None, self.store)
         self.addCleanup(flow.close)
         flow.state, flow._start_turn = self.state, Mock()
@@ -546,6 +550,7 @@ class WorkspaceReuseChecks(TestCase):
                           commit_batch={"delivery_round": 1, "review_number": 1, "manifest": {},
                                         "messages": {"前端": "feat(业务): 完成任务"}})
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        settings["workspace_root"] = str(self.root / "worktrees")
         flow = Workflow(settings, lambda *args: None, store=self.store)
         self.addCleanup(flow.close)
         flow.state = self.state

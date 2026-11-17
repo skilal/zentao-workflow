@@ -1324,7 +1324,7 @@ function WorkflowApp() {
         placeholder: "选择已检测的仓库目录", optionFilterProp: "label", showSearch: true,
         options: entry.candidates.map(candidate => ({ value: candidate.path,
           label: `${candidate.path}（${candidate.branch || "未检出分支"}）`,
-          disabled: Boolean(candidate.error) || (initial && candidate.branch !== entry.branch) })),
+          disabled: Boolean(candidate.error) || (initial && candidate.branch !== entry.branch && !(entry.action === "allocate" && candidate.path === entry.path)) })),
         onChange: path => initial ? changeDraft({ repository_paths: { ...draft.repository_paths, [entry.role]: path } }) :
           changeDraft({ baseline_paths: { ...draft.baseline_paths, [entry.name]: path } }) }),
       entry.candidates.map(candidate => h("div", { key: candidate.path, style: { marginTop: 12 } },
@@ -1354,6 +1354,7 @@ function WorkflowApp() {
           return act("detect_repositories", { purpose: "prepare", paths: Object.fromEntries(
             Object.entries(draft.repository_custom_paths || {}).filter(([, path]) => path.trim())) });
         } }, "重新检测目录"),
+        h(Button, { disabled: busy || Boolean(state.repos.length), onClick: startPlan }, "重新识别分支"),
         h(Button, { type: "primary", disabled: busy || Object.values(choices).some(path => !path),
           onClick: () => act("choose_repositories", { paths: choices }) }, "确认目录并继续")));
   }
@@ -1445,14 +1446,17 @@ function WorkflowApp() {
             h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy,
               onClick: () => act("checkout_resolved", { baseline: checkout.baseline_change.current }) }, "确认使用新基准并继续"))) :
           checkout.status !== "restored" && h(React.Fragment, null,
-            h(Alert, { type: "warning", showIcon: true, message: "智能切换已停止。请手工完成目标分支切换、恢复备份改动并解决冲突，再确认继续。" }),
+            h(Alert, { type: "warning", showIcon: true, message: checkout.status === "rolled_back" ?
+              "智能切换发生冲突，已恢复原分支、文件及暂存状态。请人工处理目标分支切换后确认继续。" :
+              checkout.status === "rollback_failed" ? "智能切换回退未完成，备份已保留。请人工核对分支、文件和暂存状态后确认继续。" :
+              "智能切换已停止。请手工完成目标分支切换、恢复备份改动并解决冲突，再确认继续。" }),
             h("div", { className: "action-bar" }, h(Button, { type: "primary", disabled: busy,
               onClick: () => act("checkout_resolved") }, "已手工恢复改动并解决冲突，继续"))),
         checkout.selected_paths && h("p", { className: "muted" }, `本次保留文件：${checkout.selected_paths.join("、")}`),
         checkout.stash && h(Typography.Paragraph, { copyable: true }, `本机改动备份（保留）：${checkout.stash}`)),
       ACTIVE.has(stage) && state.phase === "branch" &&
-      h(CardBox, { title: "项目与分支操作" },
-        h(Space, null, h(Spin, { size: "small" }), stage)),
+      h(CardBox, { title: state.workspace_analysis ? "目录空闲判定" : "项目与分支操作" },
+        h(Space, null, h(Spin, { size: "small" }), state.workspace_analysis ? "正在逐文件判断修改的功能影响" : stage)),
       detailRepositories.length > 0 && h("div", { className: compact ? "card-stack" : "repository-grid" }, detailRepositories.map(repository => {
         const entry = repositories.find(entry => entry.role === repository.role);
         const workspace = state.repos.find(entry => entry.name === repository.name);

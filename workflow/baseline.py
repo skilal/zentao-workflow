@@ -10,6 +10,7 @@ from uuid import uuid4
 from workflow.gitops import checkout_snapshot, git, repository_lock, working_paths, workspace_claims
 from workflow.settings import WorkflowError
 from workflow.store import timestamp
+from workflow.workspace_paths import managed_workspace
 
 
 BASELINE_STAGES = {"已暂停", "已停止", "等待计划确认", "等待计划补充", "等待修复选择", "等待编译选择"}
@@ -58,7 +59,7 @@ class BaselineFlow:
                 owner = claims.get(path.casefold())
                 if owner:
                     raise WorkflowError(f"目标目录正被未完成会话 {owner} 使用：{path}")
-                if moved and Path(path).is_relative_to(self.store.root.resolve()):
+                if moved and (Path(path).is_relative_to(self.store.root.resolve()) or managed_workspace(self.store, path, self.store.sessions())):
                     raise WorkflowError("更换目录请选择会话管理目录之外的本机仓库，不接管会话自建工作区。")
                 branch = git(path, "branch", "--show-current")
                 if not branch:

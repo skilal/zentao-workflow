@@ -26,7 +26,7 @@ from workflow.delivery import apply_followup_replacements, validate_review_reque
 from workflow.commit_messages import COMMIT_INSTRUCTIONS, COMMIT_MESSAGE_SCHEMA, prepare_commit_messages
 from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
 from workflow.followup_documents import current_attachment_images
-from workflow.gitops import acquire_workspace, branch_catalog, carry_checkout, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
+from workflow.gitops import acquire_workspace, branch_catalog, branch_history, carry_checkout, checkout_snapshot, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
 from workflow.repository_selection import RepositorySelectionFlow, repository_catalog
@@ -39,6 +39,8 @@ from workflow.user_input import input_request_path, pending_input
 from workflow.workspace_reuse import WorkspaceReuseFlow
 from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.workspace_release import WorkspaceReleaseFlow
+from workflow.workspace_paths import DEFAULT_WORKSPACE_ROOT, validate_workspace_root, workspace_directory
+from workflow.workspace_idle import IDLE_SCHEMA, IdleAnalysisRequired
 from workflow.shared_changes import (SCOPE_SCHEMA, initialize_session, select_scope, snapshot_review)
 from workflow.zentao import KINDS, ZentaoClient, project_context
 
@@ -244,9 +246,12 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         else:
             state.setdefault("deliveries", []).append(archived)
             state["continuation_context"] = None
-        targets = [{"name": repo["name"], "role": repo["role"], "path": repo["path"] if repo.get("directory_matched") else repo["source"],
+        configured = {repo["role"]: repo for repo in configured_repositories(self.settings)}
+        targets = [{"name": repo["name"], "role": repo["role"], "path": repo["source"],
                     "branch": repo["branch"], "base": "refs/heads/" + repo["branch"], "create": False,
-                    **({"expected_head": git(repo["path"], "rev-parse", "HEAD")} if repo.get("directory_matched") else {})}
+                    "allocate": True, "remote": configured[repo["role"]]["remote"],
+                    "candidate_paths": list(dict.fromkeys([repo["path"], repo["source"],
+                        configured[repo["role"]]["path"], *configured[repo["role"]].get("candidate_paths", [])]))}
                    for repo in state["repos"]]
         history_index = len(state["history"])
         image_ids = {entry["id"] for entry in images}
@@ -289,11 +294,15 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         state = self.state
         if state.get("workspace_reuse_request"):
             raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
+        checkout = state.get("checkout_request")
+        if checkout and checkout["status"] not in {"waiting", "restored"}:
+            raise WorkflowError("智能切换已停止，请先人工核对分支和备份改动，再确认继续。")
         state.update(stage="准备工作区中", pause_requested=False)
         self.save()
         self._close_rpc()
-        workspace = self.store.directory(state["id"]) / "workspace"
-        workspace.mkdir(exist_ok=True)
+        state.setdefault("workspace_root", validate_workspace_root(self.settings.get("workspace_root", DEFAULT_WORKSPACE_ROOT)))
+        workspace = workspace_directory(self.store, state)
+        workspace.mkdir(parents=True, exist_ok=True)
         prepared = {repo["name"] for repo in state["repos"]}
         for index, selection in enumerate(state["selections"]):
             if self.closed or state.get("pause_requested"):
@@ -301,7 +310,15 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 self.save()
                 return
             if selection["name"] not in prepared:
-                acquire_workspace(selection, workspace / f"repo-{index + 1}-delivery-{state['delivery_round']}", self.store, state)
+                try:
+                    acquire_workspace(selection, workspace / f"repo-{index + 1}-delivery-{state['delivery_round']}", self.store, state)
+                except IdleAnalysisRequired as request:
+                    self._analyze_idle(request.request)
+                    return
+                except Exception:
+                    state["stage"] = "准备工作区失败"
+                    self.save()
+                    raise
         state["prepare_complete"] = True
         self.save()
         if state["followup"].get("plan_mode") and state["phase"] == "plan":
@@ -400,14 +417,14 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         state = self.require_state("资料已读取", "准备工作区失败", "等待选择分支", "等待选择目录")
         if state.get("workspace_reuse_request"):
             raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
+        if state.get("followup") and not state.get("prepare_complete"):
+            self._prepare_followup()
+            return
         if not state.get("snapshot"):
             raise WorkflowError("需求资料尚未完整读取。")
         if "plan_started_at" not in state:
             state["plan_started_at"] = timestamp()
             self.save()
-        if not manual and state.get("repository_detection", {}).get("purpose") == "prepare":
-            self.detect_repositories()
-            return
         if state["repos"] or (not manual and state["stage"] == "准备工作区失败" and state.get("selections")):
             if manual:
                 raise WorkflowError("工作区已经创建，不能改变当前会话分支。")
@@ -416,8 +433,11 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         branch_thread_id = state.get("thread_id") if state["phase"] == "branch" else None
         self._close_rpc()
         state.pop("repository_detection", None)
+        previous = state.get("branch_resolution", {})
+        retained = [entry for entry in previous.get("repositories", []) if entry.get("source") in {"human", "common"}]
         state.update(phase="branch", thread_id=branch_thread_id, turn_id=None, supplement=supplement.strip(),
-                     pause_requested=False, error="", branch_resolution={"repositories": [], "manual": manual})
+                     pause_requested=False, error="", branch_resolution={"repositories": [], "manual": manual,
+                                                                          "retained": retained, "version": 2})
         if "project" not in state:
             state["project"] = project_context(state["item"], state["snapshot"]["sources"][0]["raw"])
         self._resolve_branches()
@@ -449,6 +469,11 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 "candidates": [], "source": "", "refreshed": False, "refresh_state": "",
                 "preferred": preferred.get(repository["role"], "")}
                 for repository in configured_repositories(self.settings)]
+            if not resolution["manual"]:
+                for repository in resolution["repositories"]:
+                    kept = next((entry for entry in resolution.get("retained", []) if entry["role"] == repository["role"]), None)
+                    if kept:
+                        repository["preferred"] = kept["branch"]
             self.save()
         for repository in resolution["repositories"]:
             if state.get("pause_requested") or self.closed:
@@ -478,6 +503,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.save()
             raise
         repository.update(refreshed=True, refresh_state="done")
+        repository.pop("analysis", None)
         self.state["stage"] = "已暂停" if self.state.get("pause_requested") else "识别分支中"
         self.save()
 
@@ -535,6 +561,10 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             state["stage"] = "已暂停"
             self.save()
         elif any(entry["status"] == "pending" for entry in repositories):
+            if state["branch_resolution"].get("version") == 2:
+                repository = next(entry for entry in repositories if entry["status"] == "pending")
+                state["branch_resolution"]["active_role"] = repository["role"]
+                repository.setdefault("analysis", {"step": "shortlist", "offset": 0, "shortlist": []})
             self._start_turn("请判断上下文中待识别仓库的分支，严格返回结构化结果。", BRANCH_SCHEMA)
         elif any(entry["status"] == "needs_user" for entry in repositories):
             state["stage"] = "等待选择分支"
@@ -574,7 +604,35 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
     def _complete_branches(self, text):
         state = self.state
         repositories = state["branch_resolution"]["repositories"]
-        results = validate_result(loads(text), repositories)
+        resolution = state["branch_resolution"]
+        results = validate_result(loads(text), repositories, resolution.get("active_role"))
+        if resolution.get("version") == 2:
+            repository = next(entry for entry in repositories if entry["role"] == resolution["active_role"])
+            analysis = repository["analysis"]
+            result = results[0]
+            if analysis["step"] == "shortlist":
+                page = repository["catalog"][analysis["offset"]:analysis["offset"] + 200]
+                names = list(dict.fromkeys([*result["candidates"], *([result["branch"]] if result["branch"] else [])]))
+                if len(names) > 3 or not set(names).issubset({entry["name"] for entry in page}):
+                    raise WorkflowError("分支初筛只能返回当前页内最多三个真实候选。")
+                analysis["shortlist"] = list(dict.fromkeys([*analysis["shortlist"], *names]))
+                analysis["offset"] += len(page)
+                if analysis["offset"] >= len(repository["catalog"]):
+                    if not analysis["shortlist"]:
+                        if result["status"] == "needs_user":
+                            repository.update(status="needs_user", reason=result["reason"],
+                                              question=result["question"] or "项目分支证据不足，请明确选择。")
+                        elif not repository["refreshed"]:
+                            self._refresh_branches(repository)
+                        else:
+                            repository.update(status="needs_user", reason=result["reason"], question="未找到贴合项目的开发分支，请明确选择。")
+                    else:
+                        self._read_branch_histories(repository)
+                self.save()
+                self._advance_branches()
+                return
+            if result["branch"] and result["branch"] not in analysis["shortlist"]:
+                raise WorkflowError("最终选择必须来自已读取提交历史的候选分支。")
         for result in results:
             repository = next(entry for entry in repositories if entry["role"] == result["role"])
             repository.update(reason=result["reason"], candidates=result["candidates"], question=result["question"])
@@ -596,21 +654,51 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self.save()
         self._advance_branches()
 
+    def _read_branch_histories(self, repository):
+        analysis = repository["analysis"]
+        histories = []
+        for name in analysis["shortlist"]:
+            entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
+            if not entry["local"] and name not in repository.get("fetched_branches", []):
+                if not repository["refreshed"]:
+                    self._refresh_branches(repository)
+                    if not set(analysis["shortlist"]).issubset({branch["name"] for branch in repository["catalog"]}):
+                        return
+                    repository["analysis"] = analysis
+                    if self.closed or self.state.get("pause_requested"):
+                        return
+                if not self._fetch_branch(repository, name):
+                    return
+                entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
+            for source in entry.get("sources", [{"path": repository["path"]}]):
+                current = branch_catalog({**repository, "path": source["path"]})
+                if any(branch["name"] == name for branch in current):
+                    histories.append(branch_history({**repository, "path": source["path"]}, name))
+        analysis.update(step="verify", histories=histories)
+
     def smart_checkout(self, paths):
         state = self.require_state("准备工作区失败")
         request = state.get("checkout_request")
-        if not request or request["selection"] not in state["selections"]:
+        if not request or not any(entry["name"] == request["selection"]["name"]
+                                  and entry["branch"] == request["selection"]["branch"] for entry in state["selections"]):
             raise WorkflowError("当前没有可处理的分支切换请求。")
         carry_checkout(request["path"], self.store, state, paths)
-        self.prepare_and_plan(state["selections"], state["supplement"])
+        if state.get("followup"):
+            self._prepare_followup()
+        else:
+            self.prepare_and_plan(state["selections"], state["supplement"])
 
     def checkout_resolved(self, baseline=None):
         state = self.require_state("准备工作区失败")
         request = state.get("checkout_request")
-        if not request or request["selection"] not in state["selections"]:
+        if not request or not any(entry["name"] == request["selection"]["name"]
+                                  and entry["branch"] == request["selection"]["branch"] for entry in state["selections"]):
             raise WorkflowError("当前没有可确认的分支切换请求。")
         if confirm_checkout(request["path"], self.store, state, baseline):
-            self.prepare_and_plan(state["selections"], state["supplement"])
+            if state.get("followup"):
+                self._prepare_followup()
+            else:
+                self.prepare_and_plan(state["selections"], state["supplement"])
         else:
             state["error"] = ""
             self.save()
@@ -633,8 +721,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         state["stage"] = "准备工作区中"
         self.save()
         state["max_fix_rounds"] = self.settings["review"]["max_fix_rounds"]
-        workspace = self.store.directory(state["id"]) / "workspace"
-        workspace.mkdir(exist_ok=True)
+        state.setdefault("workspace_root", validate_workspace_root(self.settings.get("workspace_root", DEFAULT_WORKSPACE_ROOT)))
+        workspace = workspace_directory(self.store, state)
+        workspace.mkdir(parents=True, exist_ok=True)
         existing = {repository["name"]: repository for repository in state["repos"]}
         for index, selection in enumerate(selections):
             if self.closed or state.get("pause_requested"):
@@ -643,11 +732,14 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 return
             if selection["name"] in existing:
                 old = existing[selection["name"]]
-                if old["branch"] != selection["branch"] or old["base"] != selection["base"]:
+                if old["branch"] != selection["branch"] or (not selection.get("allocate") and old["base"] != selection["base"]):
                     raise WorkflowError("已创建的工作区选择发生变化，请新建工作流处理，不会自动删除旧工作区。")
                 continue
             try:
                 acquire_workspace(selection, workspace / f"repo-{index + 1}", self.store, state)
+            except IdleAnalysisRequired as request:
+                self._analyze_idle(request.request)
+                return
             except Exception:
                 state["stage"] = "准备工作区失败"
                 self.save()
@@ -680,7 +772,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
     def ensure_rpc(self):
         if not self.state.get("codex"):
             raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
-        if self.state.get("followup") and not self.state.get("thread_id"):
+        if self.state.get("followup") and not self.state.get("thread_id") and self.state["phase"] != "branch":
             raise WorkflowError("原 Codex 线程不存在，不能新建线程替代续聊。")
         if self.closed:
             raise WorkflowError("客户端已经关闭，不能启动新会话。")
@@ -765,7 +857,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                                              if phase == "review" else ""))
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
-        turn_cwd = session_path if phase == "branch" else session_path / "workspace"
+        turn_cwd = session_path if phase == "branch" else workspace_directory(self.store, state)
         context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                    "followup_attachments": submitted_followup_attachments(state),
                    "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
@@ -824,7 +916,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                                               policy_instruction=policy_instruction,
                                               material_instruction=material_instruction, context=dumps(changed, ensure_ascii=False))
         if phase == "branch":
-            context = branch_context(state)
+            context = self._idle_context() if state.get("workspace_analysis") else branch_context(state)
             inputs = [{"type": "text", "text": prompt_templates.BRANCH_INPUT.format(
                 context=dumps(context, ensure_ascii=False, separators=(",", ":")))}]
         else:
@@ -849,6 +941,8 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             if phase != "branch":
                 state["thread_input"] = {"thread_id": state["thread_id"], "context_hashes": hashes,
                                          "images": sorted(image_hashes), "summary_policy_hash": policy_hash}
+            elif not state.get("workspace_analysis"):
+                state["branch_resolution"]["sources_input"] = {"thread_id": state["thread_id"], "revision": context["sources_revision"]}
             self.save()
 
     def approve_plan(self):
@@ -1151,7 +1245,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
     def resume(self):
         if self.state.get("workspace_handoff_request"):
             raise WorkflowError("请先完成或取消本地开发目录交接。")
-        state = self.require_state("已暂停", "已停止")
+        state = self.require_state("已暂停", "已停止", "准备工作区失败")
         if state.get("workspace_reuse_request"):
             raise WorkflowError("请先明确确认或取消外部工作区复用预览，再继续。")
         if state["commits"]:
@@ -1171,6 +1265,22 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             return
         if state["phase"] == "compile":
             self._resume_compile()
+            return
+        if state.get("workspace_analysis"):
+            request = state["workspace_analysis"]
+            if (checkout_snapshot(request["path"]) != request["snapshot"]
+                    or git(request["path"], "rev-parse", "HEAD") != request["head"]
+                    or git(request["path"], "branch", "--show-current") != request["branch"]):
+                self._close_rpc()
+                state["branch_thread_id"] = state["thread_id"]
+                state.update(phase=request["return_phase"], thread_id=request["return_thread"], stage="准备工作区失败")
+                state.pop("workspace_analysis")
+                if state.get("followup"):
+                    self._prepare_followup()
+                else:
+                    self.prepare_and_plan(state["selections"], state["supplement"])
+                return
+            self._start_turn("继续核对未提交修改的功能影响。", IDLE_SCHEMA)
             return
         if state["phase"] == "compile_analysis":
             batch = self._compile_batch()
@@ -1357,7 +1467,10 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.save()
             return
         if state["phase"] == "branch":
-            self._complete_branches(text)
+            if state.get("workspace_analysis"):
+                self._complete_idle(text)
+            else:
+                self._complete_branches(text)
             return
         if state["phase"] == "compile_analysis":
             self._compile_analyzed(text)

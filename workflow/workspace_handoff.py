@@ -9,6 +9,7 @@ from uuid import uuid4
 from workflow.gitops import checkout_snapshot, git, reject_hooks, repository_lock, safe_file, workspace_claims, worktrees
 from workflow.settings import WorkflowError
 from workflow.store import timestamp, workspaces_released
+from workflow.workspace_paths import managed_workspace
 
 
 def handoff_reason(state):
@@ -98,6 +99,8 @@ class WorkspaceHandoffFlow:
         if target.is_relative_to(self.store.root.resolve()):
             raise WorkflowError("本地开发目录不能位于会话管理目录中。")
         self._handoff_worktrees(source, target)
+        if managed_workspace(self.store, target, self.store.sessions()):
+            raise WorkflowError("本地开发目录不能位于会话管理目录中。")
         head = git(source, "rev-parse", "HEAD")
         if git(source, "branch", "--show-current") != repo["branch"]:
             raise WorkflowError("源工作区已不在会话目标分支，请先恢复后重新预览。")

@@ -10,6 +10,7 @@ from workflow.baseline import BASELINE_STAGES
 from workflow.gitops import checkout_snapshot, git, reject_hooks, repository_lock, workspace_claims, worktrees
 from workflow.settings import WorkflowError
 from workflow.store import timestamp
+from workflow.workspace_paths import managed_workspace
 
 
 RELEASE_ACTIONS = {
@@ -157,6 +158,8 @@ class WorkspaceReleaseFlow:
         if any(other["name"] != repo["name"] and Path(other["path"]).resolve() == target for other in self.state["repos"]):
             raise WorkflowError("前后端不能使用同一个仓库目录。")
         self._release_paths(repo, target)
+        if managed_workspace(self.store, target, self.store.sessions()):
+            raise WorkflowError("请选择会话管理目录之外的本地开发目录。")
         source = Path(repo["path"]).resolve()
         if source != target and (git(source, "branch", "--show-current") or git(source, "rev-parse", "HEAD") != release["head"]):
             raise WorkflowError("释放后的源工作区已变化，请先人工核对恢复。")

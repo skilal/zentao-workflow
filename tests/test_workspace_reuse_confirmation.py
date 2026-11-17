@@ -17,7 +17,7 @@ from workflow.web import WebApplication
 
 class WorkspaceReuseConfirmationChecks(TestCase):
     def setUp(self):
-        temporary = TemporaryDirectory()
+        temporary = TemporaryDirectory(dir=ROOT / ".local")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         for target in ("workflow.store.LOCAL", "workflow.web.LOCAL"):
@@ -25,6 +25,7 @@ class WorkspaceReuseConfirmationChecks(TestCase):
             patched.start()
             self.addCleanup(patched.stop)
         self.settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        self.settings["workspace_root"] = str(self.root / "worktrees")
         self.settings["repositories"] = []
         self.selections = []
         for name, role in (("前端", "frontend"), ("后端", "backend")):

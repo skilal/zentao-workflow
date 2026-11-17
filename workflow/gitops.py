@@ -12,6 +12,7 @@ from threading import Lock, RLock
 from workflow.settings import WorkflowError
 from workflow.store import session_repositories
 from workflow.locks import ProcessLock
+from workflow.workspace_paths import managed_workspace, workspace_directories, workspace_directory
 
 
 HOOK_NAMES = ("post-checkout", "pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "pre-auto-gc",
@@ -89,9 +90,25 @@ def branch_catalog(repository):
         name = ref[len("refs/heads/"):] if local else ref[len(remote_prefix):]
         entry = result.setdefault(name, {"name": name, "local": False, "remote": False})
         entry["local" if local else "remote"] = True
+        entry.setdefault("refs", []).append({"ref": ref, "commit": commit_id, "date": date, "subject": subject})
         if local or "commit" not in entry:
             entry.update(commit=commit_id, date=date, subject=subject, metadata_available=True)
     return sorted(result.values(), key=lambda entry: entry["name"])
+
+
+@locked_repository
+def branch_history(repository, name):
+    entries = branch_catalog(repository)
+    branch = next(entry for entry in entries if entry["name"] == name)
+    histories = []
+    for reference in branch["refs"]:
+        output = git(repository["path"], "log", "-10", "--format=%H%x00%P%x00%cI%x00%s", reference["commit"])
+        commits = []
+        for line in output.splitlines():
+            commit_id, parents, date, subject = line.split("\0", 3)
+            commits.append({"commit": commit_id, "parents": parents.split(), "date": date, "subject": subject})
+        histories.append({**reference, "commits": commits})
+    return {"path": repository["path"], "name": name, "refs": histories}
 
 
 @locked_repository
@@ -202,11 +219,11 @@ def workspace_claims(sessions, excluded_session):
 def switch_branch(path, selection, baseline):
     if selection["create"]:
         if selection.get("track"):
-            git(path, "switch", "--track", "-c", selection["branch"], selection["base"])
+            git(path, "switch", "--no-overwrite-ignore", "--track", "-c", selection["branch"], selection["base"])
         else:
-            git(path, "switch", "-c", selection["branch"], baseline)
+            git(path, "switch", "--no-overwrite-ignore", "-c", selection["branch"], baseline)
     else:
-        git(path, "switch", selection["branch"])
+        git(path, "switch", "--no-overwrite-ignore", selection["branch"])
 
 
 def checkout_snapshot(path):
@@ -265,7 +282,7 @@ def carry_checkout(repository, store, state, paths):
 @locked_repository
 def confirm_checkout(repository, store, state, baseline=None):
     request = state["checkout_request"]
-    if request["status"] not in {"stashed", "switched", "restore_failed", "switch_failed"}:
+    if request["status"] not in {"stashed", "switched", "restore_failed", "switch_failed", "rolled_back", "rollback_failed"}:
         raise WorkflowError("当前没有需要手工确认的智能切换。")
     branch = git(repository, "branch", "--show-current")
     if branch != request["selection"]["branch"]:
@@ -301,8 +318,58 @@ def confirm_checkout(repository, store, state, baseline=None):
     return True
 
 
-@locked_repository
 def acquire_workspace(selection, destination, store, state):
+    if selection.get("allocate"):
+        candidates = list(dict.fromkeys([*selection.get("candidate_paths", []), selection["path"]]))
+        matching = [path for path in candidates if git(path, "branch", "--show-current") == selection["branch"]]
+        if matching:
+            dates = {path: int(git(path, "log", "-1", "--format=%ct")) for path in matching}
+            latest = max(dates.values())
+            newest = [path for path in matching if dates[path] == latest]
+            if len(newest) != 1:
+                raise WorkflowError("匹配目录的 HEAD 提交者时间相同，请明确选择目录。")
+            candidates = [newest[0]]
+        else:
+            registered_matches = [path for path in candidates if any(
+                entry.get("branch") == "refs/heads/" + selection["branch"] for entry in worktrees(path))]
+            candidates = [*registered_matches, *(path for path in candidates if path not in registered_matches)]
+        for path in candidates:
+            with repository_lock(path):
+                available = branch_catalog({**selection, "path": path, "remote": selection.get("remote", "origin")})
+                branch = next((branch for branch in available if branch["name"] == selection["branch"]), None)
+                if not branch:
+                    continue
+                target = {**selection, "path": path, "allocate": False,
+                          "base": "refs/heads/" + selection["branch"] if branch["local"] else
+                                  f"refs/remotes/{selection.get('remote', 'origin')}/{selection['branch']}",
+                          "create": not branch["local"], "track": not branch["local"]}
+                claims = workspace_claims(store.sessions(), state["id"])
+                # 同分支复用仍交给原有的共享及交接检查；其他分支须先判断空闲。
+                current = git(path, "branch", "--show-current")
+                if current != selection["branch"]:
+                    registered = worktrees(path)
+                    occupied = next((entry for entry in registered if entry.get("branch") == "refs/heads/" + selection["branch"]), None)
+                    if not occupied:
+                        if str(Path(path).resolve()).casefold() in claims:
+                            continue
+                        from workflow.workspace_idle import idle_decision
+                        if not idle_decision(path, state):
+                            continue
+                    target["automatic_switch"] = True
+                return _acquire_workspace(target, destination, store, state)
+        selection = {**selection, "allocate": False, "force_create": True}
+        available = branch_catalog({**selection, "remote": selection.get("remote", "origin")})
+        branch = next((branch for branch in available if branch["name"] == selection["branch"]), None)
+        if branch is None:
+            raise WorkflowError("目标分支已不存在，请重新识别或人工确认分支后再准备工作区。")
+        selection.update(base="refs/heads/" + selection["branch"] if branch["local"] else
+                         f"refs/remotes/{selection.get('remote', 'origin')}/{selection['branch']}",
+                         create=not branch["local"], track=not branch["local"])
+    return _acquire_workspace(selection, destination, store, state)
+
+
+@locked_repository
+def _acquire_workspace(selection, destination, store, state):
     """优先沿用目标分支目录，其次切换空闲目录，最后创建；登记与分配共用仓库锁。"""
     source, destination = Path(selection["path"]).resolve(), Path(destination).resolve()
     sessions = store.sessions()
@@ -320,18 +387,16 @@ def acquire_workspace(selection, destination, store, state):
     for entry in entries:
         path = Path(entry["worktree"]).resolve()
         owner = claims.get(str(path).casefold())
-        managed = None
-        if path.is_relative_to(store.root.resolve()):
-            managed = path.relative_to(store.root.resolve()).parts[0]
+        managed = managed_workspace(store, path, sessions)
         reusable = not owner and (path == source or managed == state["id"] or
             (managed in session_states and session_states[managed]["phase"] == "complete"))
         if entry.get("branch") == "refs/heads/" + selection["branch"]:
             if "locked" in entry or "prunable" in entry:
                 raise WorkflowError(f"目标分支工作区被锁定或登记失效，已停止：{path}")
             if owner or managed:
-                holders = [session for session in sessions if session["id"] != state["id"]
+                holders = [session for session in sessions if session["id"] != state["id"] and session["phase"] != "complete"
                            and any(Path(repo["path"]).resolve() == path for repo in session["repos"])]
-                if "expected_head" in selection and any(repo["branch"] != selection["branch"]
+                if any(repo["branch"] != selection["branch"]
                         for session in holders for repo in session["repos"] if Path(repo["path"]).resolve() == path):
                     raise WorkflowError("所选目录仍被其他未完成会话按不同目标分支占用，已停止；请先处理原会话目录绑定。")
                 if any(session.get("workspace_handoff_request") or session.get("workspace_release_request")
@@ -343,10 +408,18 @@ def acquire_workspace(selection, destination, store, state):
                                     "请点击“预览复用已有工作区”，核对后明确确认复用；不会自动接管该目录。")
             available = [entry]
             break
-        if reusable and "locked" not in entry and "prunable" not in entry:
+        if reusable and "locked" not in entry and "prunable" not in entry and not selection.get("force_create"):
             available.append(entry)
     else:
         available.sort(key=lambda entry: Path(entry["worktree"]).resolve() != source)
+    if selection.get("automatic_switch"):
+        from workflow.workspace_idle import idle_decision
+        for entry in available:
+            if entry.get("branch") == "refs/heads/" + selection["branch"] or idle_decision(Path(entry["worktree"]), state):
+                available = [entry]
+                break
+        else:
+            available = []
     if not available:
         record = prepare(source, destination, selection["branch"], selection["base"],
                          selection["create"], selection.get("track", False))
@@ -377,15 +450,21 @@ def acquire_workspace(selection, destination, store, state):
         if "expected_head" in selection and switching:
             raise WorkflowError("所选目录的分支登记已变化，请重新检测并选择目录。")
         if switching:
-            try:
-                switch_branch(path, selection, baseline)
-            except WorkflowError as error:
-                if "would be overwritten by checkout" in str(error):
-                    state["checkout_request"] = {"path": str(path), "selection": dict(selection),
-                        "head": git(path, "rev-parse", "HEAD"), "from_branch": git(path, "branch", "--show-current"),
-                        "baseline": baseline, "status": "waiting", "snapshot": checkout_snapshot(path)}
-                    store.save(state)
-                raise
+            if selection.get("automatic_switch"):
+                from workflow.workspace_idle import automatic_checkout, idle_decision
+                if not idle_decision(path, state):
+                    raise WorkflowError("所选空闲目录的改动已变化，请重新准备。")
+                automatic_checkout(path, selection, baseline, store, state)
+            else:
+                try:
+                    switch_branch(path, selection, baseline)
+                except WorkflowError as error:
+                    if "would be overwritten by checkout" in str(error):
+                        state["checkout_request"] = {"path": str(path), "selection": dict(selection),
+                            "head": git(path, "rev-parse", "HEAD"), "from_branch": git(path, "branch", "--show-current"),
+                            "baseline": baseline, "status": "waiting", "snapshot": checkout_snapshot(path)}
+                        store.save(state)
+                    raise
         request = state.get("checkout_request")
         if request and request["selection"] == selection and Path(request["path"]).resolve() == path:
             if request["status"] == "restored":
@@ -395,12 +474,18 @@ def acquire_workspace(selection, destination, store, state):
         reject_hooks(path)
         record = {"source": str(source), "path": str(path), "branch": branch, "base": base,
                   "baseline": baseline, "create": bool(selection["create"]),
-                  "workspace_owned": path.parent == store.directory(state["id"]) / "workspace",
+                  "workspace_owned": path.parent in workspace_directories(store, state),
                   "workspace_mode": "switched" if switching else "reused",
                   "preserved_paths": sorted(set(preserved + working_paths({"path": str(path)})))}
         if request and request["status"] == "restored" and request["selection"] == selection:
             record["checkout_backup"] = request["stash"]
-    record.update(name=selection["name"], role=selection["role"])
+    record.update(name=selection["name"], role=selection["role"], remote=selection.get("remote", "origin"),
+                  candidate_paths=selection.get("candidate_paths", []))
+    assessment = state.get("idle_assessments", {}).get(record["path"].casefold())
+    for entry in state.get("repository_detection", {}).get("repositories", []):
+        if entry["name"] == record["name"]:
+            entry["allocation"] = {"action": record["workspace_mode"], "path": record["path"], "head": record["baseline"],
+                                   "assessment": assessment}
     if "expected_head" in selection:
         record["directory_matched"] = True
     from workflow.shared_changes import initialize
@@ -533,10 +618,13 @@ def cleanup_workspaces(store, state, repositories):
     if state.get("workspace_handoff_request"):
         raise WorkflowError("请先完成或取消本地开发目录交接，再删除会话。")
     directory = store.directory(state["id"])
-    workspace = directory / "workspace"
-    if not state["repos"] and not state.get("selections") and not workspace.exists():
+    workspace = workspace_directory(store, state)
+    roots = workspace_directories(store, state)
+    if not state["repos"] and not state.get("selections") and not any(root.exists() for root in roots):
         return
     sources = {str(Path(entry["path"]).resolve()) for entry in repositories}
+    sources.update(str(Path(path).resolve()) for entry in state.get("selections", [])
+                   for path in entry.get("candidate_paths", []) if Path(path).is_dir())
     all_repositories = session_repositories(state)
     sources.update(str(Path(entry["source"]).resolve()) for entry in all_repositories)
     sources.update(str(Path(entry["path"]).resolve()) for entry in state.get("selections", []))
@@ -550,8 +638,8 @@ def cleanup_workspaces(store, state, repositories):
             for entry in worktrees(source):
                 raw_path = Path(entry["worktree"])
                 path = raw_path.resolve()
-                if path.is_relative_to(directory):
-                    if path.parent != workspace or raw_path.is_symlink() or (raw_path.exists() and getattr(raw_path.lstat(), "st_file_attributes", 0) & 0x400):
+                if path.is_relative_to(directory) or any(path.is_relative_to(root) for root in roots):
+                    if path.parent not in roots or raw_path.is_symlink() or (raw_path.exists() and getattr(raw_path.lstat(), "st_file_attributes", 0) & 0x400):
                         raise WorkflowError(f"工作区路径不符合会话目录约束：{raw_path}")
                     if "locked" in entry or "prunable" in entry:
                         raise WorkflowError(f"工作区被锁定或注册失效，已停止删除：{path}")
@@ -561,10 +649,13 @@ def cleanup_workspaces(store, state, repositories):
         for index, selection in enumerate(state.get("selections", [])):
             if selection["name"] not in prepared:
                 suffix = f"-delivery-{state['delivery_round']}" if state.get("followup") else ""
-                expected.setdefault(str(workspace / f"repo-{index + 1}{suffix}"), selection["path"])
+                pending_path = str(workspace / f"repo-{index + 1}{suffix}")
+                actual_source = registered.get(pending_path)
+                allowed = {str(Path(path).resolve()) for path in [selection["path"], *selection.get("candidate_paths", [])]}
+                expected.setdefault(pending_path, actual_source if actual_source in allowed else selection["path"])
         for name, source in expected.items():
             path = Path(name)
-            if path.parent != workspace:
+            if path.parent not in roots:
                 raise WorkflowError(f"工作区不在目标会话内，已停止删除：{path}")
             if str(path) in removed and not path.exists() and str(path) not in registered:
                 continue
@@ -572,8 +663,10 @@ def cleanup_workspaces(store, state, repositories):
                 continue
             if registered.get(str(path)) != str(Path(source).resolve()):
                 raise WorkflowError(f"工作区与来源仓库的注册信息不匹配：{path}")
-        if workspace.exists():
-            for path in workspace.iterdir():
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.iterdir():
                 if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
                     raise WorkflowError(f"工作区目录包含链接：{path}")
                 if path.is_dir() and str(path.resolve()) not in registered:

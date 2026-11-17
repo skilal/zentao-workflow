@@ -12,6 +12,7 @@
     {"name": "后端", "role": "backend", "path": "D:/projects/ais-server", "candidate_paths": [], "remote": "origin"}
   ],
   "project_branches": {},
+  "workspace_root": "D:/wkproj/worktrees",
   "codex": {
     "command": ["codex.cmd"],
     "model": "",

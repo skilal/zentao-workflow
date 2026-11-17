@@ -3,7 +3,8 @@
 from pathlib import Path
 
 from workflow.branching import configured_repositories
-from workflow.gitops import git
+from workflow.gitops import branch_catalog, checkout_snapshot, git
+from workflow.workspace_idle import IDLE_SCHEMA, idle_evidence, validate_idle
 from workflow.settings import WorkflowError
 from workflow.store import timestamp
 
@@ -134,6 +135,13 @@ class RepositorySelectionFlow:
             if role in paths:
                 extras.append(paths[role])
             entry = match_repository({**configured[role], "name": target["name"]}, target["branch"], extras)
+            if (purpose == "prepare" and entry["status"] == "needs_user"
+                    and not any(candidate["error"] or candidate["branch"] == entry["branch"] for candidate in entry["candidates"])):
+                source = next((candidate for candidate in entry["candidates"] if any(
+                    branch["name"] == entry["branch"] for branch in branch_catalog({**configured[role], "path": candidate["path"]}))), None)
+                if source:
+                    entry.update(status="selected", path=source["path"], head="", action="allocate",
+                                 reason="将按顺序切换空闲目录；没有空闲目录时创建独立工作区。")
             if role in prepared:
                 repo = prepared[role]
                 entry.update(status="bound", path=repo["path"], head=repo["baseline"], reason="已绑定当前会话目录。")
@@ -142,6 +150,48 @@ class RepositorySelectionFlow:
         if purpose == "prepare":
             self.state.update(stage="等待选择目录", error="")
         self.save()
+
+    def _analyze_idle(self, request):
+        state = self.state
+        self._close_rpc()
+        state["workspace_analysis"] = {**request, "return_phase": state["phase"],
+                                       "return_thread": state.get("thread_id"), "offset": 0, "files": []}
+        state.update(phase="branch", thread_id=state.get("branch_thread_id"), turn_id=None)
+        self.save()
+        self._start_turn("逐文件判断未提交修改是否影响功能；无法判断返回 unknown。", IDLE_SCHEMA)
+
+    def _idle_context(self):
+        request = self.state["workspace_analysis"]
+        current = checkout_snapshot(request["path"])
+        if (current != request["snapshot"] or git(request["path"], "rev-parse", "HEAD") != request["head"]
+                or git(request["path"], "branch", "--show-current") != request["branch"]):
+            raise WorkflowError("空闲判定期间目录发生变化，请重新准备工作区。")
+        paths = request["snapshot"]["paths"][request["offset"]:request["offset"] + 10]
+        return {"step": "idle", "path": request["path"], "branch": request["branch"],
+                "project": self.state.get("project"), "supplement": self.state["supplement"],
+                "files": idle_evidence(request["path"], {"paths": paths})}
+
+    def _complete_idle(self, text):
+        state = self.state
+        request = state["workspace_analysis"]
+        paths = request["snapshot"]["paths"][request["offset"]:request["offset"] + 10]
+        request["files"].extend(validate_idle(text, paths))
+        request["offset"] += len(paths)
+        if request["offset"] < len(request["snapshot"]["paths"]):
+            self._start_turn("继续逐文件判断功能影响。", IDLE_SCHEMA)
+            return
+        state.setdefault("idle_assessments", {})[request["path"].casefold()] = {
+            key: request[key] for key in ("path", "snapshot", "head", "branch", "files")}
+        self._close_rpc()
+        state["branch_thread_id"] = state["thread_id"]
+        state.update(phase=request["return_phase"], thread_id=request["return_thread"], turn_id=None,
+                     stage="准备工作区失败")
+        state.pop("workspace_analysis")
+        self.save()
+        if state.get("followup"):
+            self._prepare_followup()
+        else:
+            self.prepare_and_plan(state["selections"], state["supplement"])
 
     def choose_repositories(self, paths):
         self.require_state("等待选择目录")
@@ -158,7 +208,8 @@ class RepositorySelectionFlow:
             if entry["status"] == "bound":
                 continue
             candidate = next((value for value in entry["candidates"] if value["path"] == paths[entry["role"]]), None)
-            if not candidate or candidate["error"] or candidate["branch"] != entry["branch"]:
+            allocation = entry.get("action") == "allocate" and paths[entry["role"]] == entry["path"]
+            if not candidate or candidate["error"] or (candidate["branch"] != entry["branch"] and not allocation):
                 raise WorkflowError("所选目录须先检测成功，并已检出目标分支。")
             current = inspect_repository(candidate["path"])
             if current != candidate:
@@ -179,10 +230,17 @@ class RepositorySelectionFlow:
         if len({entry["path"].casefold() for entry in detection["repositories"]}) != len(detection["repositories"]):
             raise WorkflowError("前后端不能使用同一个仓库目录。")
         selections = []
+        configured = {repo["role"]: repo for repo in configured_repositories(self.settings)}
         for entry in detection["repositories"]:
-            selections.append({"name": entry["name"], "role": entry["role"], "path": entry["path"],
-                               "branch": entry["branch"], "base": "refs/heads/" + entry["branch"],
-                               "create": False, "track": False, "expected_head": entry["head"]})
+            selection = {"name": entry["name"], "role": entry["role"], "path": entry["path"],
+                         "branch": entry["branch"], "base": "refs/heads/" + entry["branch"],
+                         "create": False, "track": False, "remote": configured[entry["role"]]["remote"]}
+            if entry.get("action") == "allocate":
+                selection.update(allocate=True, candidate_paths=[candidate["path"] for candidate in entry["candidates"]])
+            else:
+                selection["expected_head"] = entry["head"]
+            selections.append(selection)
         self._close_rpc()
+        self.state["branch_thread_id"] = self.state.get("thread_id")
         self.state.update(thread_id=None, turn_id=None, phase="plan", stage="资料已读取")
         self.prepare_and_plan(selections, self.state["supplement"])

@@ -15,13 +15,14 @@ from workflow.settings import ROOT, WorkflowError
 
 class RepositorySelectionChecks(TestCase):
     def setUp(self):
-        temporary = TemporaryDirectory()
+        temporary = TemporaryDirectory(dir=ROOT / ".local")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         local = patch("workflow.store.LOCAL", self.root / "local")
         local.start()
         self.addCleanup(local.stop)
         self.settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        self.settings["workspace_root"] = str(self.root / "worktrees")
         self.settings["repositories"] = []
         for role, name in (("frontend", "前端"), ("backend", "后端")):
             first = self.make_repo(role, "目标分支", "2026-01-01T10:00:00+08:00")
@@ -95,13 +96,12 @@ class RepositorySelectionChecks(TestCase):
         self.assertEqual(self.state["phase"], "plan")
         self.assertEqual(len(self.state["repos"]), 2)
 
-    def test_no_match_and_custom_directory_do_not_switch_or_create_worktree(self):
+    def test_no_match_plans_allocation_and_custom_match_still_takes_precedence(self):
         git(self.root / "frontend", "switch", "-c", "另一个分支")
         self.flow.detect_repositories()
-        self.assertEqual(self.detection()["status"], "needs_user")
+        self.assertEqual(self.detection()["status"], "selected")
+        self.assertEqual(self.detection()["action"], "allocate")
         self.assertEqual(self.state["repos"], [])
-        with self.assertRaises(WorkflowError):
-            self.flow.choose_repositories(self.choices())
         custom = self.make_repo("custom", "目标分支", "2026-02-01T10:00:00+08:00")
         self.flow.detect_repositories(paths={"frontend": str(custom)})
         self.assertEqual(self.detection()["path"], str(custom))

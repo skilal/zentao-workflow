@@ -88,7 +88,7 @@ class ProjectChecks(TestCase):
         primary = {"id": 7, "project": 41, "title": "示例需求", "spec": "需求正文", "assignedTo": "示例账号"}
         def fetch(path):
             return primary if path == "api.php/v1/stories/7" else {"id": 41, "name": "示例档案馆"}
-        with TemporaryDirectory() as directory, patch.object(client, "_fetch", side_effect=fetch) as request:
+        with TemporaryDirectory(dir=ROOT / ".local") as directory, patch.object(client, "_fetch", side_effect=fetch) as request:
             result = client.collect({"kind": "story", "id": 7}, Path(directory))
         self.assertEqual(result["project"]["name"], "示例档案馆")
         self.assertEqual(request.call_count, 2)
@@ -96,10 +96,11 @@ class ProjectChecks(TestCase):
 
 class BranchWorkflowChecks(TestCase):
     def setUp(self):
-        self.temporary = TemporaryDirectory()
+        self.temporary = TemporaryDirectory(dir=ROOT / ".local")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        self.settings["workspace_root"] = str(self.root / "worktrees")
         self.settings["project_branches"] = {}
         self.catalogs = {
             "frontend": [{"name": "示例档案馆/develop", "local": True, "remote": True, "commit": "a" * 40, "date": "2026-01-01", "subject": "示例前端修改"}],
@@ -109,6 +110,7 @@ class BranchWorkflowChecks(TestCase):
         for target, replacement in (
             ("workflow.store.LOCAL", self.root),
             ("workflow.engine.branch_catalog", lambda repository: deepcopy(self.catalogs[repository["role"]])),
+            ("workflow.engine.branch_history", lambda repository, name: {"path": repository["path"], "name": name, "refs": [{"ref": name, "commits": [{"subject": "项目长期维护"}]}]}),
             ("workflow.engine.refresh_branches", lambda repository: deepcopy(self.catalogs[repository["role"]])),
             ("workflow.engine.fetch_branch", self.fetch_branch),
             ("workflow.engine.acquire_workspace", self.prepare),
@@ -129,6 +131,7 @@ class BranchWorkflowChecks(TestCase):
         self.turns = Mock(side_effect=lambda *args: state.update(stage=PHASE_STAGE[state["phase"]]))
         self.flow._start_turn = self.turns
         self.prepared = []
+        self.branch_answers = {}
 
     def fetch_branch(self, repository, name):
         self.fetched.append((repository["role"], name))
@@ -151,7 +154,24 @@ class BranchWorkflowChecks(TestCase):
         (self.root / "settings.json").write_text(dumps(settings, ensure_ascii=False), encoding="utf-8")
 
     def complete(self, *decisions):
-        self.flow._complete_branches(dumps({"repositories": list(decisions)}, ensure_ascii=False))
+        if len({entry["role"] for entry in decisions}) != len(decisions):
+            raise WorkflowError("AI 分支角色重复。")
+        self.branch_answers.update({entry["role"]: entry for entry in decisions})
+        for _ in range(8):
+            role = self.flow.state["branch_resolution"].get("active_role")
+            repository = next(entry for entry in self.flow.state["branch_resolution"]["repositories"] if entry["role"] == role)
+            if repository["status"] != "pending" or role not in self.branch_answers:
+                return
+            result = self.branch_answers.pop(role)
+            step, fetched = repository["analysis"]["step"], len(self.fetched)
+            self.flow._complete_branches(dumps({"repositories": [result]}, ensure_ascii=False))
+            if self.flow.state.get("pause_requested") or self.flow.state["phase"] != "branch":
+                return
+            if repository["status"] == "pending":
+                if step == "shortlist" and repository.get("analysis", {}).get("step") == "verify" and len(self.fetched) == fetched:
+                    self.branch_answers[role] = result
+                else:
+                    return
 
     def test_both_repositories_are_prepared_even_for_backend_task(self):
         self.flow.start_plan("补充规则")
@@ -234,8 +254,7 @@ class BranchWorkflowChecks(TestCase):
     def test_targeted_fetch_failure_stops_without_workspace_creation_or_automatic_retry(self):
         self.catalogs["frontend"][0]["local"] = False
         self.flow.start_plan("")
-        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop"),
-                                                         decision("backend", "feature/示例")]})
+        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop")]})
         with patch("workflow.engine.fetch_branch", side_effect=WorkflowError("目标分支拉取失败")) as fetch:
             self.flow.submit(self.flow._completed, {"status": "completed"},
                              self.flow.state["id"], self.flow.connection_epoch).result()
@@ -284,7 +303,7 @@ class BranchWorkflowChecks(TestCase):
 
     def test_refresh_failure_stops_without_preparing_workspaces(self):
         self.flow.start_plan("")
-        self.flow.last_message = dumps({"repositories": [decision("frontend", status="not_found"), decision("backend", "feature/示例")]})
+        self.flow.last_message = dumps({"repositories": [decision("frontend", status="not_found")]})
         with patch("workflow.engine.refresh_branches", side_effect=WorkflowError("远程鉴权失败")):
             self.flow.submit(self.flow._completed, {"status": "completed"}, self.flow.state["id"], self.flow.connection_epoch).result()
         self.assertEqual(self.flow.state["stage"], "已停止")
@@ -421,10 +440,12 @@ class BranchWorkflowChecks(TestCase):
         self.assertEqual([entry["type"] for entry in turn_params["input"]], ["text"])
         self.assertEqual(turn_params["outputSchema"], BRANCH_SCHEMA)
         epoch = self.flow.connection_epoch
-        text = dumps({"repositories": [decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例")]})
+        text = dumps({"repositories": [decision("frontend", "示例档案馆/develop")]})
         self.flow._event({"method": "item/completed", "params": {"threadId": "branch-thread", "item": {"type": "agentMessage", "text": text}}}, epoch)
         self.flow._event({"method": "turn/completed", "params": {"threadId": "branch-thread", "turn": {"id": "branch-turn", "status": "completed"}}}, epoch)
         self.flow.executor.submit(lambda: None).result()
+        self.flow.turn_running = False
+        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
         self.assertEqual(len(self.prepared), 2)
         self.assertEqual(self.flow.state["phase"], "plan")
         self.assertIsNone(self.flow.state["thread_id"])
@@ -507,7 +528,7 @@ class BranchWorkflowChecks(TestCase):
 
 class GitBranchChecks(TestCase):
     def setUp(self):
-        self.temporary = TemporaryDirectory()
+        self.temporary = TemporaryDirectory(dir=ROOT / ".local")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.remote = self.root / "remote.git"

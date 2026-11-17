@@ -64,8 +64,9 @@ def prompt_catalog(settings):
          "content": templates.BRANCH_INPUT.format(context="【分支上下文 JSON】")}], [
              fragment("branch_rules", "分支判断规则", BRANCH_INSTRUCTIONS, "workflow/branching.py · BRANCH_INSTRUCTIONS", "仅分支识别线程"),
              fragment("branch_input", "实际发送格式", templates.BRANCH_INPUT, "workflow/prompt_templates.py · BRANCH_INPUT", "分支输入替代通用回合包装，不发送控制器记录中的阶段提示")])
-    stage("prepare", "工作区准备", "按确认的分支分配与准备前后端工作目录。", [], [], controller=True,
-          notes="由控制器执行，无独立模型提示词；需要 AI 判断分支时进入分支识别阶段。")
+    stage("prepare", "工作区准备", "依次复用目标目录、切换空闲目录或创建工作区。", [], [
+        fragment("idle_rules", "空闲判定规则", BRANCH_INSTRUCTIONS, "workflow/branching.py · BRANCH_INSTRUCTIONS", "目录有未提交修改时，复用只读分支分析线程逐文件判断")], controller=True,
+          notes="Git 操作由控制器执行；未提交修改由 AI 按实际差异判断功能影响，无法判断不切换，冲突回退后等待人工。")
     stage("plan", "需求分析与计划", "使用原生计划模式分析需求；首次工作项会话可同时生成名称。", [
         variant("plan", "首次需求计划", "plan", prompts.PLAN, "首次进入需求计划"),
         variant("followup_plan", "续聊计划模式", "plan", prompts.PLAN + prompts.FOLLOWUP_PLAN, "续聊选择计划模式时")], [
