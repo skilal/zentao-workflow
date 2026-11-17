@@ -51,7 +51,7 @@ class WorkspaceReleaseFlow:
         source = Path(repo["path"]).resolve()
         paths = [source] if target is None else [source, target]
         entries = worktrees(source)
-        claims = workspace_claims(self.store.sessions(), self.state["id"])
+        claims = workspace_claims(self.store.sessions(), self.state["id"], switching=True)
         common = git(source, "rev-parse", "--path-format=absolute", "--git-common-dir")
         for path in paths:
             entry = next((entry for entry in entries if Path(entry["worktree"]).resolve() == path), None)

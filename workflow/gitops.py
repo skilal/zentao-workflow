@@ -229,11 +229,22 @@ def prepare(repository, destination, branch, base, create, track=False):
             "base": base, "baseline": baseline, "create": bool(create)}
 
 
-def workspace_claims(sessions, excluded_session):
-    claims = {str(Path(repository["path"]).resolve()).casefold(): session["id"]
-            for session in sessions if session["id"] != excluded_session and session["phase"] != "complete"
-            for repository in [*session["repos"], *(repo for repo in session.get("retired_repos", [])
-                                                   if repo.get("workspace_owned", True))]}
+def workspace_claims(sessions, excluded_session, *, switching=False):
+    claims, branches = {}, {}
+    inactive = {"已暂停", "已停止", "等待人工回答", "等待计划确认", "等待计划补充", "等待修复选择", "准备工作区失败"}
+    for session in sessions:
+        if session["id"] == excluded_session or session["phase"] == "complete":
+            continue
+        repositories = [*session["repos"], *(repo for repo in session.get("retired_repos", []) if repo.get("workspace_owned", True))]
+        for repository in repositories:
+            path = Path(repository["path"]).resolve()
+            key = str(path).casefold()
+            if switching and session.get("stage") in inactive and repository.get("branch") and path.is_dir():
+                if key not in branches:
+                    branches[key] = git(path, "branch", "--show-current")
+                if branches[key] != repository["branch"]:
+                    continue
+            claims[key] = session["id"]
     for session in sessions:
         if session["id"] != excluded_session:
             for repo in session["repos"]:
@@ -277,7 +288,7 @@ def carry_checkout(repository, store, state, paths):
             or not set(paths).issubset(request["snapshot"]["paths"])):
         raise WorkflowError("请从本次切换受阻的文件中明确选择要携带的改动。")
     reject_hooks(path)
-    if workspace_claims(store.sessions(), state["id"]).get(str(path.resolve()).casefold()):
+    if workspace_claims(store.sessions(), state["id"], switching=True).get(str(path.resolve()).casefold()):
         raise WorkflowError("该目录已被其他会话占用，不能智能切换。")
     if (git(path, "rev-parse", "HEAD") != request["head"]
             or git(path, "branch", "--show-current") != request["from_branch"]
@@ -374,7 +385,7 @@ def acquire_workspace(selection, destination, store, state):
                           "base": "refs/heads/" + selection["branch"] if branch["local"] else
                                   f"refs/remotes/{selection.get('remote', 'origin')}/{selection['branch']}",
                           "create": not branch["local"], "track": not branch["local"]}
-                claims = workspace_claims(store.sessions(), state["id"])
+                claims = workspace_claims(store.sessions(), state["id"], switching=True)
                 # 同分支复用仍交给原有的共享及交接检查；其他分支须先判断空闲。
                 current = git(path, "branch", "--show-current")
                 if current != selection["branch"]:
@@ -404,7 +415,7 @@ def _acquire_workspace(selection, destination, store, state):
     """优先沿用目标分支目录，其次切换空闲目录，最后创建；登记与分配共用仓库锁。"""
     source, destination = Path(selection["path"]).resolve(), Path(destination).resolve()
     sessions = store.sessions()
-    claims = workspace_claims(sessions, state["id"])
+    claims = workspace_claims(sessions, state["id"], switching=True)
     session_states = {session["id"]: session for session in sessions}
     entries = worktrees(source)
     if "expected_head" in selection:

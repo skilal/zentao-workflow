@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 from workflow.branching import BRANCH_INSTRUCTIONS, branch_context
 from workflow.engine import Workflow
-from workflow.gitops import acquire_workspace, branch_history, checkout_snapshot, cleanup_workspaces, git
+from workflow.gitops import acquire_workspace, branch_history, checkout_snapshot, cleanup_workspaces, git, workspace_claims
 from workflow.settings import ROOT, WorkflowError
 from workflow.workspace_idle import IdleAnalysisRequired, idle_evidence, redact_evidence
 from workflow.workspace_paths import managed_workspace, workspace_directory
@@ -104,6 +104,48 @@ class WorkspaceAllocationChecks(TestCase):
         record = self.acquire()
         self.assertEqual(record["workspace_mode"], "created")
         self.assertEqual(git(path, "branch", "--show-current"), "其他项目/develop")
+
+    def test_stale_paused_binding_does_not_hide_idle_directory(self):
+        path = self.root / "frontend"
+        other = self.engine.store.new({"kind": "task", "id": 8, "title": "旧会话"})
+        other.update(stage="已暂停", phase="plan", repos=[{
+            "name": "前端", "path": str(path), "branch": "旧项目/develop", "workspace_owned": False}])
+        self.engine.store.save(other)
+        (path / "logback.xml").write_text("需要保留的本机配置\n", encoding="utf-8")
+        self.assess(path)
+        record = self.acquire()
+        self.assertEqual(record["path"], str(path))
+        self.assertEqual(record["workspace_mode"], "switched")
+        self.assertEqual((path / "logback.xml").read_text(encoding="utf-8"), "需要保留的本机配置\n")
+        self.assertEqual(self.engine.store.load(other["id"])["repos"][0]["branch"], "旧项目/develop")
+
+    def test_valid_paused_binding_remains_reserved(self):
+        path = self.root / "frontend"
+        other = self.engine.store.new({"kind": "task", "id": 8, "title": "有效会话"})
+        other.update(stage="已暂停", phase="plan", repos=[{
+            "name": "前端", "path": str(path), "branch": "其他项目/develop", "workspace_owned": False}])
+        self.engine.store.save(other)
+        self.assertEqual(self.acquire()["workspace_mode"], "created")
+
+    def test_running_session_is_not_treated_as_stale(self):
+        path = self.root / "frontend"
+        other = self.engine.store.new({"kind": "task", "id": 8, "title": "执行中的会话"})
+        other.update(stage="实施中", phase="implement", repos=[{
+            "name": "前端", "path": str(path), "branch": "旧项目/develop", "workspace_owned": False}])
+        self.engine.store.save(other)
+        self.assertEqual(self.acquire()["workspace_mode"], "created")
+
+    def test_cleanup_ownership_is_preserved_when_switch_claim_is_stale(self):
+        path = self.root / "frontend"
+        other = self.engine.store.new({"kind": "task", "id": 8, "title": "旧会话"})
+        other.update(stage="已暂停", phase="plan", repos=[{
+            "name": "前端", "path": str(path), "branch": "旧项目/develop", "workspace_owned": False}])
+        self.engine.store.save(other)
+        key = str(path).casefold()
+        self.assertEqual(workspace_claims([other], self.state["id"])[key], other["id"])
+        self.assertNotIn(key, workspace_claims([other], self.state["id"], switching=True))
+        other["repos"][0]["workspace_release"] = {"status": "released"}
+        self.assertEqual(workspace_claims([other], self.state["id"], switching=True)[key], other["id"])
 
     def test_matching_secondary_clone_wins_before_switching_first(self):
         source = self.root / "frontend"

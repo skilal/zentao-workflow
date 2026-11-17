@@ -51,7 +51,7 @@ class BaselineFlow:
                 if not Path(path).is_dir() or Path(git(path, "rev-parse", "--show-toplevel")).resolve() != Path(path):
                     raise WorkflowError(f"请选择已存在的 Git 仓库根目录：{path}")
                 locks.enter_context(repository_lock(path))
-            claims = workspace_claims(self.store.sessions(), state["id"])
+            claims = workspace_claims(self.store.sessions(), state["id"], switching=True)
             repositories = []
             for repo in state["repos"]:
                 path = targets[repo["name"]]
