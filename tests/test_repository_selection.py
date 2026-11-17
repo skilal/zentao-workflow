@@ -149,15 +149,42 @@ class RepositorySelectionChecks(TestCase):
         self.assertEqual(self.state["repos"], [])
         self.assertEqual(self.state["selections"][0]["path"], str(self.second()))
 
-    def test_directory_claimed_for_another_branch_is_not_taken_over(self):
+    def test_directory_claimed_by_running_session_for_another_branch_is_not_taken_over(self):
         other = self.flow.store.new({"kind": "task", "id": 8, "title": "其他会话"})
-        other.update(phase="plan", repos=[{"name": "前端", "path": str(self.root / "frontend"), "branch": "其他目标分支"}])
+        other.update(phase="implement", stage="实施中",
+                     repos=[{"name": "前端", "path": str(self.root / "frontend"), "branch": "其他目标分支"}])
         self.flow.store.save(other)
         self.flow.detect_repositories()
         with self.assertRaisesRegex(WorkflowError, "不同目标分支占用"):
             self.flow.choose_repositories(self.choices())
         self.assertEqual(self.state["repos"], [])
         self.assertEqual(git(self.root / "frontend", "branch", "--show-current"), "目标分支")
+
+    def test_stale_inactive_binding_allows_matching_directory_with_local_changes(self):
+        path = self.root / "frontend"
+        (path / "文件.txt").write_text("其他需求的暂存内容", encoding="utf-8")
+        git(path, "add", "文件.txt")
+        (path / "其他需求.txt").write_text("其他需求未跟踪内容", encoding="utf-8")
+        snapshot = checkout_snapshot(path)
+        original = deepcopy(self.state)
+        other = self.flow.store.new({"kind": "task", "id": 8, "title": "旧会话"})
+        other.update(phase="plan", repos=[{"name": "前端", "path": str(path), "branch": "旧目标分支",
+                                         "workspace_owned": True}])
+        for stage in ("已暂停", "已停止", "等待人工回答", "等待计划确认", "等待计划补充", "等待修复选择", "准备工作区失败"):
+            with self.subTest(stage=stage):
+                other["stage"] = stage
+                self.flow.store.save(other)
+                self.flow.state = self.state = deepcopy(original)
+                self.flow.save()
+                self.flow.detect_repositories()
+                self.flow.choose_repositories(self.choices())
+                repo = self.state["repos"][0]
+                self.assertEqual(repo["path"], str(path))
+                self.assertEqual(repo["workspace_mode"], "reused")
+                self.assertEqual(repo["branch"], "目标分支")
+                self.assertEqual(set(repo["preserved_paths"]), {"文件.txt", "其他需求.txt"})
+                self.assertEqual(checkout_snapshot(path), snapshot)
+                self.assertEqual(self.flow.store.load(other["id"])["repos"], other["repos"])
 
     def test_pause_and_resume_do_not_answer_pending_directory_question(self):
         git(self.root / "frontend", "switch", "-c", "不同分支")

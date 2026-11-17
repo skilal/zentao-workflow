@@ -71,6 +71,23 @@ class SharedWorkspaceChecks(TestCase):
         fingerprint = select_scope([repo], [{"repository": "前端", "include": selected, "exclude": excluded}])
         return fingerprint
 
+    def test_stale_branch_binding_can_share_and_commit_only_current_requirement(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "其他需求")
+        self.first.update(stage="已暂停")
+        self.first["repos"][0]["branch"] = "旧目标分支"
+        self.store.save(self.first)
+        third = self.add_session(3)
+        repo = third["repos"][0]
+        self.assertEqual(repo["path"], str(self.path))
+        self.replace(third, "共享.txt", "原始第12行", "本对话需求")
+        working = (self.path / "共享.txt").read_bytes()
+        committed = commit(repo, "fix(共享): 只提交本对话需求", self.review(third))
+        text = git(self.path, "show", committed + ":共享.txt")
+        self.assertIn("本对话需求", text)
+        self.assertNotIn("其他需求", text)
+        self.assertEqual((self.path / "共享.txt").read_bytes(), working)
+        self.assertEqual(self.store.load(self.first["id"])["repos"][0]["branch"], "旧目标分支")
+
     def test_same_branch_reuses_directory_and_different_files_commit_independently(self):
         self.assertEqual(self.first["repos"][0]["path"], self.second["repos"][0]["path"])
         self.replace(self.first, "甲.txt", "原始第3行", "甲需求")

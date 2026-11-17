@@ -439,7 +439,9 @@ def _acquire_workspace(selection, destination, store, state):
                 holders = [session for session in sessions if session["id"] != state["id"] and session["phase"] != "complete"
                            and any(Path(repo["path"]).resolve() == path for repo in session["repos"])]
                 if any(repo["branch"] != selection["branch"]
-                        for session in holders for repo in session["repos"] if Path(repo["path"]).resolve() == path):
+                        for session in holders
+                        if str(path).casefold() in workspace_claims([session], state["id"], switching=True)
+                        for repo in session["repos"] if Path(repo["path"]).resolve() == path):
                     raise WorkflowError("所选目录仍被其他未完成会话按不同目标分支占用，已停止；请先处理原会话目录绑定。")
                 if any(session.get("workspace_handoff_request") or session.get("workspace_release_request")
                        or any(repo.get("workspace_release") for repo in session["repos"]) for session in holders):

@@ -11,6 +11,7 @@ COMMIT_MESSAGE_SCHEMA = {"type": "array", "items": {"type": "object", "propertie
     "scope": {"type": "string"}, "summary": {"type": "string"}},
     "required": ["repository", "type", "scope", "summary"], "additionalProperties": False}}
 COMMIT_INSTRUCTIONS = (
+    "只提交本对话需求涉及的改动，排除其他需求的改动；先用 git_log 查看目标分支近期提交，参考其模块命名和摘要表述。"
     "commit_messages 逐仓库对应实际纳入的差异，无改动不填；返回 repository/type/scope/summary。"
     "标题 type(实际模块): 简短中文摘要，最多 72 字符；类型按实际变化选择，续聊不等于 fix。"
     "模块、摘要不带工作项编号或前后端角色，不照搬任务标题。人工 commit_message 已规范则原样保留，否则逐字保留摘要并补全格式。"
