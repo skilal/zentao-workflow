@@ -539,6 +539,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         entry.update(metadata)
         if "sources" in entry:
             source.update(metadata)
+        repository.pop("analysis", None)
         repository.setdefault("fetched_branches", []).append(name)
         repository["fetch_state"] = "done"
         self.state["stage"] = "已暂停" if self.state.get("pause_requested") else "识别分支中"
@@ -575,8 +576,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             if state["branch_resolution"].get("version") == 2:
                 repository = next(entry for entry in repositories if entry["status"] == "pending")
                 state["branch_resolution"]["active_role"] = repository["role"]
-                repository.setdefault("analysis", {"step": "shortlist", "offset": 0, "shortlist": []})
-            self._start_turn("请判断上下文中待识别仓库的分支，严格返回结构化结果。", BRANCH_SCHEMA)
+                if repository.get("analysis", {}).get("step") != "select":
+                    self._read_branch_histories(repository)
+            self._start_turn("结合项目地名和 Git 记录，排除功能、临时修复及备份分支，直接选择一条最新开发主线。", BRANCH_SCHEMA)
         elif any(entry["status"] == "needs_user" for entry in repositories):
             state["stage"] = "等待选择分支"
             self.save()
@@ -634,33 +636,6 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self._advance_branches()
             return
         results = validate_result(loads(text), repositories, resolution.get("active_role"))
-        if resolution.get("version") == 2:
-            repository = next(entry for entry in repositories if entry["role"] == resolution["active_role"])
-            analysis = repository["analysis"]
-            result = results[0]
-            if analysis["step"] == "shortlist":
-                page = repository["catalog"][analysis["offset"]:analysis["offset"] + 200]
-                names = list(dict.fromkeys([*result["candidates"], *([result["branch"]] if result["branch"] else [])]))
-                if len(names) > 3 or not set(names).issubset({entry["name"] for entry in page}):
-                    raise WorkflowError("分支初筛只能返回当前页内最多三个真实候选。")
-                analysis["shortlist"] = list(dict.fromkeys([*analysis["shortlist"], *names]))
-                analysis["offset"] += len(page)
-                if analysis["offset"] >= len(repository["catalog"]):
-                    if not analysis["shortlist"]:
-                        if result["status"] == "needs_user":
-                            repository.update(status="needs_user", reason=result["reason"],
-                                              question=result["question"] or "项目分支证据不足，请明确选择。")
-                        elif not repository["refreshed"]:
-                            self._refresh_branches(repository)
-                        else:
-                            repository.update(status="needs_user", reason=result["reason"], question="未找到贴合项目的开发分支，请明确选择。")
-                    else:
-                        self._read_branch_histories(repository)
-                self.save()
-                self._advance_branches()
-                return
-            if result["branch"] and result["branch"] not in analysis["shortlist"]:
-                raise WorkflowError("最终选择必须来自已读取提交历史的候选分支。")
         for result in results:
             repository = next(entry for entry in repositories if entry["role"] == result["role"])
             repository.update(reason=result["reason"], candidates=result["candidates"], question=result["question"])
@@ -683,26 +658,12 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self._advance_branches()
 
     def _read_branch_histories(self, repository):
-        analysis = repository["analysis"]
         histories = []
-        for name in analysis["shortlist"]:
-            entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
-            if not entry["local"] and name not in repository.get("fetched_branches", []):
-                if not repository["refreshed"]:
-                    self._refresh_branches(repository)
-                    if not set(analysis["shortlist"]).issubset({branch["name"] for branch in repository["catalog"]}):
-                        return
-                    repository["analysis"] = analysis
-                    if self.closed or self.state.get("pause_requested"):
-                        return
-                if not self._fetch_branch(repository, name):
-                    return
-                entry = next(entry for entry in repository["catalog"] if entry["name"] == name)
+        for entry in repository["catalog"]:
+            name = entry["name"]
             for source in entry.get("sources", [{"path": repository["path"]}]):
-                current = branch_catalog({**repository, "path": source["path"], "names_only": False, "branch_names": [name]})
-                if any(branch["name"] == name for branch in current):
-                    histories.append(branch_history({**repository, "path": source["path"]}, name))
-        analysis.update(step="verify", histories=histories)
+                histories.append(branch_history({**repository, "path": source["path"]}, name))
+        repository["analysis"] = {"step": "select", "histories": histories}
 
     def smart_checkout(self, paths):
         state = self.require_state("准备工作区失败")

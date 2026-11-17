@@ -123,7 +123,10 @@ def branch_catalog(repository):
 @locked_repository
 def branch_history(repository, name):
     entries = branch_catalog({**repository, "names_only": False, "branch_names": [name]})
-    branch = next(entry for entry in entries if entry["name"] == name)
+    branch = next((entry for entry in entries if entry["name"] == name), None)
+    if branch is None:
+        # 在线清单中新出现的远程分支尚无本地引用；只在选定后定向拉取。
+        return {"path": repository["path"], "name": name, "refs": [], "metadata_available": False}
     histories = []
     for reference in branch["refs"]:
         output = git(repository["path"], "log", "-10", "--format=%H%x00%P%x00%cI%x00%s", reference["commit"])

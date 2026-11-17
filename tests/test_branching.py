@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from workflow.branching import BRANCH_SCHEMA, KEYWORD_SCHEMA, branch_context, configured_repositories, saved_branches, validate_keywords
 from workflow.engine import PHASE_STAGE, Workflow
-from workflow.gitops import branch_catalog, fetch_branch, git, prepare, refresh_branches
+from workflow.gitops import branch_catalog, branch_history, fetch_branch, git, prepare, refresh_branches
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError
 from workflow.zentao import ZentaoClient, project_context
@@ -124,7 +124,7 @@ class BranchWorkflowChecks(TestCase):
         self.settings["project_branches"] = {}
         self.catalogs = {
             "frontend": [{"name": "示例档案馆/develop", "local": True, "remote": True, "commit": "a" * 40, "date": "2026-01-01", "subject": "示例前端修改"}],
-            "backend": [{"name": "feature/示例", "local": True, "remote": True, "commit": "b" * 40, "date": "2026-01-01", "subject": "示例后端修改"}],
+            "backend": [{"name": "示例服务/develop", "local": True, "remote": True, "commit": "b" * 40, "date": "2026-01-01", "subject": "示例后端修改"}],
         }
         self.fetched = []
         for target, replacement in (
@@ -192,21 +192,17 @@ class BranchWorkflowChecks(TestCase):
             if repository["status"] != "pending" or role not in self.branch_answers:
                 return
             result = self.branch_answers.pop(role)
-            step, fetched = repository["analysis"]["step"], len(self.fetched)
             self.flow._complete_branches(dumps({"repositories": [result]}, ensure_ascii=False))
             if self.flow.state.get("pause_requested") or self.flow.state["phase"] != "branch":
                 return
             if repository["status"] == "pending":
-                if step == "shortlist" and repository.get("analysis", {}).get("step") == "verify" and len(self.fetched) == fetched:
-                    self.branch_answers[role] = result
-                else:
-                    return
+                return
 
     def keywords(self):
         if self.flow.state["branch_resolution"].get("step") == "keywords":
             self.flow._complete_branches(dumps({"keywords": ["示例"], "reason": "项目名称明确包含示例。", "question": ""}, ensure_ascii=False))
 
-    def test_keyword_filter_excludes_unrelated_branches_before_shortlist(self):
+    def test_keyword_filter_excludes_unrelated_branches_before_direct_selection(self):
         self.catalogs["frontend"].append({**self.catalogs["frontend"][0], "name": "资阳/develop"})
         self.flow.start_plan("")
         self.assertEqual(branch_context(self.flow.state)["repositories"], [])
@@ -234,11 +230,41 @@ class BranchWorkflowChecks(TestCase):
         self.assertEqual(self.turns.call_count, 1)
         self.assertEqual(self.flow.state["stage"], "等待选择分支")
 
+    def test_stopped_old_page_state_resumes_with_one_direct_branch_choice(self):
+        self.flow.start_plan("")
+        self.keywords()
+        repository = self.flow.state["branch_resolution"]["repositories"][0]
+        repository["analysis"] = {"step": "shortlist", "offset": len(repository["catalog"]),
+                                  "shortlist": ["示例档案馆/develop"]}
+        self.flow.state.update(stage="已停止", error="分支初筛只能返回当前页内最多三个真实候选。")
+        self.flow.resume()
+        self.assertEqual(repository["analysis"]["step"], "select")
+        self.assertNotIn("offset", repository["analysis"])
+        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop"))
+        self.assertEqual(len(self.prepared), 2)
+
+    def test_selected_branch_does_not_require_a_three_candidate_shortlist(self):
+        self.catalogs["frontend"].extend({**self.catalogs["frontend"][0], "name": f"示例/develop-{number}"} for number in range(5))
+        self.flow.start_plan("")
+        self.keywords()
+        result = decision("frontend", "示例档案馆/develop", candidates=[entry["name"] for entry in self.catalogs["frontend"]])
+        self.complete(result, decision("backend", "示例服务/develop"))
+        self.assertEqual(len(self.prepared), 2)
+
+    def test_reading_matching_histories_does_not_fetch_all_remote_branches(self):
+        self.catalogs["frontend"][0]["local"] = False
+        self.flow.start_plan("")
+        self.keywords()
+        self.assertEqual(self.fetched, [])
+        repository = self.flow.state["branch_resolution"]["repositories"][0]
+        self.assertEqual(repository["analysis"]["step"], "select")
+        self.assertTrue(repository["analysis"]["histories"])
+
     def test_both_repositories_are_prepared_even_for_backend_task(self):
         self.flow.start_plan("补充规则")
         self.assertEqual(self.turns.call_args.args[1], KEYWORD_SCHEMA)
-        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
-        self.assertEqual([entry["branch"] for entry in self.prepared], ["示例档案馆/develop", "feature/示例"])
+        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop"))
+        self.assertEqual([entry["branch"] for entry in self.prepared], ["示例档案馆/develop", "示例服务/develop"])
         self.assertEqual(self.flow.state["phase"], "plan")
         self.assertEqual(self.flow.state["supplement"], "补充规则")
         self.assertEqual(self.settings["project_branches"], {})
@@ -247,7 +273,7 @@ class BranchWorkflowChecks(TestCase):
     def test_saved_common_branches_skip_ai_and_are_site_scoped(self):
         site = self.settings["zentao"]["base_url"]
         self.settings["project_branches"] = {site: {"41": {"name": "示例档案馆", "branches": {
-            "frontend": "示例档案馆/develop", "backend": "feature/示例"}}}}
+            "frontend": "示例档案馆/develop", "backend": "示例服务/develop"}}}}
         self.flow.start_plan("")
         self.assertEqual(self.turns.call_count, 1)
         self.assertEqual(len(self.prepared), 2)
@@ -257,7 +283,7 @@ class BranchWorkflowChecks(TestCase):
     def test_ambiguous_ai_result_waits_and_manual_choices_are_saved(self):
         self.flow.start_plan("")
         self.complete(decision("frontend", status="needs_user", candidates=["示例档案馆/develop"]),
-                      decision("backend", "feature/示例"))
+                      decision("backend", "示例服务/develop"))
         self.assertEqual(self.flow.state["stage"], "等待选择分支")
         self.assertEqual(self.prepared, [])
         self.flow.choose_branches({"frontend": "示例档案馆/develop"})
@@ -269,7 +295,7 @@ class BranchWorkflowChecks(TestCase):
     def test_no_match_refreshes_once_then_waits_for_user(self):
         self.flow.start_plan("")
         with patch("workflow.engine.refresh_branches", side_effect=lambda repo: deepcopy(self.catalogs[repo["role"]])) as refresh:
-            self.complete(decision("frontend", status="not_found"), decision("backend", "feature/示例"))
+            self.complete(decision("frontend", status="not_found"), decision("backend", "示例服务/develop"))
             self.assertEqual(refresh.call_count, 1)
             self.complete(decision("frontend", status="not_found"))
             self.assertEqual(refresh.call_count, 1)
@@ -279,7 +305,7 @@ class BranchWorkflowChecks(TestCase):
         self.catalogs["frontend"][0]["local"] = False
         self.flow.start_plan("")
         with patch("workflow.engine.refresh_branches", side_effect=lambda repo: deepcopy(self.catalogs[repo["role"]])) as refresh:
-            self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
+            self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop"))
             self.assertEqual(self.prepared, [])
             self.assertEqual(refresh.call_count, 1)
             self.complete(decision("frontend", "示例档案馆/develop"))
@@ -293,7 +319,7 @@ class BranchWorkflowChecks(TestCase):
                   "date": "", "subject": "", "metadata_available": False}
         self.catalogs["frontend"] = [{**online, "date": "2026-11-02", "subject": "目标项目修改", "metadata_available": True}]
         with patch("workflow.engine.refresh_branches", return_value=[deepcopy(online)]):
-            self.complete(decision("frontend", status="not_found"), decision("backend", "feature/示例"))
+            self.complete(decision("frontend", status="not_found"), decision("backend", "示例服务/develop"))
         self.assertFalse(self.fetched)
         self.complete(decision("frontend", "新示例项目分支"))
         repository = self.flow.state["branch_resolution"]["repositories"][0]
@@ -308,7 +334,7 @@ class BranchWorkflowChecks(TestCase):
     def test_manual_remote_choice_fetches_only_chosen_branch(self):
         self.catalogs["frontend"][0]["local"] = False
         self.flow.start_plan("", manual=True)
-        self.flow.choose_branches({"frontend": "示例档案馆/develop", "backend": "feature/示例"})
+        self.flow.choose_branches({"frontend": "示例档案馆/develop", "backend": "示例服务/develop"})
         self.assertEqual(self.fetched, [("frontend", "示例档案馆/develop")])
         self.assertEqual(len(self.prepared), 2)
 
@@ -334,7 +360,7 @@ class BranchWorkflowChecks(TestCase):
             return self.fetch_branch(repository, name)
 
         with patch("workflow.engine.fetch_branch", side_effect=fetch):
-            self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
+            self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop"))
         self.assertEqual(self.flow.state["stage"], "已暂停")
         self.assertEqual(self.prepared, [])
         self.assertEqual(self.fetched, [("frontend", "示例档案馆/develop")])
@@ -343,7 +369,7 @@ class BranchWorkflowChecks(TestCase):
         self.catalogs["frontend"][0]["local"] = False
         site = self.settings["zentao"]["base_url"]
         self.settings["project_branches"] = {site: {"41": {"branches": {
-            "frontend": "示例档案馆/develop", "backend": "feature/示例"}}}}
+            "frontend": "示例档案馆/develop", "backend": "示例服务/develop"}}}}
 
         def refresh(repository):
             self.flow.pause()
@@ -359,7 +385,7 @@ class BranchWorkflowChecks(TestCase):
         site = self.settings["zentao"]["base_url"]
         self.settings["project_branches"] = {site: {"41": {"branches": {"frontend": "已失效分支"}}}}
         self.flow.start_plan("")
-        self.complete(decision("backend", "feature/示例"))
+        self.complete(decision("backend", "示例服务/develop"))
         self.assertEqual(self.flow.state["stage"], "等待选择分支")
         self.assertIn("已不可用", self.flow.state["branch_resolution"]["repositories"][0]["reason"])
 
@@ -377,7 +403,7 @@ class BranchWorkflowChecks(TestCase):
     def test_invalid_model_branch_or_role_is_rejected(self):
         self.flow.start_plan("")
         for result in (
-            [decision("frontend", "凭空生成的分支"), decision("backend", "feature/示例")],
+            [decision("frontend", "凭空生成的分支"), decision("backend", "示例服务/develop")],
             [decision("frontend", "示例档案馆/develop"), decision("frontend", "示例档案馆/develop")],
         ):
             with self.assertRaises(WorkflowError):
@@ -406,7 +432,7 @@ class BranchWorkflowChecks(TestCase):
         self.assertFalse(self.turns.called)
         with self.assertRaises(WorkflowError):
             self.flow.choose_branches({"frontend": "示例档案馆/develop"})
-        self.flow.choose_branches({"frontend": "示例档案馆/develop", "backend": "feature/示例"})
+        self.flow.choose_branches({"frontend": "示例档案馆/develop", "backend": "示例服务/develop"})
         self.assertEqual(len(saved_branches(self.settings, self.flow.state["project"])), 2)
 
     def test_pause_and_restore_do_not_start_planning_or_skip_manual_choices(self):
@@ -429,7 +455,7 @@ class BranchWorkflowChecks(TestCase):
             self.flow.pause()
             return deepcopy(self.catalogs[repository["role"]])
         with patch("workflow.engine.refresh_branches", side_effect=refresh):
-            self.complete(decision("frontend", status="not_found"), decision("backend", "feature/示例"))
+            self.complete(decision("frontend", status="not_found"), decision("backend", "示例服务/develop"))
         self.assertEqual(self.flow.state["stage"], "已暂停")
         self.assertEqual(self.prepared, [])
 
@@ -509,7 +535,7 @@ class BranchWorkflowChecks(TestCase):
         self.flow._event({"method": "turn/completed", "params": {"threadId": "branch-thread", "turn": {"id": "branch-turn", "status": "completed"}}}, epoch)
         self.flow.executor.submit(lambda: None).result()
         self.flow.turn_running = False
-        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例"))
+        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop"))
         self.assertEqual(len(self.prepared), 2)
         self.assertEqual(self.flow.state["phase"], "plan")
         self.assertIsNone(self.flow.state["thread_id"])
@@ -529,7 +555,7 @@ class BranchWorkflowChecks(TestCase):
             self.flow.start_plan("原补充")
             epoch = self.flow.connection_epoch
             self.flow.turn_running = False
-            self.complete(decision("frontend", status="needs_user"), decision("backend", "feature/示例"))
+            self.complete(decision("frontend", status="needs_user"), decision("backend", "示例服务/develop"))
             self.flow.start_plan("本次新补充")
         methods = [call.args[0] for call in rpc.request.call_args_list]
         self.assertEqual(methods.count("thread/start"), 1)
@@ -583,7 +609,7 @@ class BranchWorkflowChecks(TestCase):
     def test_late_turn_completion_cannot_apply_after_resume(self):
         self.flow.start_plan("")
         self.flow.state["turn_id"] = "新的识别轮次"
-        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop"), decision("backend", "feature/示例")]})
+        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop")]})
         self.flow._completed({"id": "旧识别轮次", "status": "completed"}, self.flow.state["id"], self.flow.connection_epoch)
         self.flow._event({"method": "item/completed", "params": {"turnId": "旧识别轮次", "item": {"type": "agentMessage", "text": "迟到输出"}}}, self.flow.connection_epoch)
         self.assertEqual(self.prepared, [])
@@ -627,6 +653,14 @@ class GitBranchChecks(TestCase):
         self.assertTrue(catalog)
         self.assertTrue(all(not entry["metadata_available"] and "commit" not in entry for entry in catalog))
         self.assertEqual(len(command.call_args_list), 1)
+
+    def test_history_for_online_only_branch_is_unverified_until_selected_fetch(self):
+        self.remote_commit("绍兴新开发主线", b"new development")
+        with patch("workflow.gitops.git", wraps=git) as command:
+            history = branch_history(self.repository, "绍兴新开发主线")
+        self.assertEqual(history["refs"], [])
+        self.assertFalse(history["metadata_available"])
+        self.assertFalse(any("fetch" in call.args for call in command.call_args_list))
 
     def test_remote_refresh_keeps_only_keyword_matches_and_exact_read_is_explicit(self):
         self.remote_commit("绍兴/develop", b"shaoxing")
