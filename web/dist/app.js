@@ -117,23 +117,23 @@ function ProgressTurn({ turn }) {
         h(Typography.Text, { type: "secondary" }, active ? "模型正在处理中，等待可展示的过程内容。" : "本回合没有返回可展示的过程内容。") }]
   }));
 }
-function ChangedFiles({ sessionId, revision, running }) {
-  const [files, setFiles] = useState(null);
-  const [failed, setFailed] = useState(false);
+function useConversationChanges(sessionId, revision, running) {
+  const [result, setResult] = useState(null);
   useEffect(() => {
+    if (!sessionId) return;
     const controller = new AbortController();
     let disposed = false;
     let timer;
     async function refresh() {
       try {
-        const result = await fetch(`/api/changed-files?session_id=${encodeURIComponent(sessionId)}`,
+        const files = await fetch(`/api/conversation-changes?session_id=${encodeURIComponent(sessionId)}`,
           { signal: controller.signal, cache: "no-store" }).then(readResponse);
-        if (!disposed) {
-          setFiles(result);
-          setFailed(false);
-        }
+        if (!disposed) setResult(files);
       } catch (error) {
-        if (!disposed) setFailed(true);
+        if (!disposed) setResult(previous => ({
+          ...(previous?.session_id === sessionId ? previous : { session_id: sessionId }),
+          error: "文件清单读取失败"
+        }));
       } finally {
         if (!disposed && running) timer = setTimeout(refresh, 3000);
       }
@@ -141,18 +141,39 @@ function ChangedFiles({ sessionId, revision, running }) {
     refresh();
     return () => { disposed = true; controller.abort(); clearTimeout(timer); };
   }, [sessionId, revision, running]);
-  return h(Collapse, { className: "changed-files", size: "small", defaultActiveKey: ["files"],
-    items: [{ key: "files", label: `改动文件${files && !failed ? ` · ${files.total}` : ""}`,
-      children: failed ? h(Typography.Text, { type: "secondary", role: "status" }, "文件清单读取失败") :
-        files === null ? h(Typography.Text, { type: "secondary", role: "status" }, "正在读取文件清单…") :
-          files.total === 0 ? h(Typography.Text, { type: "secondary" }, "暂无改动文件") :
-            h("div", { className: "changed-files-list" }, [...files.repositories]
-              .sort((left, right) => Number(right.name === "后端") - Number(left.name === "后端")).map(repo =>
-              h("div", { className: "changed-files-repository", key: repo.name,
-                style: { gridColumn: { "后端": 1, "前端": 2 }[repo.name] } },
-                h(Typography.Text, { strong: true }, repo.name),
-                repo.paths.map(path => h("div", { className: "repo-path", key: path }, path))))) }]
+  return result?.session_id === sessionId ? result : null;
+}
+function ChangedFiles({ total, repositories, onOpen }) {
+  return h(Collapse, { className: `changed-files${onOpen ? " conversation-changes" : ""}`, size: "small",
+    defaultActiveKey: onOpen ? [] : ["files"],
+    items: [{ key: "files", label: `${onOpen ? "本次改动" : "历史改动文件"} · ${total}`,
+      children: h("div", { className: "changed-files-list" }, [...repositories]
+        .sort((left, right) => Number(right.name === "后端") - Number(left.name === "后端")).map(repo =>
+        h("div", { className: "changed-files-repository", key: repo.id || repo.name,
+          style: { gridColumn: { "后端": 1, "前端": 2 }[repo.name] } },
+          h(Typography.Text, { strong: true }, repositories.filter(entry => entry.name === repo.name).length > 1 ?
+            `${repo.name} · ${repo.branch}` : repo.name),
+          onOpen ? repo.files.map(file => h("div", { key: file.path, className: "changed-file" },
+            h(Tag, { color: { "新增": "green", "删除": "red" }[file.kind] }, file.kind),
+            h(Button, { size: "small", type: "link", onClick: () => onOpen(repo, file.path) }, file.path))) :
+            repo.paths.map(path => h("div", { className: "repo-path", key: path }, path))))) }]
   });
+}
+function ConversationDiff({ file, onClose }) {
+  const [result, setResult] = useState(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    const query = new URLSearchParams({ session_id: file.sessionId, message_index: file.messageIndex,
+      record_id: file.recordId, path: file.path });
+    fetch(`/api/conversation-diff?${query}`, { signal: controller.signal, cache: "no-store" })
+      .then(readResponse).then(value => { if (!controller.signal.aborted) setResult(value); })
+      .catch(error => { if (!controller.signal.aborted) setResult({ error: error.message }); });
+    return () => controller.abort();
+  }, [file]);
+  return h(Drawer, { title: `本次改动 · ${file.path}`, placement: "right", width: "80vw", open: true, onClose },
+    result === null ? h(Spin, null) : result.error ? h(Alert, { type: "error", showIcon: true, message: result.error }) :
+      result.note ? h(Typography.Text, { type: "secondary" }, result.note) :
+        h("pre", { className: "diff-text" }, result.patch));
 }
 function ChangeSummary({ pages = [] }) {
   return h(Collapse, { className: "change-locations", size: "small", defaultActiveKey: ["locations"],
@@ -570,6 +591,7 @@ function WorkflowApp() {
   const [materialsOpen, setMaterialsOpen] = useState(false);
   const [planDetailsOpen, setPlanDetailsOpen] = useState(false);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [conversationDiff, setConversationDiff] = useState(null);
   const [baselineDirectoriesOpen, setBaselineDirectoriesOpen] = useState(false);
   const [handoffRepository, setHandoffRepository] = useState(null);
   const [releaseRepository, setReleaseRepository] = useState(null);
@@ -966,7 +988,7 @@ function WorkflowApp() {
     };
   }, []);
 
-  useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
+  useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); setConversationDiff(null); }, [model?.selectedSessionId, page]);
   useEffect(() => {
     if (!model?.connected) requestedItemKinds.current.clear();
   }, [model?.connected]);
@@ -981,6 +1003,10 @@ function WorkflowApp() {
 
   const state = model?.state;
   const stage = state?.stage || "";
+  const changeSessionId = page === "plan" && model?.selectedSessionId && state?.phase !== "branch" &&
+    (state?.repos.length || state?.followup) ? state.id : null;
+  const fileChanges = useConversationChanges(changeSessionId, model?.revision,
+    !stopped && (Boolean(model?.working || model?.busy) || ACTIVE.has(stage)));
   const review = state?.reviews?.filter((entry, index) => (entry.delivery_round || 1) === (state.delivery_round || 1) && index >= (state.review_start || 0)).at(-1);
   const transfers = imageTransfers[state?.id] || [];
   const imagesUploading = transfers.some(entry => entry.status !== "error");
@@ -1038,7 +1064,7 @@ function WorkflowApp() {
   useLayoutEffect(() => { followBottom.current = true; }, [page, state?.id]);
   useLayoutEffect(() => {
     if (feedRef.current && followBottom.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
-  }, [page, state?.id, selectionMatches, state?.phase, model?.stream, state?.history?.length, state?.progress_turns, review?.number]);
+  }, [page, state?.id, selectionMatches, state?.phase, model?.stream, state?.history?.length, state?.progress_turns, review?.number, fileChanges]);
   useEffect(() => {
     if (!model?.settings) return;
     const serialized = JSON.stringify(model.settings);
@@ -1599,9 +1625,23 @@ function WorkflowApp() {
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const canSend = canAnswer && answersComplete && !answerTransfers.length && (!continuing || !transfers.length);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
+    const changesByMessage = new Map((fileChanges?.groups || []).map(group => [group.message_index, group]));
+    let messageIndex = -1;
     const entries = [...state.history.map((entry, index) => ({ ...entry, index })),
       ...(state.progress_turns || []).map(turn => ({ process: turn, index: turn.history_index }))]
-      .filter(entry => entry.role !== "控制器" || entry.display_text).sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process));
+      .filter(entry => entry.role !== "控制器" || entry.display_text)
+      .sort((left, right) => left.index - right.index || Boolean(right.process) - Boolean(left.process))
+      .flatMap(entry => {
+        if (!(entry.change_group || (entry.role === "用户" && entry.request_id))) return [entry];
+        const changes = changesByMessage.get(messageIndex);
+        messageIndex = entry.index;
+        return changes ? [{ changes }, entry] : [entry];
+      });
+    const currentChanges = changesByMessage.get(messageIndex);
+    const legacyRepositories = fileChanges?.legacy_repositories || [];
+    const renderChanges = changes => h(ChangedFiles, { key: `changes:${changes.message_index}`,
+      total: changes.total, repositories: changes.repositories, onOpen: (repo, path) =>
+        setConversationDiff({ sessionId: state.id, messageIndex: changes.message_index, recordId: repo.id, path }) });
     const processRunning = state.progress_turns?.at(-1)?.status === "running";
     const baselineDetection = state.repository_detection?.purpose === "baseline" ? state.repository_detection : null;
     const baselinePaths = Object.fromEntries(state.repos.map(repo => [repo.name, draft.baseline_paths?.[repo.name] ??
@@ -1637,7 +1677,8 @@ function WorkflowApp() {
             const feed = event.currentTarget;
             followBottom.current = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48;
           } }, entries.length === 0 && h(Empty, { description: "等待开始计划" }),
-            entries.map(entry => entry.process ? h(ProgressTurn, { key: entry.process.id, turn: entry.process }) :
+            entries.map(entry => entry.changes ? renderChanges(entry.changes) :
+              entry.process ? h(ProgressTurn, { key: entry.process.id, turn: entry.process }) :
               h("div", { className: `chat-entry ${entry.role === "用户" ? "user" : ["系统", "控制器"].includes(entry.role) ? "system" : "assistant"}`, key: entry.index },
               h("div", { className: "chat-meta" }, h("strong", null, entry.role === "控制器" ? "系统" : entry.role), h("span", null, timeLabel(entry.time)),
                 entry.delivery_round > 1 && h(Tag, null, `第 ${entry.delivery_round} 轮交付`),
@@ -1663,9 +1704,11 @@ function WorkflowApp() {
             stage === "核对改动中" && h("div", { className: "stream-indicator", role: "status" },
               h(Spin, { size: "small" }), " 正在核对代码差异与修改归属…"),
             state.phase === "review" && stage === "审查中" ? h("div", { className: "stream-indicator", role: "status" }, h(Spin, { size: "small" }), " 正在审查，结果校验完成后显示问题卡片…") :
-              model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream })))),
-          h(ChangedFiles, { key: state.id, sessionId: state.id, revision: model.revision,
-            running: !stopped && (model.working || Boolean(model.busy) || ACTIVE.has(stage)) }),
+              model.stream && h("div", { className: "chat-entry assistant" }, h("div", { className: "stream-indicator" }, "正在分析…"), h("div", { className: "chat-body" }, h(Markdown, { text: model.stream }))),
+            currentChanges && renderChanges(currentChanges)),
+          fileChanges?.error && h(Typography.Text, { type: "secondary", role: "status" }, fileChanges.error),
+          legacyRepositories.length > 0 && h(ChangedFiles, { key: `${state.id}:legacy`, repositories: legacyRepositories,
+            total: legacyRepositories.reduce((total, repo) => total + repo.paths.length, 0) }),
           state.phase === "complete" && h(ChangeSummary, { key: `${state.id}:locations`, pages: state.change_summary })),
         h(CardBox, { className: "app-card followup-composer", title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复",
           extra: hasWorkItemMaterials && h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
@@ -2063,6 +2106,8 @@ function WorkflowApp() {
       planDetailsOpen && hasImplementationPlan && h(React.Fragment, null,
         h("div", { className: "plan-version" }, `计划版本 ${state.plan_hash.slice(0, 12)}`),
         h(Markdown, { text: state.plan }))),
+    conversationDiff?.sessionId === state?.id && conversationDiff &&
+      h(ConversationDiff, { file: conversationDiff, onClose: () => setConversationDiff(null) }),
     h(Drawer, { title: "本轮代码差异与归属", placement: "right", width: "80vw", open: diffOpen, onClose: () => setDiffOpen(false) },
       diffs === null ? h(Spin, null) : h(Collapse, { defaultActiveKey: diffs.map((_, index) => String(index)), items: diffs.map((diff, index) => ({ key: String(index), label: diff.repository,
         children: diff.commit ? h(Typography.Text, { copyable: true }, diff.commit) : h(React.Fragment, null, h("pre", { className: "diff-text" }, diff.stat || "没有本轮差异"),
