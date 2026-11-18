@@ -26,12 +26,12 @@ from workflow.delivery import apply_followup_replacements, validate_review_reque
 from workflow.commit_messages import COMMIT_INSTRUCTIONS, COMMIT_MESSAGE_SCHEMA, prepare_commit_messages
 from workflow.followup_attachments import attachment_view, submitted_attachments as submitted_followup_attachments
 from workflow.followup_documents import current_attachment_images
-from workflow.gitops import acquire_workspace, branch_catalog, branch_history, carry_checkout, checkout_snapshot, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
+from workflow.gitops import acquire_workspace, branch_catalog, branch_histories, carry_checkout, checkout_snapshot, commit, confirm_checkout, ensure_baseline, fetch_branch, git, manifest, refresh_branches, working_paths
 from workflow.projects import assign_project, project_locked
 from workflow.progress import ProgressFlow, settle_progress
 from workflow.repository_selection import RepositorySelectionFlow, repository_catalog
 from workflow.pdf_materials import material_files
-from workflow.rpc import AppServer, CodexRequestError, thread_parameters
+from workflow.rpc import MAX_INPUT_CHARACTERS, AppServer, CodexRequestError, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.session_titles import collect_session_title, title_generation_context
 from workflow.store import SessionStore, followup_available, require_attached_workspaces, timestamp
@@ -607,11 +607,15 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             state["stage"] = "已暂停"
             self.save()
         elif any(entry["status"] == "pending" for entry in repositories):
-            if state["branch_resolution"].get("version") == 2:
-                repository = next(entry for entry in repositories if entry["status"] == "pending")
-                state["branch_resolution"]["active_role"] = repository["role"]
-                if repository.get("analysis", {}).get("step") != "select":
-                    self._read_branch_histories(repository)
+            if resolution.get("version") == 2:
+                pending = [entry for entry in repositories if entry["status"] == "pending"]
+                for repository in pending:
+                    if repository.get("analysis", {}).get("step") != "select":
+                        repository["analysis"] = {"step": "select", "histories": branch_histories(repository)}
+                resolution.pop("active_role", None)
+                if len(pending) > 1 and len(self._branch_prompt(branch_context(state))) > MAX_INPUT_CHARACTERS:
+                    # 两端合并会超出协议长度时，按仓库分别提交完整候选。
+                    resolution["active_role"] = pending[0]["role"]
             self._start_turn("结合项目地名和 Git 记录，排除功能、临时修复及备份分支，直接选择一条最新开发主线。", BRANCH_SCHEMA)
         elif any(entry["status"] == "needs_user" for entry in repositories):
             state["stage"] = "等待选择分支"
@@ -669,9 +673,13 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.save()
             self._advance_branches()
             return
-        results = validate_result(loads(text), repositories, resolution.get("active_role"))
-        for result in results:
-            repository = next(entry for entry in repositories if entry["role"] == result["role"])
+        results = {result["role"]: result for result in validate_result(loads(text), repositories, resolution.get("active_role"))}
+        for repository in repositories:
+            if state.get("pause_requested") or self.closed:
+                break
+            result = results.get(repository["role"])
+            if result is None:
+                continue
             repository.update(reason=result["reason"], candidates=result["candidates"], question=result["question"])
             if result["status"] == "selected":
                 branch = next(entry for entry in repository["catalog"] if entry["name"] == result["branch"])
@@ -690,14 +698,6 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 repository["status"] = "needs_user"
         self.save()
         self._advance_branches()
-
-    def _read_branch_histories(self, repository):
-        histories = []
-        for entry in repository["catalog"]:
-            name = entry["name"]
-            for source in entry.get("sources", [{"path": repository["path"]}]):
-                histories.append(branch_history({**repository, "path": source["path"]}, name))
-        repository["analysis"] = {"step": "select", "histories": histories}
 
     def smart_checkout(self, paths):
         state = self.require_state("准备工作区失败")
@@ -828,6 +828,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.state["rpc_connected"] = True
             self.save()
 
+    def _branch_prompt(self, context):
+        return prompt_templates.BRANCH_INPUT.format(context=dumps(context, ensure_ascii=False, separators=(",", ":")))
+
     def _start_turn(self, text, output_schema=None):
         if self.closed:
             return
@@ -940,8 +943,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                                               material_instruction=material_instruction, context=dumps(changed, ensure_ascii=False))
         if phase == "branch":
             context = self._idle_context() if state.get("workspace_analysis") else branch_context(state)
-            inputs = [{"type": "text", "text": prompt_templates.BRANCH_INPUT.format(
-                context=dumps(context, ensure_ascii=False, separators=(",", ":")))}]
+            inputs = [{"type": "text", "text": self._branch_prompt(context)}]
         else:
             # 技能已由 thread/start 或 thread/resume 的 developerInstructions 提供。
             inputs = [{"type": "text", "text": prompt}, *image_inputs]

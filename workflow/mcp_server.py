@@ -29,10 +29,15 @@ def schema(properties, required=()):
 
 
 STRING = {"type": "string"}
+BRANCH_COMPARE_TOOL = "compare_branch_refs"
+BRANCH_COMPARE_ARGS = ("role", "path", "left_ref", "right_ref")
 FILE_ARGS = {"repository": STRING, "path": STRING}
 LINE_ARGS = {"start_line": {"type": "integer", "minimum": 1},
              "line_count": {"type": "integer", "minimum": 1, "maximum": 500}}
 TOOLS = [
+    (BRANCH_COMPARE_TOOL, "仅选分支阶段使用。比较同一仓库目录中当前候选的两个完整 Git 引用，返回两侧各自独有的提交数。"
+                          "role、path 和引用使用控制器已给出的值。",
+     schema({key: STRING for key in BRANCH_COMPARE_ARGS}, BRANCH_COMPARE_ARGS)),
     ("set_change_summary", "汇总全部改完后涉及哪些页面及各自的简短变化；同一页面合并，只保留一份整体说明，不记录文件或修改回合。", schema({
         "pages": {"type": "array", "minItems": 1, "items": schema({"page": STRING, "description": STRING}, ("page", "description"))}
     }, ("pages",))),
@@ -89,6 +94,37 @@ TOOLS = [
     ("delete_file", "授权阶段删除普通文件；expected_version 使用最近读取的版本。", schema({**FILE_ARGS, "expected_version": STRING}, ("repository", "path"))),
 ]
 SKIP = {".git", ".local", ".codex", ".idea", ".husky", "node_modules", "target", "dist", "build", "logs", "__pycache__", ".venv", "outputs", "output"}
+
+
+def compare_branch_refs(state, arguments):
+    resolution = state.get("branch_resolution", {})
+    if (state["phase"] != "branch" or state["stage"] != "识别分支中" or resolution.get("step") != "branches"
+            or state.get("workspace_analysis") or state.get("pause_requested")):
+        raise WorkflowError("只允许在选分支阶段比较当前候选。")
+    if (not isinstance(arguments, dict) or set(arguments) != set(BRANCH_COMPARE_ARGS)
+            or any(not isinstance(value, str) or not value for value in arguments.values())):
+        raise WorkflowError("请传入当前候选的仓库角色、目录及两个完整 Git 引用。")
+    role, path, left, right = (arguments[key] for key in BRANCH_COMPARE_ARGS)
+    active = resolution.get("active_role")
+    refs = {ref["ref"]: ref["commit"]
+            for repository in resolution["repositories"]
+            if repository["role"] == role and repository["status"] == "pending" and (not active or active == role)
+            for history in repository.get("analysis", {}).get("histories", []) if history["path"] == path
+            for ref in history["refs"]}
+    if left == right or left not in refs or right not in refs:
+        raise WorkflowError("只能比较同一候选目录中已提供的两个不同 Git 引用。")
+    expected = [refs[left], refs[right]]
+    with repository_lock(path):
+        environment = {"GIT_NO_LAZY_FETCH": "1"}
+        output = git(path, "for-each-ref", "--format=%(refname)%00%(objectname)", left, right,
+                     environment_override=environment)
+        current = dict(line.split("\0", 1) for line in output.splitlines())
+        if [current.get(left), current.get(right)] != expected:
+            raise WorkflowError("候选引用已变化，请重新识别分支。")
+        left_only, right_only = map(int, git(path, "rev-list", "--left-right", "--count", f"{expected[0]}...{expected[1]}",
+                                            "--", environment_override=environment).split())
+    return {"左侧": {"引用": left, "提交": expected[0], "独有提交数": left_only},
+            "右侧": {"引用": right, "提交": expected[1], "独有提交数": right_only}}
 
 
 def matches(relative, pattern):
@@ -163,6 +199,10 @@ class Tools:
     def call(self, name, arguments):
         state = self.store.load(self.session_id)
         self.reading_review = state["phase"] == "review"
+        if name == BRANCH_COMPARE_TOOL:
+            return compare_branch_refs(state, arguments)
+        if state["phase"] == "branch":
+            raise WorkflowError("分支判断阶段只允许比较当前候选 Git 引用。")
         if name in {"write_file", "replace_text", "delete_file", "request_review", "ask_user", "set_session_title", "set_change_summary"}:
             require_attached_workspaces(state)
         if name != "ask_user" and pending_input(self.store, state):

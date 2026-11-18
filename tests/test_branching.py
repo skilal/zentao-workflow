@@ -10,9 +10,11 @@ from unittest.mock import Mock, patch
 
 from workflow.branching import BRANCH_SCHEMA, KEYWORD_SCHEMA, branch_context, configured_repositories, saved_branches, validate_keywords
 from workflow.engine import PHASE_STAGE, Workflow
-from workflow.gitops import branch_catalog, branch_history, fetch_branch, git, prepare, refresh_branches
+from workflow.gitops import branch_catalog, branch_histories, branch_history, fetch_branch, git, prepare, refresh_branches
+from workflow.mcp_server import BRANCH_COMPARE_TOOL, Tools
 from workflow.rpc import AppServer, thread_parameters
 from workflow.settings import ROOT, WorkflowError
+from workflow.store import SessionStore
 from workflow.zentao import ZentaoClient, project_context
 
 
@@ -130,7 +132,9 @@ class BranchWorkflowChecks(TestCase):
         for target, replacement in (
             ("workflow.store.LOCAL", self.root),
             ("workflow.engine.branch_catalog", self.read_catalog),
-            ("workflow.engine.branch_history", lambda repository, name: {"path": repository["path"], "name": name, "refs": [{"ref": name, "commits": [{"subject": "项目长期维护"}]}]}),
+            ("workflow.engine.branch_histories", lambda repository: [
+                {"path": repository["path"], "name": entry["name"], "refs": [{"ref": entry["name"], "commits": [{"subject": "项目长期维护"}]}]}
+                for entry in repository["catalog"]]),
             ("workflow.engine.refresh_branches", self.read_catalog),
             ("workflow.engine.fetch_branch", self.fetch_branch),
             ("workflow.engine.acquire_workspace", self.prepare),
@@ -151,7 +155,6 @@ class BranchWorkflowChecks(TestCase):
         self.turns = Mock(side_effect=lambda *args: state.update(stage=PHASE_STAGE[state["phase"]]))
         self.flow._start_turn = self.turns
         self.prepared = []
-        self.branch_answers = {}
 
     def read_catalog(self, repository):
         entries = deepcopy(self.catalogs[repository["role"]])
@@ -183,20 +186,7 @@ class BranchWorkflowChecks(TestCase):
 
     def complete(self, *decisions):
         self.keywords()
-        if len({entry["role"] for entry in decisions}) != len(decisions):
-            raise WorkflowError("AI 分支角色重复。")
-        self.branch_answers.update({entry["role"]: entry for entry in decisions})
-        for _ in range(8):
-            role = self.flow.state["branch_resolution"].get("active_role")
-            repository = next(entry for entry in self.flow.state["branch_resolution"]["repositories"] if entry["role"] == role)
-            if repository["status"] != "pending" or role not in self.branch_answers:
-                return
-            result = self.branch_answers.pop(role)
-            self.flow._complete_branches(dumps({"repositories": [result]}, ensure_ascii=False))
-            if self.flow.state.get("pause_requested") or self.flow.state["phase"] != "branch":
-                return
-            if repository["status"] == "pending":
-                return
+        self.flow._complete_branches(dumps({"repositories": list(decisions)}, ensure_ascii=False))
 
     def keywords(self):
         if self.flow.state["branch_resolution"].get("step") == "keywords":
@@ -269,6 +259,19 @@ class BranchWorkflowChecks(TestCase):
         self.assertEqual(self.flow.state["supplement"], "补充规则")
         self.assertEqual(self.settings["project_branches"], {})
         self.assertEqual(self.fetched, [])
+        self.assertEqual([call.args[1] for call in self.turns.call_args_list[:2]], [KEYWORD_SCHEMA, BRANCH_SCHEMA])
+        self.assertEqual(self.turns.call_count, 3)
+
+    def test_long_combined_input_keeps_full_candidates_and_uses_separate_turns(self):
+        self.flow.start_plan("")
+        with patch("workflow.engine.MAX_INPUT_CHARACTERS", 1):
+            self.keywords()
+        state = self.flow.state
+        self.assertEqual([entry["role"] for entry in branch_context(state)["repositories"]], ["frontend"])
+        self.complete(decision("frontend", "示例档案馆/develop"))
+        self.assertEqual([entry["role"] for entry in branch_context(state)["repositories"]], ["backend"])
+        self.complete(decision("backend", "示例服务/develop"))
+        self.assertEqual(len(self.prepared), 2)
 
     def test_saved_common_branches_skip_ai_and_are_site_scoped(self):
         site = self.settings["zentao"]["base_url"]
@@ -342,7 +345,7 @@ class BranchWorkflowChecks(TestCase):
         self.catalogs["frontend"][0]["local"] = False
         self.flow.start_plan("")
         self.keywords()
-        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop")]})
+        self.flow.last_message = dumps({"repositories": [decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop")]})
         with patch("workflow.engine.fetch_branch", side_effect=WorkflowError("目标分支拉取失败")) as fetch:
             self.flow.submit(self.flow._completed, {"status": "completed"},
                              self.flow.state["id"], self.flow.connection_epoch).result()
@@ -392,7 +395,7 @@ class BranchWorkflowChecks(TestCase):
     def test_refresh_failure_stops_without_preparing_workspaces(self):
         self.flow.start_plan("")
         self.keywords()
-        self.flow.last_message = dumps({"repositories": [decision("frontend", status="not_found")]})
+        self.flow.last_message = dumps({"repositories": [decision("frontend", status="not_found"), decision("backend", "示例服务/develop")]})
         with patch("workflow.engine.refresh_branches", side_effect=WorkflowError("远程鉴权失败")):
             self.flow.submit(self.flow._completed, {"status": "completed"}, self.flow.state["id"], self.flow.connection_epoch).result()
         self.assertEqual(self.flow.state["stage"], "已停止")
@@ -475,7 +478,8 @@ class BranchWorkflowChecks(TestCase):
         disabled_mcp = {"other": {"command": "示例命令", "enabled": False}}
         params = thread_parameters(state, "示例模型", disabled_mcp)
         server = params["config"]["mcp_servers"]["workflow"]
-        self.assertFalse(server["enabled"])
+        self.assertTrue(server["enabled"])
+        self.assertEqual(server["enabled_tools"], [BRANCH_COMPARE_TOOL])
         self.assertEqual(server["command"], python_executable)
         self.assertEqual(server["args"], [str(ROOT / "mcp.py"), state["id"]])
         self.assertEqual(params["config"]["mcp_servers"]["other"], disabled_mcp["other"])
@@ -490,6 +494,7 @@ class BranchWorkflowChecks(TestCase):
                     "全局服务": {"command": "全局命令", "enabled": False}})
                 server = params["config"]["mcp_servers"]["workflow"]
                 self.assertTrue(server["enabled"])
+                self.assertNotIn(BRANCH_COMPARE_TOOL, server["enabled_tools"])
                 self.assertEqual(server["command"], python_executable)
                 self.assertNotIn("全局服务", params["config"]["mcp_servers"])
                 self.assertNotIn("features.shell_tool", params["config"])
@@ -525,17 +530,16 @@ class BranchWorkflowChecks(TestCase):
             Workflow._start_turn(self.flow, "识别分支", BRANCH_SCHEMA)
         thread_params = rpc.request.call_args_list[0].args[1]
         turn_params = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "turn/start")
-        self.assertFalse(thread_params["config"]["mcp_servers"]["workflow"]["enabled"])
+        self.assertEqual(thread_params["config"]["mcp_servers"]["workflow"]["enabled_tools"], [BRANCH_COMPARE_TOOL])
         self.assertEqual(Path(turn_params["cwd"]).name, self.flow.state["id"])
         self.assertEqual([entry["type"] for entry in turn_params["input"]], ["text"])
         self.assertEqual(turn_params["outputSchema"], BRANCH_SCHEMA)
         epoch = self.flow.connection_epoch
-        text = dumps({"repositories": [decision("frontend", "示例档案馆/develop")]})
+        text = dumps({"repositories": [decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop")]})
         self.flow._event({"method": "item/completed", "params": {"threadId": "branch-thread", "item": {"type": "agentMessage", "text": text}}}, epoch)
         self.flow._event({"method": "turn/completed", "params": {"threadId": "branch-thread", "turn": {"id": "branch-turn", "status": "completed"}}}, epoch)
         self.flow.executor.submit(lambda: None).result()
         self.flow.turn_running = False
-        self.complete(decision("frontend", "示例档案馆/develop"), decision("backend", "示例服务/develop"))
         self.assertEqual(len(self.prepared), 2)
         self.assertEqual(self.flow.state["phase"], "plan")
         self.assertIsNone(self.flow.state["thread_id"])
@@ -562,7 +566,7 @@ class BranchWorkflowChecks(TestCase):
         self.assertEqual(methods.count("thread/resume"), 1)
         resumed = next(call.args[1] for call in rpc.request.call_args_list if call.args[0] == "thread/resume")
         self.assertEqual(resumed["threadId"], "branch-thread")
-        self.assertFalse(resumed["config"]["mcp_servers"]["workflow"]["enabled"])
+        self.assertEqual(resumed["config"]["mcp_servers"]["workflow"]["enabled_tools"], [BRANCH_COMPARE_TOOL])
         sent = next(call.args[1]["input"][0]["text"] for call in reversed(rpc.request.call_args_list)
                     if call.args[0] == "turn/start")
         self.assertEqual(loads(sent.split("\n", 1)[1])["supplement"], "本次新补充")
@@ -661,6 +665,50 @@ class GitBranchChecks(TestCase):
         self.assertEqual(history["refs"], [])
         self.assertFalse(history["metadata_available"])
         self.assertFalse(any("fetch" in call.args for call in command.call_args_list))
+
+    def test_catalog_histories_reuse_refs_and_commit_history(self):
+        git(self.source, "branch", "项目/develop")
+        git(self.source, "branch", "项目/同一提交")
+        catalog = branch_catalog({**self.repository, "branch_keywords": ["项目"]})
+        expected = [branch_history(self.repository, entry["name"]) for entry in catalog]
+        with patch("workflow.gitops.git", wraps=git) as command:
+            self.assertEqual(branch_histories({**self.repository, "catalog": catalog}), expected)
+        self.assertEqual([call.args[1] for call in command.call_args_list], ["log"])
+
+    def test_candidate_tool_compares_only_the_frozen_refs_during_selection(self):
+        git(self.source, "branch", "项目/develop")
+        git(self.source, "switch", "-c", "项目/专题")
+        git(self.source, "commit", "--allow-empty", "-m", "专题改动")
+        catalog = branch_catalog({**self.repository, "branch_keywords": ["项目"]})
+        histories = branch_histories({**self.repository, "catalog": catalog})
+        args = {"role": "frontend", "path": str(self.source),
+                "left_ref": "refs/heads/项目/develop", "right_ref": "refs/heads/项目/专题"}
+        with patch("workflow.store.LOCAL", self.root):
+            store = SessionStore()
+            state = store.new(None)
+            state.update(phase="branch", stage="识别分支中", branch_resolution={"step": "branches", "repositories": [
+                {"role": "frontend", "status": "pending", "analysis": {"step": "select", "histories": histories}}]})
+            store.save(state)
+            tools = Tools(state["id"])
+            compared = tools.call(BRANCH_COMPARE_TOOL, args)
+            self.assertEqual([compared[side]["独有提交数"] for side in ("左侧", "右侧")], [0, 1])
+            with patch("workflow.mcp_server.git") as command:
+                for invalid in ({**args, "path": str(self.remote)}, {**args, "role": "backend"},
+                                {**args, "right_ref": "refs/heads/主目录分支"}):
+                    with self.assertRaisesRegex(WorkflowError, "同一候选目录"):
+                        tools.call(BRANCH_COMPARE_TOOL, invalid)
+                with self.assertRaisesRegex(WorkflowError, "只允许比较"):
+                    tools.call("task_context", {})
+                state["branch_resolution"]["step"] = "keywords"
+                store.save(state)
+                with self.assertRaisesRegex(WorkflowError, "选分支阶段"):
+                    tools.call(BRANCH_COMPARE_TOOL, args)
+                command.assert_not_called()
+            state["branch_resolution"]["step"] = "branches"
+            store.save(state)
+            git(self.source, "branch", "-f", "项目/develop", "HEAD")
+            with self.assertRaisesRegex(WorkflowError, "候选引用已变化"):
+                tools.call(BRANCH_COMPARE_TOOL, args)
 
     def test_remote_refresh_keeps_only_keyword_matches_and_exact_read_is_explicit(self):
         self.remote_commit("绍兴/develop", b"shaoxing")

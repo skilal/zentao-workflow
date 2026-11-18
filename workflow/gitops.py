@@ -123,19 +123,33 @@ def branch_catalog(repository):
 @locked_repository
 def branch_history(repository, name):
     entries = branch_catalog({**repository, "names_only": False, "branch_names": [name]})
-    branch = next((entry for entry in entries if entry["name"] == name), None)
-    if branch is None:
-        # 在线清单中新出现的远程分支尚无本地引用；只在选定后定向拉取。
-        return {"path": repository["path"], "name": name, "refs": [], "metadata_available": False}
+    return branch_histories({**repository, "catalog": entries or [{"name": name}]})[0]
+
+
+def branch_histories(repository):
+    """复用本轮分支目录的本地引用，以固定提交读取历史。"""
     histories = []
-    for reference in branch["refs"]:
-        output = git(repository["path"], "log", "-10", "--format=%H%x00%P%x00%cI%x00%s", reference["commit"])
-        commits = []
-        for line in output.splitlines():
-            commit_id, parents, date, subject = line.split("\0", 3)
-            commits.append({"commit": commit_id, "parents": parents.split(), "date": date, "subject": subject})
-        histories.append({**reference, "commits": commits})
-    return {"path": repository["path"], "name": name, "refs": histories}
+    cache = {}
+    for branch in repository["catalog"]:
+        for source in branch.get("sources", [{**branch, "path": repository["path"]}]):
+            path = source["path"]
+            refs = []
+            for reference in source.get("refs", []):
+                key = (path, reference["commit"])
+                if key not in cache:
+                    output = git(path, "log", "-10", "--format=%H%x00%P%x00%cI%x00%s", reference["commit"],
+                                 environment_override={"GIT_NO_LAZY_FETCH": "1"})
+                    commits = []
+                    for line in output.splitlines():
+                        commit_id, parents, date, subject = line.split("\0", 3)
+                        commits.append({"commit": commit_id, "parents": parents.split(), "date": date, "subject": subject})
+                    cache[key] = commits
+                refs.append({**reference, "commits": cache[key]})
+            history = {"path": path, "name": branch["name"], "refs": refs}
+            if not refs:
+                history["metadata_available"] = False
+            histories.append(history)
+    return histories
 
 
 @locked_repository

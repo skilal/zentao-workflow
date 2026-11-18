@@ -12,7 +12,7 @@ from sys import executable as python_executable
 from threading import Event, Lock, Thread, current_thread
 
 from workflow.branching import BRANCH_INSTRUCTIONS
-from workflow.mcp_server import TOOLS
+from workflow.mcp_server import BRANCH_COMPARE_TOOL, TOOLS
 from workflow.settings import ROOT, WorkflowError
 
 
@@ -77,7 +77,7 @@ class AppServer:
         self.initialized = True
         configuration = self.request("config/read", {"includeLayers": False}).get("config", {})
         self.configuration = configuration
-        # 只为不调用工具的分支识别线程保留禁用覆盖；业务线程直接继承原生配置。
+        # 分支识别只启用受控的候选比较工具；业务线程直接继承原生配置。
         # config/read 的未设置字段为 null，不能作为 TOML 覆盖传回。
         self.disabled_mcp = {name: {**{key: value for key, value in server.items() if value is not None}, "enabled": False}
                              for name, server in configuration.get("mcp_servers", {}).items() if name != "workflow"}
@@ -211,9 +211,10 @@ def thread_parameters(state, model, disabled_mcp):
     session_path = ROOT / ".local" / "sessions" / state["id"]
     server = {"command": python_executable,
               "args": [str(ROOT / "mcp.py"), state["id"]], "cwd": str(ROOT),
-              "required": True, "enabled": state["phase"] != "branch", "startup_timeout_sec": 30,
-              "enabled_tools": [name for name, _, _ in TOOLS]}
+              "required": True, "enabled": True, "startup_timeout_sec": 30,
+              "enabled_tools": [name for name, _, _ in TOOLS if name != BRANCH_COMPARE_TOOL]}
     if state["phase"] == "branch":
+        server["enabled_tools"] = [BRANCH_COMPARE_TOOL]
         return {"cwd": str(session_path), "model": model,
                 "approvalPolicy": "on-request", "sandbox": "read-only",
                 "config": {"model_reasoning_effort": state["codex"]["reasoning_effort"],

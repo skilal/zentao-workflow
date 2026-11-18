@@ -286,7 +286,8 @@ class WorkspaceAllocationChecks(TestCase):
         self.assertTrue(context["repositories"][0]["histories"])
         self.assertEqual(context["sources"][0]["content"], "项目需求")
         result = {"role": "frontend", "status": "selected", "branch": "项目/develop", "reason": "名称贴合项目", "candidates": [], "question": ""}
-        self.engine._complete_branches(dumps({"repositories": [result]}))
+        backend = {**result, "role": "backend", "status": "needs_user", "branch": "", "question": "请确认后端分支"}
+        self.engine._complete_branches(dumps({"repositories": [result, backend]}))
         self.assertEqual(self.state["repos"], [])
         self.assertEqual(self.state["branch_resolution"]["repositories"][0]["branch"], "项目/develop")
         self.assertIn("先排除功能分支", BRANCH_INSTRUCTIONS)
@@ -380,7 +381,8 @@ class WorkspaceAllocationChecks(TestCase):
         histories = branch_context(self.state)["repositories"][0]["histories"]
         self.assertEqual({entry["name"] for entry in histories}, {"项目/develop", "其他项目/develop", "feature/项目-20261117-专题"})
         result["candidates"] = []
-        self.engine._complete_branches(dumps({"repositories": [result]}))
+        backend = {**result, "role": "backend", "status": "needs_user", "branch": "", "question": "请确认后端分支"}
+        self.engine._complete_branches(dumps({"repositories": [result, backend]}))
         self.assertEqual(self.state["branch_resolution"]["repositories"][0]["branch"], "项目/develop")
 
     def test_idle_evidence_redacts_xml_and_assignment_credentials(self):

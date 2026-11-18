@@ -8,6 +8,7 @@ TOOL_LABELS = {
     "read_files": "批量读取文件", "baseline_file": "读取基线文件", "search_text": "搜索代码",
     "git_log": "查看提交历史", "git_files": "查看版本文件列表",
     "git_file": "读取版本文件", "git_diff": "查看版本差异",
+    "compare_branch_refs": "比较候选分支提交",
     "changes": "查看代码差异", "write_file": "写入文件", "replace_text": "修改文件",
     "delete_file": "删除文件", "ask_user": "等待你的回答", "request_review": "登记审查请求",
     "create_artifact": "生成成果文件", "publish_artifact": "返回成果文件",

@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 from workflow.gitops import git
 from workflow.git_read import GIT_READ_TOOLS
-from workflow.mcp_server import TOOLS, Tools
+from workflow.mcp_server import BRANCH_COMPARE_TOOL, TOOLS, Tools
 from workflow.rpc import thread_parameters
 from workflow.settings import WorkflowError
 from workflow.store import SessionStore
@@ -153,4 +153,4 @@ class GitReadChecks(TestCase):
         self.assertTrue(GIT_READ_TOOLS.issubset(enabled))
         definitions = {name: definition for name, _, definition in TOOLS}
         self.assertTrue(GIT_READ_TOOLS.issubset(definitions))
-        self.assertEqual(set(enabled), set(definitions))
+        self.assertEqual(set(enabled), set(definitions) - {BRANCH_COMPARE_TOOL})
