@@ -10,6 +10,7 @@ from pathlib import Path
 from workflow.gitops import checkout_snapshot, ensure_baseline, git, repository_lock, safe_file
 from workflow.diff_index import line_opcodes, occurrence_counts
 from workflow.settings import WorkflowError
+from workflow.store import session_lock
 
 
 INCLUDE_CURRENT = "本轮全部"
@@ -29,13 +30,19 @@ def digest(value):
 
 def save_record(path, record):
     path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(dumps(record, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
+    with session_lock(path):
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(dumps(record, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(path)
+
+
+def load_record_file(path):
+    with session_lock(path):
+        return loads(path.read_text(encoding="utf-8"))
 
 
 def load_record(repo):
-    return loads(Path(repo["change_record"]).read_text(encoding="utf-8"))
+    return load_record_file(Path(repo["change_record"]))
 
 
 def blob_directory(repo):
@@ -133,7 +140,7 @@ def journals(repo):
     root = Path(repo["change_record"]).parents[2]
     records = []
     for path in root.glob("*/changes/*.json"):
-        record = loads(path.read_text(encoding="utf-8"))
+        record = load_record_file(path)
         if (record.get("version") == 1 and record["path"].casefold() == current["path"].casefold()
                 and record["branch"] == current["branch"]):
             records.append(({**repo, "change_record": str(path)}, record))
@@ -312,9 +319,13 @@ def validate_write(repo, relative, expected_version):
         raise WorkflowError(f"文件版本已变化或缺少版本，请重新读取后修改：{relative}")
 
 
-def record_write(repo, relative, before, after):
+def record_write(repo, relative, before, after, message_index=None):
     record = load_record(repo)
-    record["edits"].append({"path": relative, "before": store_blob(repo, before), "after": store_blob(repo, after)})
+    if before != after:
+        edit = {"path": relative, "before": store_blob(repo, before), "after": store_blob(repo, after)}
+        if message_index is not None:
+            edit["message_index"] = message_index
+        record["edits"].append(edit)
     record["reads"][relative] = sha256(after).hexdigest() if after is not None else "missing"
     save_record(repo["change_record"], record)
 

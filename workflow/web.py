@@ -1,6 +1,6 @@
 """本机网页接口：复用工作流引擎，浏览器断开不结束后台会话。"""
 
-from collections import OrderedDict, deque
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -21,6 +21,7 @@ from webbrowser import open as open_browser
 
 from workflow.projects import ProjectPartitions, assign_project, project_move_error, session_project
 from workflow.context import normalized_sources
+from workflow.conversation_changes import change_groups, conversation_edits, conversation_patch
 from workflow.store import followup_available, require_attached_workspaces, session_repositories, session_title, timestamp, workspaces_released
 from workflow.engine import ACTIVE, COMPLETE, parse_review, skipped_review_ids
 from workflow.gitops import branches, changed_paths, cleanup_workspaces, differences, safe_file
@@ -1033,6 +1034,10 @@ class WebApplication:
     def changed_files(self, session_id):
         with self.lock:
             state = deepcopy(self.sessions.get(session_id).engine.state)
+        return self._changed_files(state)
+
+    @staticmethod
+    def _changed_files(state):
         grouped = {repo["name"]: set() for repo in state["repos"]}
         for delivery in [*state.get("deliveries", []), state]:
             historical = delivery is not state
@@ -1051,6 +1056,31 @@ class WebApplication:
         repositories = [{"name": name, "paths": sorted(paths)} for name, paths in grouped.items() if paths]
         return {"session_id": state["id"], "repositories": repositories,
                 "total": sum(len(repo["paths"]) for repo in repositories)}
+
+    def conversation_changes(self, session_id):
+        with self.lock:
+            state = deepcopy(self.sessions.get(session_id).engine.state)
+        edits = conversation_edits(self.sessions.store.directory(session_id))
+        legacy = defaultdict(set)
+        for entry in edits.get(None, {}).values():
+            legacy[entry["repository"]["name"]].add(entry["path"])
+        # 尚未使用写入记录的旧交付仅保留原有清单。
+        deliveries = [{**delivery, "repos": [repo for repo in delivery["repos"] if not repo.get("change_record")]}
+                      for delivery in [*state.get("deliveries", []), state]]
+        legacy_state = {**deliveries[-1], "deliveries": deliveries[:-1]}
+        for repository in self._changed_files(legacy_state)["repositories"]:
+            legacy[repository["name"]].update(repository["paths"])
+        return {"session_id": session_id, "groups": change_groups(edits),
+                "legacy_repositories": [{"name": name, "paths": sorted(paths)} for name, paths in legacy.items()]}
+
+    def conversation_diff(self, session_id, message_index, record_id, relative):
+        with self.lock:
+            self.sessions.get(session_id)
+        if not fullmatch(r"-1|[0-9]{1,12}", message_index) or not record_id or not relative:
+            raise WorkflowError("请选择这次对话的改动文件。")
+        edits = conversation_edits(self.sessions.store.directory(session_id))
+        entry = edits.get(int(message_index), {}).get((record_id, relative))
+        return conversation_patch(entry)
 
     def diff(self, session_id):
         with self.lock:
@@ -1172,6 +1202,12 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._json(200, application.diff(query.get("session_id", [""])[0]))
             elif path == "/api/changed-files":
                 self._json(200, application.changed_files(query.get("session_id", [""])[0]))
+            elif path == "/api/conversation-changes":
+                self._json(200, application.conversation_changes(query.get("session_id", [""])[0]))
+            elif path == "/api/conversation-diff":
+                self._json(200, application.conversation_diff(query.get("session_id", [""])[0],
+                           query.get("message_index", [""])[0], query.get("record_id", [""])[0],
+                           query.get("path", [""])[0]))
             elif path == "/api/material":
                 self._material(query)
             elif path == "/api/supplement-images":

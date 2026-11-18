@@ -296,13 +296,15 @@ class Tools:
                 raise WorkflowError("该历史任务文件已在上轮交付后被外部修改，未自动覆盖；请先明确确认这些改动。")
         if path.name.casefold() in ("agents.md", "claude.md", "qwen.md"):
             raise WorkflowError("工作流不允许通过修改项目指令文件扩大执行权限。")
+        message = state.get("manual_compile") or state.get("followup") or {}
+        message_index = message.get("history_index", -1)
         if name == "delete_file":
             if not path.is_file():
                 raise WorkflowError("删除目标不是普通文件。")
             before = path.read_bytes()
             path.unlink()
             if repository.get("change_record"):
-                record_write(repository, relative, before, None)
+                record_write(repository, relative, before, None, message_index)
             return {"message": "文件已删除。", "version": "missing"}
         if name == "replace_text":
             old, new = arguments["old"], arguments["new"]
@@ -325,7 +327,7 @@ class Tools:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="")
         if repository.get("change_record"):
-            record_write(repository, relative, before, path.read_bytes())
+            record_write(repository, relative, before, path.read_bytes(), message_index)
         if replacement_path is not None:
             replacements["files"].setdefault(repository["name"], {})[relative] = sha256(path.read_bytes()).hexdigest()
             temporary = replacement_path.with_suffix(".json.tmp")

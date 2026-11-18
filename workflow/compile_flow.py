@@ -64,8 +64,9 @@ class CompileFlow:
             heads[repo["name"]] = head
         state["manual_compile"] = {"request_id": request_id, "phase": state["phase"], "stage": state["stage"],
                                    "compile_check": deepcopy(state.get("compile_check", {"enabled": False})), "heads": heads,
-                                   "commits": deepcopy(state["commits"])}
+                                   "commits": deepcopy(state["commits"]), "history_index": len(state["history"])}
         state.update(compile_check={"enabled": True}, pause_requested=False, commits={})
+        self.note("控制器", "已启动独立后端编译检查。", display_text="已启动独立后端编译检查。", change_group=True)
         self._begin_compile()
 
     def _before_review(self):
