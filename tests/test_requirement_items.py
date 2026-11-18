@@ -3,6 +3,7 @@
 from json import loads
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from unittest import TestCase
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
@@ -143,6 +144,41 @@ class RequirementItemsChecks(TestCase):
             with self.assertRaisesRegex(WorkflowError, "权限不足"):
                 self.client.list_requirements()
         self.assertEqual(fetch.call_count, 2)
+
+    def test_independent_product_pages_run_concurrently_and_keep_list_order(self):
+        first_pages = Barrier(4, timeout=5)
+
+        def fetch(path):
+            query = parse_qs(urlparse(path).query)
+            if path.startswith("api.php/v1/products?"):
+                return {"total": 4, "products": [{"id": number} for number in range(1, 5)]}
+            product_id, page = int(query["product"][0]), int(query["page"][0])
+            if page == 1:
+                first_pages.wait()
+            return {"total": 2 if product_id == 1 else 1,
+                    "stories": [self.item("requirement", product_id * 10 + page)]}
+
+        with patch.object(self.client, "_fetch", side_effect=fetch) as request:
+            items = self.client.list_requirements(("requirement",))
+        self.assertEqual([item["id"] for item in items], [11, 12, 21, 31, 41])
+        self.assertEqual(request.call_count, 6)
+
+    def test_failed_product_page_does_not_start_another_batch(self):
+        def fetch(path):
+            query = parse_qs(urlparse(path).query)
+            page = int(query["page"][0])
+            if path.startswith("api.php/v1/products?"):
+                return {"total": 5, "products": [{"id": number} for number in range(page * 2 - 1, min(page * 2, 5) + 1)]}
+            product_id = int(query["product"][0])
+            self.assertLessEqual(product_id, 4)
+            self.assertEqual(page, 1)
+            if product_id == 2:
+                raise WorkflowError("权限不足")
+            return {"total": 2, "stories": [self.item("requirement", product_id)]}
+
+        with patch.object(self.client, "_fetch", side_effect=fetch):
+            with self.assertRaisesRegex(WorkflowError, "权限不足"):
+                self.client.list_requirements(("requirement",))
 
     def test_details_preserve_kind_body_verification_and_materials(self):
         for kind in REQUIREMENT_KINDS:

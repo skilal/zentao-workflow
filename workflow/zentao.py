@@ -1,5 +1,6 @@
 """只使用明确的禅道 API v1；不自动重登或切换接口。"""
 
+from concurrent.futures import ThreadPoolExecutor
 from html import unescape
 from hashlib import sha256
 from html.parser import HTMLParser
@@ -20,6 +21,18 @@ from workflow.pdf_materials import read_pdf
 REQUIREMENT_KINDS = ("epic", "requirement", "story")
 KINDS = {"epic": ("业务需求", "stories"), "requirement": ("用户需求", "stories"),
          "story": ("研发需求", "stories"), "task": ("任务", "tasks"), "bug": ("Bug", "bugs")}
+
+
+def _read_in_batches(read, entries):
+    """限制同批请求数，按输入顺序返回；当前批失败时不派发下一批。"""
+    if len(entries) <= 1:
+        return list(map(read, entries))
+    workers = 4
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for start in range(0, len(entries), workers):
+            results.extend(pool.map(read, entries[start:start + workers]))
+    return results
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -299,6 +312,10 @@ class ZentaoClient:
         return [item for kind in kinds for item in records[kind]]
 
     def _pages(self, path, key, parameters, on_page=None):
+        for items, _ in self._page_batches(path, key, parameters, on_page):
+            yield from items
+
+    def _page_batches(self, path, key, parameters, on_page=None):
         page, seen = 1, set()
         while True:
             query = urlencode({**parameters, "limit": self.settings["page_size"], "page": page})
@@ -320,11 +337,15 @@ class ZentaoClient:
                 raise WorkflowError("禅道产品或需求编号无效，已停止。")
             if not ids.difference(seen) and len(seen) < total:
                 raise WorkflowError("禅道分页提前结束，列表不完整，已停止。")
+            new_items = []
             for item in items:
-                if identifier(item["id"]) not in seen:
-                    seen.add(identifier(item["id"]))
-                    yield item
-            if len(seen) >= total:
+                item_id = identifier(item["id"])
+                if item_id not in seen:
+                    seen.add(item_id)
+                    new_items.append(item)
+            has_more = len(seen) < total
+            yield new_items, has_more
+            if not has_more:
                 return
             page += 1
 
@@ -333,46 +354,71 @@ class ZentaoClient:
         records, seen = [], set()
         products = list(self._pages("api.php/v1/products", "products", {"status": "all", "order": "id_asc"},
                                    on_page=(lambda page: on_progress(f"正在读取可见产品：第 {page} 页")) if on_progress else None))
-        for index, product in enumerate(products, 1):
-            for kind in kinds:
+        product_items = [[] for _ in products]
+        for kind in kinds:
+            pending = {}
+            for index, product in enumerate(products):
                 parameters = {"product": identifier(product["id"]), "type": kind, "status": "assignedtome",
                               "branch": "all", "order": "id_asc"}
-                on_page = (lambda page: on_progress(f"正在读取{KINDS[kind][0]}：产品 {index}/{len(products)}，第 {page} 页")) if on_progress else None
-                for item in self._pages("api.php/v1/stories", "stories", parameters, on_page=on_page):
-                    item_id = identifier(item["id"])
-                    if (kind, item_id) in seen:
-                        continue
-                    seen.add((kind, item_id))
-                    if (account_of(item.get("assignedTo")) != self.account
-                            or item.get("status") in self.settings["excluded_statuses"] or item.get("deleted")):
-                        continue
-                    project = project_context(item)
-                    records.append({"kind": kind, "id": item_id, "title": item.get("title", ""),
-                                    "status": item.get("statusName", item.get("status", "")),
-                                    "project": project["name"] or project["id"],
-                                    "project_id": project["id"], "project_name": project["name"],
-                                    "project_candidates": project["candidates"],
-                                    "priority": item.get("pri", ""), "assigned_to": self.account})
+                prefix = f"正在读取{KINDS[kind][0]}：产品 {index + 1}/{len(products)}"
+                on_page = (lambda page, prefix=prefix: on_progress(f"{prefix}，第 {page} 页")) if on_progress else None
+                pending[index] = self._page_batches("api.php/v1/stories", "stories", parameters, on_page)
+            while pending:
+                results = _read_in_batches(next, list(pending.values()))
+                remaining = {}
+                for (index, pages), (page_items, has_more) in zip(pending.items(), results):
+                    product_items[index].extend(page_items)
+                    if has_more:
+                        remaining[index] = pages
+                pending = remaining
+        for items in product_items:
+            for item in items:
+                kind, item_id = item["type"], identifier(item["id"])
+                if (kind, item_id) in seen:
+                    continue
+                seen.add((kind, item_id))
+                if (account_of(item.get("assignedTo")) != self.account
+                        or item.get("status") in self.settings["excluded_statuses"] or item.get("deleted")):
+                    continue
+                project = project_context(item)
+                records.append({"kind": kind, "id": item_id, "title": item.get("title", ""),
+                                "status": item.get("statusName", item.get("status", "")),
+                                "project": project["name"] or project["id"],
+                                "project_id": project["id"], "project_name": project["name"],
+                                "project_candidates": project["candidates"],
+                                "priority": item.get("pri", ""), "assigned_to": self.account})
         return records
 
     def resolve_item_projects(self, items, on_progress=None):
-        details = {}
+        projects, detail_keys = [], {}
         for item in items:
             project = project_context(item, {"projects": item.get("project_candidates", [])})
+            projects.append(project)
             if item["kind"] in REQUIREMENT_KINDS and not project["id"] and not project["candidates"]:
-                key = (item["kind"], item["id"])
-                if key not in details:
-                    if on_progress:
-                        on_progress(f"正在读取{KINDS[item['kind']][0]} #{item['id']} 的项目关联")
-                    details[key] = self.detail(*key)
+                detail_keys[(item["kind"], item["id"])] = None
+
+        def read_detail(key):
+            kind, item_id = key
+            if on_progress:
+                on_progress(f"正在读取{KINDS[kind][0]} #{item_id} 的项目关联")
+            return self.detail(kind, item_id)
+
+        details = dict(zip(detail_keys, _read_in_batches(read_detail, list(detail_keys))))
+        for item, project in zip(items, projects):
+            key = (item["kind"], item["id"])
+            if key in details and not project["id"] and not project["candidates"]:
                 project = project_context(item, details[key])
             item.update(project_id=project["id"], project_name=project["name"], project_candidates=project["candidates"])
         names = {project["id"]: project["name"] for item in items for project in item["project_candidates"] if project["name"]}
         missing = sorted({project["id"] for item in items for project in item["project_candidates"] if project["id"] not in names})
-        for index, project_id in enumerate(missing, 1):
+
+        def read_name(entry):
+            index, project_id = entry
             if on_progress:
                 on_progress(f"正在补齐所属项目名称：第 {index}/{len(missing)} 个")
-            names[project_id] = self._project_name(project_id)
+            return self._project_name(project_id)
+
+        names.update(zip(missing, _read_in_batches(read_name, list(enumerate(missing, 1)))))
         for item in items:
             for project in item["project_candidates"]:
                 project["name"] = names[project["id"]]

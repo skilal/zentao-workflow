@@ -357,11 +357,14 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         started, started_at, requests = monotonic(), timestamp(), 0
         kinds = ("story", "task", "bug") if kind == "all" else (kind,)
         label = "快速待办" if kind == "all" else KINDS[kind][0]
+        progress_lock = Lock()
+
         def report(message):
             nonlocal requests
-            requests += 1
-            self.emit("items_sync", {"status": "loading", "message": message, "started_at": started_at,
-                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
+            with progress_lock:
+                requests += 1
+                self.emit("items_sync", {"status": "loading", "message": message, "started_at": started_at,
+                                         "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
         self.emit("items_sync", {"status": "loading", "message": "正在连接禅道" if reconnect else f"正在刷新{label}",
                                  "started_at": started_at, "elapsed_seconds": 0, "list_requests": 0, "kinds": kinds})
         try:
