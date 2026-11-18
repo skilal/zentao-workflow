@@ -1527,6 +1527,9 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             result = parse_review(text, protocol)
             if protocol == 3:
                 state["review_manifest"] = select_scope(state["repos"], result["commit_scope"])
+                approved_scope = {repo["name"]: repo["commit_scope"] for repo in state["repos"] if repo.get("change_record")}
+                for scope in result["commit_scope"]:
+                    scope["include"] = approved_scope[scope["repository"]]
                 state.pop("scope_review_required", None)
             commit_messages = prepare_commit_messages(state, result["commit_messages"])
             collect_change_summary(self.store, state)

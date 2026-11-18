@@ -14,7 +14,7 @@ from workflow.gitops import acquire_workspace, cleanup_workspaces, commit, ensur
 from workflow.delivery import previous_task_changes, validate_review_request
 from workflow.mcp_server import Tools
 from workflow.settings import WorkflowError
-from workflow.shared_changes import candidates, initialize, load_record, select_scope, snapshot_review
+from workflow.shared_changes import INCLUDE_CURRENT, candidates, initialize, load_record, select_scope, snapshot_review
 from workflow.store import SessionStore
 from workflow.engine import Workflow
 from workflow.settings import ROOT
@@ -215,6 +215,21 @@ class SharedWorkspaceChecks(TestCase):
         fingerprint = self.review(self.second, [foreign["id"]])
         committed = commit(repo, "fix(共享): 纳入相关修改", fingerprint)
         self.assertIn("甲需求", git(self.path, "show", committed + ":共享.txt"))
+
+    def test_include_current_expands_frozen_fragments_and_respects_exclusions(self):
+        self.replace(self.first, "甲.txt", "原始第3行", "其他会话")
+        self.replace(self.second, "共享.txt", "原始第3行", "本轮改动")
+        self.replace(self.second, "乙.txt", "原始第7行", "本轮排除")
+        self.replace(self.second, "人工.txt", "原始第9行", "本轮保留")
+        repo = self.second["repos"][0]
+        snapshot_review(repo)
+        identifiers = {fragment["path"]: fragment["id"] for fragment in candidates(repo)}
+        selection = {"repository": "前端", "include": [INCLUDE_CURRENT],
+                     "exclude": [{"id": identifiers["乙.txt"], "reason": "本轮不需要"}]}
+        result = select_scope([repo], [selection])
+        self.assertEqual(set(result), {"前端/共享.txt", "前端/人工.txt"})
+        self.assertEqual(set(repo["commit_scope"]), {identifiers["共享.txt"], identifiers["人工.txt"]})
+        self.assertEqual(selection["include"], [INCLUDE_CURRENT])
 
     def test_overlap_sources_are_retained_and_require_scope_selection(self):
         self.replace(self.first, "共享.txt", "原始第3行", "甲需求")

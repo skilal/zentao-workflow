@@ -12,9 +12,11 @@ from workflow.diff_index import line_opcodes, occurrence_counts
 from workflow.settings import WorkflowError
 
 
+INCLUDE_CURRENT = "本轮全部"
 SCOPE_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "repository": {"type": "string"},
-    "include": {"type": "array", "items": {"type": "string"}},
+    "include": {"type": "array", "items": {"type": "string"},
+                "description": f"片段编号，或用“{INCLUDE_CURRENT}”纳入审查快照中的本轮片段（exclude 除外）。"},
     "exclude": {"type": "array", "items": {"type": "object", "properties": {
         "id": {"type": "string"}, "reason": {"type": "string"}},
         "required": ["id", "reason"], "additionalProperties": False}}},
@@ -364,11 +366,20 @@ def select_locked_scope(repositories, selections):
             raise WorkflowError("提交片段重复、状态冲突或缺少排除原因。")
         own = {identifier for identifier, fragment in frozen.items() if fragment["source"] == "本轮"
                or fragment["path"] in repo.get("review_paths", [])}
-        if not own.issubset(set(included) | set(excluded)):
-            raise WorkflowError("本轮修改片段遗漏，请明确纳入或说明排除原因。")
+        if INCLUDE_CURRENT in included:
+            included = [identifier for identifier in included if identifier != INCLUDE_CURRENT]
+            if any(identifier in own for identifier in included):
+                raise WorkflowError(f"{repo['name']}：“{INCLUDE_CURRENT}”与单独列出的本轮片段重复。")
+            included.extend(identifier for identifier in frozen if identifier in own and identifier not in excluded)
+        missing = own.difference(included, excluded)
+        if missing:
+            examples = "、".join(f"{frozen[identifier]['path']}:{frozen[identifier]['new_start'] + 1}（{identifier}）"
+                                 for identifier in sorted(missing)[:3])
+            raise WorkflowError(f"{repo['name']}：本轮修改片段遗漏 {len(missing)} 个，请明确纳入或说明排除原因。"
+                                f" {examples}")
         for identifier in [*included, *excluded]:
             if identifier not in frozen or identifier not in current:
-                raise WorkflowError("Review 使用了失效或未知的差异片段。")
+                raise WorkflowError(f"{repo['name']}：Review 使用了失效或未知的差异片段 {identifier}。")
             if identifier in included:
                 entry = current[identifier]
                 if entry["context"] != frozen[identifier]["context"]:
