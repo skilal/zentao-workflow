@@ -1684,7 +1684,7 @@ function WorkflowApp() {
           changeDraft({ baseline_paths: {} });
           return act("detect_repositories", { purpose: "baseline", paths });
         } }, "重新检测目录")),
-        h(CardBox, { title: "工作流会话", extra: stageTag(stage) },
+        h(CardBox, { title: "工作流会话", className: "app-card conversation-card", extra: stageTag(stage) },
           state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
           state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
             message: `第 ${state.delivery_round} 轮已完成`, "aria-label": "本轮执行结果", style: { marginBottom: 16 },
@@ -1985,11 +1985,13 @@ function WorkflowApp() {
       .sort((left, right) => !left.id ? 1 : !right.id ? -1 : left.lastDialogueTime === right.lastDialogueTime ? left.id - right.id : right.lastDialogueTime - left.lastDialogueTime);
     const running = model.history.filter(entry => ACTIVE.has(entry.stage) || entry.busy).length;
     return h(CardBox, { title: "会话", className: "app-card session-panel", extra: h(Typography.Text, { type: "secondary" }, `${running} 个执行中`) },
-      h(Button, { type: "primary", block: true, onClick: newSession, disabled: stopped }, "新建会话"),
-      h(Button, { block: true, className: "add-project-button", onClick: addProjectPartition, disabled: stopped || !model.connected }, "添加项目分区"),
-      h(Input.Search, { value: sessionQuery, allowClear: true, placeholder: "搜索会话或项目名称、编号", onChange: event => setSessionQuery(event.target.value) }),
-      h(Select, { value: sessionFilter, className: "full-width", onChange: setSessionFilter,
-        options: [{ value: "all", label: "全部状态" }, ...stages.map(value => ({ value, label: value }))] }),
+      h("div", { className: "session-panel-tools" },
+        h("div", { className: "session-panel-actions" },
+          h(Button, { type: "primary", size: "small", onClick: newSession, disabled: stopped }, "新建会话"),
+          h(Button, { size: "small", onClick: addProjectPartition, disabled: stopped || !model.connected }, "添加项目分区")),
+        h(Input.Search, { size: "small", value: sessionQuery, allowClear: true, placeholder: "搜索会话或项目名称、编号", onChange: event => setSessionQuery(event.target.value) }),
+        h(Select, { size: "small", value: sessionFilter, className: "full-width", "aria-label": "筛选会话状态", onChange: setSessionFilter,
+          options: [{ value: "all", label: "全部状态" }, ...stages.map(value => ({ value, label: value }))] })),
       h("div", { className: "session-list" }, groups.map(project => {
         const key = String(project.id);
         return h("section", { key, "data-project-id": key, className: `session-project${dropProjectId === key ? " drop-target" : ""}`,
@@ -2005,13 +2007,14 @@ function WorkflowApp() {
             if (entry?.can_move_project && (entry.project?.id || 0) !== project.id) moveProject(entry.id, project.id || null);
             setDropProjectId(null); setDragSessionId(null);
           } },
-          h(Collapse, { ghost: true, activeKey: query || !collapsedProjects.includes(key) ? [key] : [],
+          h(Collapse, { size: "small", ghost: true, activeKey: query || !collapsedProjects.includes(key) ? [key] : [],
             onChange: keys => { if (!query) changeProjectCollapse(keys.length ? collapsedProjects.filter(value => value !== key) : [...collapsedProjects, key]); },
             items: [{ key, label: h("div", { className: "session-project-heading" },
               h("span", { className: "session-project-name", title: project.id ? `${project.name || "项目"} #${project.id}` : project.name }, project.name || `项目 #${project.id}`,
                 project.id > 0 && h("span", { className: "session-project-number" }, ` #${project.id}`)),
               h(Tag, { className: "session-project-count" }, project.rows.length)),
-              children: h(List, { dataSource: project.rows, locale: { emptyText: "暂无会话，可移入未启动的会话" }, renderItem: entry => {
+              children: h(List, { size: "small", dataSource: project.rows, locale: { emptyText: "暂无会话，可移入未启动的会话" }, renderItem: entry => {
+                const items = sessionItems(entry);
                 const selected = model.selectedSessionId === entry.id;
                 const inactive = Boolean(entry.last_user_message_at && sessionNow - Date.parse(entry.last_user_message_at) > 120 * 60 * 60 * 1000);
                 const canMove = entry.can_move_project && !stopped && !requestsPending[entry.id];
@@ -2024,7 +2027,8 @@ function WorkflowApp() {
                   tabIndex: 0, role: "button", "aria-pressed": selected, onKeyDown: event => { if (event.target === event.currentTarget && ["Enter", " "].includes(event.key)) { event.preventDefault(); open(); } } },
                   h("div", { className: "session-entry-body" },
                     h("div", { className: "session-entry-custom-title", title: entry.title }, entry.title),
-                    h("div", { className: "session-entry-title", title: itemLabel(entry) }, sessionItems(entry).map(item => h("div", { key: itemKey(item) }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
+                    items.length > 0 && h("div", { className: "session-entry-title", title: itemLabel(entry) },
+                      items.map(item => h("div", { key: itemKey(item) }, `${TYPE_NAMES[item.kind]} #${item.id} · ${item.title}`))),
                     h("div", { className: "session-entry-status" }, stageTag(entry.stage), entry.busy && h(Spin, { size: "small" }),
                       inactive && h(Tag, { className: "session-inactive-tag", title: `用户最后发言：${timeLabel(entry.last_user_message_at)}` }, "超过5天未对话")),
                     h("div", { className: "session-entry-foot" }, h("span", { className: "muted", title: "最近对话时间" }, entry.last_dialogue_at ? timeLabel(entry.last_dialogue_at) : "尚无对话"),

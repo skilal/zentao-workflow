@@ -28,9 +28,9 @@ button, input, textarea { font: inherit; }
 .page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 19px; }
 .page-heading h1 { margin: 0 0 7px; font-size: 23px; font-weight: 600; letter-spacing: -.4px; }
 .page-subtitle { color: #7a8597; font-size: 13px; line-height: 1.7; }
-.workflow-strip { margin-bottom: 22px; border-color: #e9edf3; }
-.workflow-strip .ant-card-body { padding: 18px 22px; }
-.workflow-strip-top { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.workflow-strip { margin-bottom: 14px; border-color: #e9edf3; }
+.workflow-strip .ant-card-body { padding: 11px 16px; }
+.workflow-strip-top { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
 .workflow-strip-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
 .current-item { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #48556a; }
 .card-stack { display: flex; flex-direction: column; gap: 18px; }
@@ -112,6 +112,8 @@ button, input, textarea { font: inherit; }
 .followup-actions > .ant-btn { margin-left: auto; }
 .followup-composer .attachment-grid:empty { display: none; }
 .conversation-layout > * { min-width: 0; }
+.conversation-card > .ant-card-head { min-height: 44px; padding-inline: 16px; }
+.conversation-card > .ant-card-body { padding: 14px 16px; }
 .changed-files { margin-top: 16px; }
 .changed-files-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; max-height: 180px; overflow: auto; }
 .changed-files-repository { min-width: 0; }
@@ -203,24 +205,29 @@ button, input, textarea { font: inherit; }
 .project-info-actions { display: flex; flex-direction: column; gap: 10px; padding: 16px 0; border-top: 1px solid #edf0f4; }
 .project-info-actions .ant-btn, .project-info-confirm { height: auto; padding: 6px 10px; white-space: normal; font-size: 12px; }
 .project-info-confirm { margin-top: 12px; }
-.session-panel { position: sticky; top: calc(var(--app-header-height) + 18px); }
-.session-panel .ant-card-body { padding: 16px; }
-.session-panel .ant-input-search, .session-panel .ant-select { margin-top: 12px; }
-.session-list { margin-top: 12px; max-height: calc(100vh - var(--app-header-height) - 360px); min-height: 180px; overflow-y: auto; }
-.add-project-button { margin-top: 8px; }
-.session-project { border: 1px solid #edf0f4; border-radius: 6px; margin-bottom: 8px; }
+.session-panel { position: sticky; top: calc(var(--app-header-height) + 18px); display: flex; flex-direction: column; min-width: 0;
+  max-height: max(280px, calc(100dvh - var(--app-header-height) - 116px)); }
+.session-panel > .ant-card-head { flex: none; min-height: 38px; padding-inline: 10px; }
+.session-panel > .ant-card-head .ant-typography { font-size: 12px; }
+.session-panel > .ant-card-body { display: flex; flex-direction: column; gap: 8px; min-height: 0; padding: 8px 10px; }
+.session-panel-tools { display: grid; gap: 6px; flex: none; }
+.session-panel-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.session-panel-actions > .ant-btn { flex: 1 0 auto; }
+.session-list { min-height: 0; overflow-y: auto; }
+.session-project { border: 1px solid #edf0f4; border-radius: 6px; }
+.session-project + .session-project { margin-top: 5px; }
 .session-project.drop-target { border-color: #1b8fff; background: #eef7ff; }
-.session-project .ant-collapse > .ant-collapse-item > .ant-collapse-header { padding: 10px 8px; align-items: center; }
-.session-project .ant-collapse .ant-collapse-content > .ant-collapse-content-box { padding: 0 4px 4px; }
+.session-project .ant-collapse > .ant-collapse-item > .ant-collapse-header { padding: 5px 7px; align-items: center; }
+.session-project .ant-collapse .ant-collapse-content > .ant-collapse-content-box { padding: 0 3px 3px; }
 .session-project-heading { display: flex; align-items: center; justify-content: space-between; gap: 6px; min-width: 0; }
 .session-project-name { min-width: 0; color: #25354b; font-size: 12px; overflow-wrap: anywhere; }
 .session-project-number { color: #8a94a6; white-space: nowrap; }
 .session-project-count.ant-tag { margin: 0; font-size: 11px; flex-shrink: 0; }
-.session-project .ant-empty { margin-block: 12px; font-size: 12px; }
+.session-project .ant-empty { margin-block: 6px; font-size: 12px; }
 .session-entry[draggable="true"] { cursor: grab; }
 .session-entry-actions { display: inline-flex; align-items: center; flex-shrink: 0; }
 .session-entry-actions .ant-btn { padding-inline: 3px; font-size: 11px; }
-.session-entry.ant-list-item { padding: 12px 10px; border-radius: 6px; cursor: pointer; border-bottom: 1px solid #edf0f4; }
+.session-project .session-entry.ant-list-item { padding: 5px 6px; border-radius: 6px; cursor: pointer; border-bottom: 1px solid #edf0f4; }
 .session-entry:hover, .session-entry:focus-visible { background: #f6f8fb; }
 .session-entry.selected { background: #eef7ff; box-shadow: inset 3px 0 rgb(27, 143, 255); }
 .session-entry.inactive { background: #f6f8fb; }
@@ -228,15 +235,15 @@ button, input, textarea { font: inherit; }
 .session-entry.inactive.selected { background: #eef7ff; }
 .session-entry.inactive .session-entry-custom-title, .session-entry.inactive .session-entry-title { color: #8a94a6; }
 .session-entry.inactive .session-entry-status .ant-tag { color: #8a94a6; background: #f6f8fb; border-color: #edf0f4; }
-.session-entry-status .session-inactive-tag { margin-inline-end: 0; font-size: 11px; }
 .session-entry-body { width: 100%; min-width: 0; }
-.session-entry-custom-title { margin-bottom: 4px; color: #25354b; font-weight: 600; font-size: 14px; line-height: 1.7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-entry-title { color: #25354b; font-weight: 500; font-size: 13px; line-height: 1.7; }
+.session-entry-custom-title { color: #25354b; font-weight: 600; font-size: 14px; line-height: 19px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-entry-title { color: #25354b; font-weight: 500; font-size: 13px; line-height: 17px; }
 .session-entry-title > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-entry-status { margin: 9px 0 5px; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.session-entry-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px; }
-.session-entry-foot .muted { font-size: 11px; }
-.session-panel-note { padding-top: 14px; border-top: 1px solid #edf0f4; line-height: 1.8; }
+.session-entry-status { margin-top: 3px; display: flex; flex-wrap: wrap; align-items: center; gap: 3px 5px; }
+.session-entry-status .ant-tag { margin-inline-end: 0; font-size: 11px; line-height: 16px; }
+.session-entry-foot { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0 4px; }
+.session-entry-foot .muted { font-size: 11px; white-space: nowrap; }
+.session-panel-note { flex: none; padding-top: 6px; border-top: 1px solid #edf0f4; font-size: 11px; line-height: 1.5; }
 .delete-description .repo-path { margin-bottom: 10px; }
 @media (max-width: 1350px) {
   .session-workspace { grid-template-columns: 250px minmax(0, 1fr); }
@@ -254,7 +261,11 @@ button, input, textarea { font: inherit; }
   .project-info-section { padding: 12px 0; }
   .project-info-section + .project-info-section { border-left: 0; border-top: 1px solid #edf0f4; }
 }
-@media (max-width: 1000px) { .session-workspace { grid-template-columns: 1fr; } .session-panel { position: static; } .session-list { max-height: 260px; min-height: 0; } }
+@media (max-width: 1000px) {
+  .session-workspace { grid-template-columns: minmax(0, 1fr); }
+  .session-panel { position: static; max-height: none; }
+  .session-list { max-height: clamp(260px, 42dvh, 440px); }
+}
 @container (max-width: 1000px) { .repository-grid { grid-template-columns: 1fr; } }
 @media (max-width: 1100px) { .repository-grid { grid-template-columns: 1fr; } .app-header { padding: 0 18px; } .page-content { padding: 20px 18px; } }
 @media (max-width: 750px) { .app-sider:not(.ant-layout-sider-collapsed) { width: 156px !important; min-width: 156px !important; max-width: 156px !important; } .main-layout { margin-left: 156px; } .brand { padding: 0 12px; gap: 7px; } .brand-title { font-size: 13px; } .brand-mark { width: 30px; height: 30px; } .brand-subtitle, .header-caption { display: none; } .sider-foot { left: 14px; right: 14px; } .page-heading h1 { font-size: 20px; } .settings-grid { grid-template-columns: 1fr; } .workflow-strip .ant-steps-item-description { display: none; } .data-foot { align-items: flex-start; flex-direction: column; } }
