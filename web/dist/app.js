@@ -556,7 +556,6 @@ function WorkflowApp() {
   const [selectedItems, setSelectedItems] = useState([]);
   const selectionRequest = useRef("");
   const [filter, setFilter] = useState("all");
-  const requestedItemKinds = useRef(new Set());
   const [query, setQuery] = useState("");
   const [itemProject, setItemProject] = useState("all");
   const [itemPagination, setItemPagination] = useState({ current: 1, pageSize: 10 });
@@ -892,7 +891,7 @@ function WorkflowApp() {
     fetch("/api/bootstrap", { credentials: "same-origin", cache: "no-store" }).then(readResponse).then(data => {
       if (disposed) return;
       if (data.preview_supported !== true) throw new Error("本地服务版本过旧，请停止并重新启动本地服务，再刷新页面。当前服务不支持临时查看资料。");
-      if (!data.items_loads) throw new Error("本地服务版本过旧，请停止并重新启动本地服务，再刷新页面。当前服务不支持按需读取需求。");
+      if (!data.items_loads) throw new Error("本地服务版本过旧，请重新启动本地服务后刷新页面。");
       csrf.current = data.csrf_token;
       const saved = sessionStorage.getItem("workflow-session");
       const selectedSessionId = saved === null ? data.default_session_id : saved;
@@ -986,15 +985,6 @@ function WorkflowApp() {
   }, []);
 
   useEffect(() => { setMaterialsOpen(false); setPlanDetailsOpen(false); }, [model?.selectedSessionId, page]);
-  useEffect(() => {
-    if (!model?.connected) requestedItemKinds.current.clear();
-  }, [model?.connected]);
-  useEffect(() => {
-    if (page !== "items" || !["epic", "requirement"].includes(filter) || !model?.connected || stopped ||
-        model.global_busy || requestsPending.global || model.items_loads?.[filter] || requestedItemKinds.current.has(filter)) return;
-    requestedItemKinds.current.add(filter);
-    act("refresh", { kind: filter, force: false });
-  }, [page, filter, model?.connected, model?.global_busy, model?.items_loads, requestsPending.global, stopped]);
   useEffect(() => { setHandoffRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_handoffs?.length]);
   useEffect(() => { setReleaseRepository(null); }, [model?.selectedSessionId, model?.state?.workspace_release_history?.length]);
 
@@ -1202,7 +1192,7 @@ function WorkflowApp() {
   function renderItems() {
     const load = model.items_loads[filter];
     const sync = filter === "all" ? model.items_sync : load;
-    const unloadedRequirement = ["epic", "requirement"].includes(filter) && !load?.loaded;
+    const loaded = filter === "all" ? Object.values(model.items_loads).some(entry => entry.loaded) : load?.loaded;
     const projects = [...new Map(model.items.map(item => [item.project_id, {
       value: item.project_id, label: itemProjectLabel(item)
     }])).values()];
@@ -1230,16 +1220,17 @@ function WorkflowApp() {
     const snapshot = selectionMatches ? state?.snapshot : null;
     return h("div", { className: "card-stack" },
       h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, {
-        onClick: () => act("refresh", { kind: filter }), title: filter === "all" ? "刷新研发需求、任务和 Bug；保留已加载的业务、用户需求" : "重新读取当前分类",
+        onClick: () => act("refresh", { kind: filter }), title: filter === "all" ? "重新读取全部工作项" : "重新读取当前分类",
         disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表"),
         h(Button, { onClick: readItemById, disabled: selectionDisabled }, "按编号读取")) },
         sync && h(ItemsSyncStatus, { sync }),
-        h(Typography.Paragraph, { type: "secondary", style: { marginBottom: 12 } }, "业务、用户需求首次打开时读取，本次服务运行中复用。“全部”汇总已加载分类，刷新时仅更新研发需求、任务和 Bug。"),
         h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => { setFilter(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => {
           const entry = model.items_loads[value];
-          const count = ["epic", "requirement"].includes(value) && !entry?.loaded ?
-            entry?.status === "loading" ? "读取中" : entry?.status === "failed" ? "读取失败" : "未加载" : model.items.filter(item => item.kind === value).length;
-          return { value, label: `${label} ${count}` };
+          const count = model.items.filter(item => item.kind === value).length;
+          if (entry?.loaded || count) return { value, label: `${label} ${count}` };
+          if (entry?.status === "loading") return { value, label: `${label} 读取中` };
+          if (entry?.status === "failed") return { value, label: `${label} 读取失败` };
+          return { value, label };
         })] }),
           h(Space, { wrap: true },
             h(Select, { "aria-label": "筛选所属项目", value: itemProject, showSearch: true, optionFilterProp: "label", style: { width: 180 },
@@ -1251,8 +1242,8 @@ function WorkflowApp() {
           ...itemPagination, current: Math.min(itemPagination.current, Math.max(1, Math.ceil(rows.length / itemPagination.pageSize))),
           showSizeChanger: true, pageSizeOptions: [10, 20, 50], showTotal: total => `共 ${total} 项`,
           onChange: (current, pageSize) => setItemPagination({ current: pageSize === itemPagination.pageSize ? current : 1, pageSize }) },
-          scroll: { x: 700 }, locale: { emptyText: !model.connected ? "连接禅道后显示待处理工作项" : unloadedRequirement ?
-            load?.status === "failed" ? "读取失败，请点击“刷新列表”重试" : load?.status === "loading" ? "正在读取当前分类…" : "尚未读取当前分类" : "暂无符合条件的待处理工作项" }, rowClassName: "item-row",
+          scroll: { x: 700 }, locale: { emptyText: !model.connected ? "连接禅道后显示待处理工作项" : !loaded && sync?.status === "failed" ?
+            "读取失败，请点击“刷新列表”重试" : !loaded && sync?.status === "loading" ? "正在读取工作项…" : "暂无符合条件的待处理工作项" }, rowClassName: "item-row",
           rowSelection: { type: "checkbox", selectedRowKeys: selectedItems, preserveSelectedRowKeys: true, hideSelectAll: filter !== "task", onChange: chooseItems,
             getCheckboxProps: () => ({ disabled: selectionDisabled }) },
           onRow: record => ({ onClick: event => {

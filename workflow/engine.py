@@ -355,36 +355,48 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
 
     def refresh(self, reconnect=False, kind="all"):
         started, started_at, requests = monotonic(), timestamp(), 0
-        kinds = ("story", "task", "bug") if kind == "all" else (kind,)
-        label = "快速待办" if kind == "all" else KINDS[kind][0]
+        all_items = kind == "all"
+        assigned = ("story", "task", "bug")
+        requirements = ("epic", "requirement")
+        groups = (assigned, requirements) if all_items else ((kind,),)
+        pending = tuple(KINDS) if all_items else (kind,)
+        label = "全部工作项" if all_items else KINDS[kind][0]
         progress_lock = Lock()
+
+        def publish(status, message, kinds, group_only=False):
+            self.emit("items_sync", {"status": status, "message": message, "started_at": started_at,
+                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests,
+                                     "kinds": kinds, "group_only": group_only})
 
         def report(message):
             nonlocal requests
             with progress_lock:
                 requests += 1
-                self.emit("items_sync", {"status": "loading", "message": message, "started_at": started_at,
-                                         "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
-        self.emit("items_sync", {"status": "loading", "message": "正在连接禅道" if reconnect else f"正在刷新{label}",
-                                 "started_at": started_at, "elapsed_seconds": 0, "list_requests": 0, "kinds": kinds})
+                publish("loading", message, kinds)
+
+        publish("loading", "正在连接禅道" if reconnect else f"正在刷新{label}", pending)
+        known_project_names, total = {}, 0
         try:
             if reconnect:
                 with self.zentao_lock:
                     profile = self.zentao.login()
                 self.emit("connected", profile)
             with self.zentao_lock:
-                if kind in ("epic", "requirement"):
-                    items = self.zentao.list_requirements(kinds, on_progress=report)
-                else:
-                    items = self.zentao.list_assigned_items(kinds, on_progress=report)
-                items = self.zentao.resolve_item_projects(items, on_progress=report)
+                for kinds in groups:
+                    read_items = self.zentao.list_requirements if kinds[0] in requirements else self.zentao.list_assigned_items
+                    items = read_items(kinds, on_progress=report)
+                    items = self.zentao.resolve_item_projects(items, on_progress=report, known_project_names=known_project_names)
+                    self.emit("items_batch", {"kinds": kinds, "items": items})
+                    pending = tuple(item_kind for item_kind in pending if item_kind not in kinds)
+                    total += len(items)
+                    if all_items:
+                        publish("complete", f"已更新 {len(items)} 项工作项", kinds, group_only=True)
+                        known_project_names.update((project["id"], project["name"])
+                                                   for item in items for project in item["project_candidates"])
         except WorkflowError as error:
-            self.emit("items_sync", {"status": "failed", "message": str(error), "started_at": started_at,
-                                     "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
+            publish("failed", str(error), pending)
             raise
-        self.emit("items_batch", {"kinds": kinds, "items": items})
-        self.emit("items_sync", {"status": "complete", "message": f"已更新 {len(items)} 项工作项", "started_at": started_at,
-                                 "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
+        publish("complete", f"已更新 {total} 项工作项", () if all_items else groups[0])
 
     def collect(self, items, require_assignee=True):
         if self.state and not self.editable():

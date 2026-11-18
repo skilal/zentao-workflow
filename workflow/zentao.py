@@ -389,7 +389,7 @@ class ZentaoClient:
                                 "priority": item.get("pri", ""), "assigned_to": self.account})
         return records
 
-    def resolve_item_projects(self, items, on_progress=None):
+    def resolve_item_projects(self, items, on_progress=None, known_project_names=None):
         projects, detail_keys = [], {}
         for item in items:
             project = project_context(item, {"projects": item.get("project_candidates", [])})
@@ -409,7 +409,9 @@ class ZentaoClient:
             if key in details and not project["id"] and not project["candidates"]:
                 project = project_context(item, details[key])
             item.update(project_id=project["id"], project_name=project["name"], project_candidates=project["candidates"])
-        names = {project["id"]: project["name"] for item in items for project in item["project_candidates"] if project["name"]}
+        names = dict(known_project_names or {})
+        names.update((project["id"], project["name"]) for item in items
+                     for project in item["project_candidates"] if project["name"])
         missing = sorted({project["id"] for item in items for project in item["project_candidates"] if project["id"] not in names})
 
         def read_name(entry):

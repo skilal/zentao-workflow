@@ -255,12 +255,14 @@ class WebApplication:
                 self._publish("items", self.items)
                 self._publish("projects", {"project_partitions": self.projects()})
             elif kind == "items_sync":
-                self.items_sync = deepcopy(value)
+                if not value.get("group_only"):
+                    self.items_sync = deepcopy(value)
+                    self._publish("items_sync", self.items_sync)
                 for item_kind in value["kinds"]:
                     loaded = self.items_loads.get(item_kind, {}).get("loaded", False) or value["status"] == "complete"
                     self.items_loads[item_kind] = {**deepcopy(value), "loaded": loaded}
-                self._publish("items_sync", self.items_sync)
-                self._publish("items_loads", deepcopy(self.items_loads))
+                if value["kinds"]:
+                    self._publish("items_loads", deepcopy(self.items_loads))
             elif kind == "connected":
                 self.connected, self.profile = True, value
                 self._publish("connected", value)
@@ -761,15 +763,9 @@ class WebApplication:
             if action == "connect":
                 operation, arguments, affects = engine.connect, (), False
             elif action == "refresh":
-                item_kind, force = data.get("kind", "all"), data.get("force", True)
-                if not isinstance(item_kind, str) or item_kind not in {"all", *KINDS} or type(force) is not bool:
-                    raise WorkflowError("请选择有效的工作项分类和刷新方式。")
-                if item_kind in ("epic", "requirement") and not force and self.items_loads.get(item_kind, {}).get("loaded"):
-                    result = {"accepted": True, "cached": True, "request_id": request_id, "session_id": None}
-                    self.requests[request_key] = result
-                    while len(self.requests) > 512:
-                        self.requests.popitem(last=False)
-                    return result
+                item_kind = data.get("kind", "all")
+                if not isinstance(item_kind, str) or item_kind not in {"all", *KINDS}:
+                    raise WorkflowError("请选择有效的工作项分类。")
                 operation, arguments, affects = engine.refresh, (False, item_kind), False
             elif action == "new_conversation":
                 project_id = data.get("project_id", 0)
