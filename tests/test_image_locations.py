@@ -74,7 +74,8 @@ class ImageLocationChecks(TestCase):
                  '<p>复现<img src="?fileID=100"></p><p>期望<img src="?fileID=200"></p>'}
         with patch.object(self.client, "_fetch", side_effect=lambda path, **kwargs:
                           (b"simulated image", "image/png") if kwargs.get("binary") else
-                          {"api.php/v1/tasks/1": task, "api.php/v1/tasks/2": other}[path]):
+                          {"api.php/v1/tasks/1": task, "api.php/v1/tasks/2": other,
+                           "api.php/v1/stories/8": {"id": 8, "actions": []}}[path]):
             snapshot = self.client.collect_many([{"kind": "task", "id": 1}, {"kind": "task", "id": 2}], self.directory)
         stories = [source for source in snapshot["sources"] if source["kind"] == "story"]
         self.assertEqual(len(stories), 2)
@@ -113,6 +114,23 @@ class ImageLocationChecks(TestCase):
 
 
 class ImageLocationModelChecks(PerformanceFixture):
+    def test_comment_image_is_attached_to_model_and_keeps_comment_context(self):
+        path = self.root / "comment.png"
+        path.write_bytes(b"comment image content")
+        source = self.state["snapshot"]["sources"][0]
+        source["raw"] = {"actions": [{"id": 3, "actor": "张三", "date": "2026-11-18", "comment":
+            '<p>请按评论截图修改<img src="?fileID=200&amp;t=png">保存结果</p>'}]}
+        source["material_ids"] = [200]
+        self.state["snapshot"]["materials"] = [{"file_id": 200, "image": True, "path": str(path)}]
+        self.state["phase"] = "plan"
+        self.flow._start_turn("分析评论截图")
+        inputs = self.rpc.request.call_args.args[1]["input"]
+        self.assertIn({"type": "localImage", "path": str(path)}, inputs)
+        context = self.tools.call("task_context", {"include_materials": True})
+        source = context["snapshot"]["sources"][0]
+        self.assertIn("张三", source["content"])
+        self.assertEqual(source["image_locations"][0]["field"], "comment:3")
+
     def test_model_can_match_each_occurrence_after_image_content_deduplication(self):
         materials = []
         for file_id in (100, 200):

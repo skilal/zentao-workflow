@@ -6,7 +6,7 @@ from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from json import dumps, loads
 from pathlib import Path
-from re import sub
+from re import fullmatch, sub
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, HTTPRedirectHandler, Request, build_opener
@@ -66,20 +66,44 @@ def parse_description(value):
     return parser
 
 
+def image_reference(url):
+    parsed = urlparse(unescape(url))
+    query = parse_qs(parsed.query)
+    if "fileID" in query:
+        return identifier(query["fileID"][0]), query.get("t", ["png"])[0]
+    match = fullmatch(r"(?:.*/)?file-read-([0-9]+)\.([a-zA-Z0-9]+)", parsed.path)
+    return (int(match[1]), match[2]) if match else (None, "")
+
+
 def description_content(data):
     """保留每次图片引用在原字段正文中的位置，下载去重不影响引用。"""
     content, locations, parsers = [], [], []
-    for field in ("spec", "verify", "desc", "steps", "bugSteps"):
-        if not data.get(field):
+    fields = [(field, field, data.get(field)) for field in ("spec", "verify", "desc", "steps", "bugSteps")]
+    actions = data.get("actions", [])
+    if not isinstance(actions, (list, dict)):
+        raise WorkflowError("禅道评论动态格式不符合预期。")
+    for action in actions.values() if isinstance(actions, dict) else actions:
+        if not isinstance(action, dict) or not isinstance(action.get("comment", ""), str):
+            raise WorkflowError("禅道评论内容格式不符合预期。")
+        if not action.get("comment"):
             continue
-        parsed = parse_description(data[field])
+        action_id = identifier(action.get("id"))
+        actor = action.get("actor", "")
+        if isinstance(actor, dict):
+            actor = actor.get("realname") or actor.get("account", "")
+        label = f"评论 #{action_id} · {actor} · {action.get('date', '')}"
+        fields.append((f"comment:{action_id}", label, action["comment"]))
+    for field, label, value in fields:
+        if not value:
+            continue
+        parsed = parse_description(value)
         parsers.append(parsed)
         parts, previous = [], 0
         for index, (url, position) in enumerate(zip(parsed.images, parsed.image_positions), 1):
-            query = parse_qs(urlparse(url).query)
-            file_id = identifier(query["fileID"][0]) if "fileID" in query else None
+            file_id, _ = image_reference(url)
             reference = f"；fileID={file_id}" if file_id is not None else ""
-            marker = f"【正文图片：{field}:{index}{reference}】"
+            category = "评论图片" if field.startswith("comment:") else "正文图片"
+            marker = f"【{category}：{field}:{index}{reference}】"
             location = {"marker": marker, "field": field, "index": index,
                         "file_id": file_id,
                         "context_before": "".join(parsed.parts[:position]).strip()[-240:],
@@ -91,7 +115,7 @@ def description_content(data):
         parts.extend(parsed.parts[previous:])
         text = sub(r"\n[ \t]*\n+", "\n\n", "".join(parts)).strip()
         if text:
-            content.append(f"【{field}】\n{text}")
+            content.append(f"【{label}】\n{text}")
     return "\n\n".join(content), locations, parsers
 
 
@@ -404,10 +428,14 @@ class ZentaoClient:
     def collect(self, item, directory):
         return self.collect_many([item], directory)
 
-    def collect_many(self, items, directory):
+    def collect_many(self, items, directory, require_assignee=True):
         documents, projects = [], []
+        items = [dict(item) for item in items]
+        story_actions = {}
         for item in items:
-            primary = self.detail(item["kind"], item["id"])
+            primary = self.detail(item["kind"], item["id"], require_assignee=require_assignee)
+            if not require_assignee:
+                item.update(title=primary.get("title", primary.get("name", "")), status=primary.get("status", ""))
             project = project_context({**item, "projects": item.get("project_candidates", [])}, primary)
             if project["id"] and not project["name"]:
                 project["name"] = self._project_name(project["id"])
@@ -417,10 +445,12 @@ class ZentaoClient:
             story_id = identifier(primary.get("story"))
             from_bug = identifier(primary.get("fromBug"))
             if item["kind"] == "task" and not from_bug and story_id:
+                if story_id not in story_actions:
+                    story_actions[story_id] = self.detail("story", story_id, require_assignee=False).get("actions", [])
                 documents.append({"kind": "story", "origin": "task", "version": primary.get("storyVersion"),
                                   "data": {"id": story_id, "title": primary.get("storyTitle", ""),
                                            "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
-                                           "files": primary.get("storyFiles", [])}})
+                                           "files": primary.get("storyFiles", []), "actions": story_actions[story_id]}})
             elif item["kind"] in ("task", "bug") and story_id:
                 documents.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
             if item["kind"] == "task" and from_bug:
@@ -461,16 +491,15 @@ class ZentaoClient:
             for image_url in sorted(image_urls):
                 parsed_url = urlparse(urljoin(self.base, image_url))
                 if parsed_url.netloc != urlparse(self.base).netloc:
-                    blockers.append("正文包含站外图片，第一版不自动获取：" + image_url)
+                    blockers.append("正文或评论包含站外图片，不自动获取：" + image_url)
                     continue
-                query = parse_qs(parsed_url.query)
-                if "fileID" in query:
-                    file_id = identifier(query["fileID"][0])
+                file_id, extension = image_reference(image_url)
+                if file_id is not None:
                     source["material_ids"].append(file_id)
                     if file_id not in materials:
-                        materials[file_id] = self._download(file_id, query.get("t", ["png"])[0], "正文图片", directory)
+                        materials[file_id] = self._download(file_id, extension, "正文或评论图片", directory)
                 else:
-                    blockers.append("正文图片未包含可识别的禅道 fileID：" + image_url)
+                    blockers.append("正文或评论图片未包含可识别的禅道 fileID：" + image_url)
             source["material_ids"] = list(dict.fromkeys(source["material_ids"]))
             key = (source["kind"], source["id"], source.get("version"), source["content"], tuple(source["material_ids"]))
             if key not in seen:

@@ -2,9 +2,8 @@
 
 from hashlib import sha256
 from json import dumps
-from urllib.parse import parse_qs, urlparse
 
-from workflow.zentao import description_content, identifier, parse_description
+from workflow.zentao import description_content, identifier, image_reference
 
 
 def normalized_sources(sources):
@@ -22,11 +21,12 @@ def normalized_sources(sources):
             if isinstance(files, dict):
                 files = files.values()
             material_ids = [identifier(file.get("id")) for file in files]
-            for field in ("spec", "verify", "desc", "steps", "bugSteps"):
-                for url in parse_description(raw.get(field)).images:
-                    query = parse_qs(urlparse(url).query)
-                    if "fileID" in query:
-                        material_ids.append(identifier(query["fileID"][0]))
+            _, _, parsers = description_content(raw)
+            for parser in parsers:
+                for url in parser.images:
+                    file_id, _ = image_reference(url)
+                    if file_id is not None:
+                        material_ids.append(file_id)
             source["material_ids"] = list(dict.fromkeys(material_ids))
         result.append(source)
     return result
@@ -40,7 +40,7 @@ def requirement_context(state):
     for source in sources:
         if not source.get("image_locations"):
             continue
-        source["image_location_note"] = ("正文图片标记保留原文位置；结合所在字段、章节和前后文字判断图片含义，"
+        source["image_location_note"] = ("正文和评论图片标记保留原文位置；结合所在字段、评论作者、时间、章节和前后文字判断图片含义，"
                                          "不要将复现步骤、实际结果和期望结果中的截图混用。"
                                          "每次出现均为独立引用；按 path 对应 image_references，图片内容可能已去重。"
                                          "没有 path 或附件存在 issue 时，不代表图片已读取。")

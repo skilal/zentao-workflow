@@ -31,6 +31,15 @@ class TaskCollectionChecks(TestCase):
                      "desc": "完成示例查询功能", "story": 2872, "storyTitle": "示例关联需求",
                      "storyVersion": 1, "latestStoryVersion": 2, "storySpec": "<p>支持范围查询</p>",
                      "storyVerify": "查询结果符合条件", "storyFiles": [], "files": [], "fromBug": 0}
+        # 这些用例关注任务绑定版本；当前需求评论的真实请求由评论用例单独覆盖。
+        detail = self.client.detail
+        def read_detail(kind, item_id, require_assignee=True):
+            if kind == "story" and not require_assignee and not self.task["fromBug"] and item_id in (2872, 2873):
+                return {"id": item_id, "actions": []}
+            return detail(kind, item_id, require_assignee=require_assignee)
+        mocked = patch.object(self.client, "detail", side_effect=read_detail)
+        mocked.start()
+        self.addCleanup(mocked.stop)
 
     def test_task_uses_embedded_version_and_downloads_story_image(self):
         self.task["storySpec"] += '<img src="/index.php?m=file&amp;f=read&amp;t=png&amp;fileID=27881">'

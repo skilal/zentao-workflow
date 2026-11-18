@@ -830,6 +830,25 @@ function WorkflowApp() {
         finally { setRequestsPending(previous => { const next = { ...previous }; delete next[entry.id]; return next; }); }
       } });
   }
+  function readItemById() {
+    let kind = "task", itemId;
+    const dialog = modal.confirm({ title: "按编号读取工作项", okText: "读取资料", cancelText: "取消", icon: null,
+      okButtonProps: { disabled: true },
+      content: h(Space, { direction: "vertical", style: { width: "100%" } },
+        h(Select, { "aria-label": "工作项类型", defaultValue: kind, style: { width: "100%" },
+          options: Object.entries(TYPE_NAMES).map(([value, label]) => ({ value, label })), onChange: value => { kind = value; } }),
+        h(InputNumber, { "aria-label": "工作项编号", min: 1, precision: 0, placeholder: "工作项编号", style: { width: "100%" },
+          onChange: value => { itemId = value; dialog.update({ okButtonProps: { disabled: !Number.isInteger(value) || value <= 0 } }); } }),
+        h(Typography.Text, { type: "secondary" }, "支持已完成、已关闭或已转交的工作项，按当前账号权限读取。")),
+      onOk: async () => {
+        const result = await act("collect_by_id", { items: [{ kind, id: itemId }] });
+        if (!result) throw new Error("读取操作未提交");
+        const keys = [`${kind}:${itemId}`];
+        selectionRequest.current = keys[0];
+        setSelectedItems(keys);
+        changeDraft({ selected_items: keys });
+      } });
+  }
   function changeProjectCollapse(keys) {
     setCollapsedProjects(keys);
     localStorage.setItem("workflow-collapsed-projects", JSON.stringify(keys));
@@ -1051,8 +1070,8 @@ function WorkflowApp() {
   async function act(action, data = {}, targetId = modelRef.current.selectedSessionId, revision) {
     const current = modelRef.current;
     const id = ["connect", "refresh", "settings", "new_conversation"].includes(action) ? null : targetId;
-    const previewId = !id && ["collect", "plan"].includes(action) ? current.preview?.preview_id : null;
-    const pendingKey = id || previewId || (["collect", "new_conversation"].includes(action) ? "new" : "global");
+    const previewId = !id && ["collect", "collect_by_id", "refresh_materials", "plan"].includes(action) ? current.preview?.preview_id : null;
+    const pendingKey = id || previewId || (["collect", "collect_by_id", "new_conversation"].includes(action) ? "new" : "global");
     const epoch = viewEpoch.current;
     setRequestsPending(previous => ({ ...previous, [pendingKey]: action }));
     try {
@@ -1060,13 +1079,13 @@ function WorkflowApp() {
         headers: { "Content-Type": "application/json", "X-Workflow-Token": csrf.current },
         body: JSON.stringify({ action, data, request_id: crypto.randomUUID(), session_id: id,
           preview_id: previewId, revision: revision ?? (previewId ? current.preview.revision : current.sessions[id]?.revision) }) }).then(readResponse);
-      if (["collect", "new_conversation"].includes(action) && !id && epoch === viewEpoch.current) {
+      if (["collect", "collect_by_id", "new_conversation"].includes(action) && !id && epoch === viewEpoch.current) {
         if (!previewId) changeDraft({ codex: { model: current.settings.model, reasoning_effort: current.settings.reasoning_effort } });
         lastSession.current = result.preview_id;
         applyModel({ ...modelRef.current, preview: { preview_id: result.preview_id, event_cursor: -1 } });
         const payload = await fetch(`/api/preview?id=${encodeURIComponent(result.preview_id)}`, { cache: "no-store" }).then(readResponse);
         if (epoch === viewEpoch.current) receivePreview(payload);
-      } else if (["collect", "new_conversation"].includes(action) && !id && !previewId) {
+      } else if (["collect", "collect_by_id", "new_conversation"].includes(action) && !id && !previewId) {
         releasePreview(result.preview_id);
       } else if (action === "plan" && previewId && epoch === viewEpoch.current) {
         lastSession.current = result.session_id;
@@ -1212,7 +1231,8 @@ function WorkflowApp() {
     return h("div", { className: "card-stack" },
       h(CardBox, { title: "待处理工作项", extra: h(Space, null, h(Typography.Text, { type: "secondary" }, `共 ${model.items.length} 项`), h(Button, {
         onClick: () => act("refresh", { kind: filter }), title: filter === "all" ? "刷新研发需求、任务和 Bug；保留已加载的业务、用户需求" : "重新读取当前分类",
-        disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表")) },
+        disabled: busy || !model.connected, loading: model.busy === "refresh" }, "刷新列表"),
+        h(Button, { onClick: readItemById, disabled: selectionDisabled }, "按编号读取")) },
         sync && h(ItemsSyncStatus, { sync }),
         h(Typography.Paragraph, { type: "secondary", style: { marginBottom: 12 } }, "业务、用户需求首次打开时读取，本次服务运行中复用。“全部”汇总已加载分类，刷新时仅更新研发需求、任务和 Bug。"),
         h("div", { className: "table-tools" }, h(Radio.Group, { value: filter, onChange: event => { setFilter(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, optionType: "button", options: [{ label: "全部", value: "all" }, ...Object.entries(TYPE_NAMES).map(([value, label]) => {
@@ -1241,15 +1261,17 @@ function WorkflowApp() {
             chooseItems(selectedItems.includes(key) ? selectedItems.filter(value => value !== key) : [...selectedItems, key]);
           } }) }),
         h("div", { className: "data-foot" }, h("span", { className: "muted" }, "仅显示直接指派给当前登录账号的待处理工作项"),
-          h(Space, null, (sending === "collect" || model.busy === "collect") && h(Spin, { size: "small" }),
+          h(Space, null, (["collect", "collect_by_id"].includes(sending) || ["collect", "collect_by_id"].includes(model.busy)) && h(Spin, { size: "small" }),
             h("span", { className: "muted" }, selectedItems.length ? `已选 ${selectedItems.length} 项 · 选中后自动读取资料` : "可多选同一项目的任务联合开发；需求和 Bug 单选")))),
-      h(CardBox, { title: snapshot ? h(Space, { wrap: true }, "工作项资料", ...sessionItems(state).map(item => h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id}`))) : "工作项资料" },
+      h(CardBox, { title: snapshot ? h(Space, { wrap: true }, "工作项资料", ...sessionItems(state).map(item => h(Tag, { key: itemKey(item), color: "blue" }, `${TYPE_NAMES[item.kind]} #${item.id}`))) : "工作项资料",
+        extra: snapshot && sessionItems(state).length > 0 && h(Button, { disabled: workspaceBusy || !model.connected || model.working || Boolean(state.pending) || Boolean(state.workspace_handoff_request) ||
+          !(state.can_edit || state.phase === "complete" || stage === "已暂停"), onClick: () => act("refresh_materials") }, "刷新正文与评论") },
         snapshot && state.item === null && h(Typography.Paragraph, { type: "secondary" }, "尚未关联工作项，可直接输入需求并开始计划，也可勾选工作项读取资料。"),
         stage === "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "资料读取失败", description: state.error,
-          action: h(Button, { disabled: busy || !model.connected, onClick: () => act("collect", { items: selectedItems.map(key => {
+          action: h(Button, { disabled: busy || !model.connected, onClick: () => act(state.collected_by_id ? "collect_by_id" : "collect", { items: selectedItems.map(key => {
             const [kind, id] = key.split(":"); return { kind, id: Number(id) };
           }) }) }, "重新读取资料"), style: { marginBottom: 16 } }),
-        !snapshot ? h("div", { className: "empty-area" }, h(Empty, { description: model.busy === "collect" || sending === "collect" ? "正在读取所选工作项的完整资料…" : "勾选工作项后自动读取描述、图片、附件及关联需求" })) :
+        !snapshot ? h("div", { className: "empty-area" }, h(Empty, { description: ["collect", "collect_by_id"].includes(model.busy) || ["collect", "collect_by_id"].includes(sending) ? "正在读取所选工作项的完整资料…" : "勾选工作项后自动读取描述、图片、附件及关联需求" })) :
           renderWorkItemMaterials(snapshot, model.preview ? { preview_id: state.id } : { session: state.id })),
       snapshot && renderBranches());
   }
@@ -2051,6 +2073,8 @@ function WorkflowApp() {
       onSave: selection => act("configure_codex", selection, codexEditor.sessionId, codexEditor.revision),
       onClose: () => setCodexEditor(null) }),
     h(Drawer, { title: "工作项资料", "aria-label": "工作项资料", placement: "right", width: "min(960px, 100vw)", rootClassName: "materials-drawer",
+      extra: hasWorkItemMaterials && h(Button, { disabled: workspaceBusy || !model.connected || model.working || Boolean(state.pending) || Boolean(state.workspace_handoff_request) ||
+        !(state.can_edit || state.phase === "complete" || stage === "已暂停"), onClick: () => act("refresh_materials") }, "刷新正文与评论"),
       open: Boolean(materialsOpen && hasWorkItemMaterials), onClose: () => setMaterialsOpen(false), destroyOnClose: true },
       materialsOpen && hasWorkItemMaterials && h("div", { id: "work-item-materials" },
         h(Typography.Paragraph, { type: "secondary" }, "本会话资料快照"),

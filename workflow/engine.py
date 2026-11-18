@@ -10,7 +10,7 @@ from json import JSONDecodeError, dumps, loads
 from pathlib import Path
 from re import IGNORECASE, fullmatch, search
 from threading import Lock, RLock
-from time import monotonic
+from time import monotonic, time_ns
 
 from workflow.approvals import is_workflow_tool_call, mcp_approval_question
 from workflow.artifacts import ARTIFACT_TOOLS, collect_artifacts
@@ -383,7 +383,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self.emit("items_sync", {"status": "complete", "message": f"已更新 {len(items)} 项工作项", "started_at": started_at,
                                  "elapsed_seconds": round(monotonic() - started, 1), "list_requests": requests, "kinds": kinds})
 
-    def collect(self, items):
+    def collect(self, items, require_assignee=True):
         if self.state and not self.editable():
             raise WorkflowError("开始计划后不能改变工作项，请新建会话。")
         if not self.state:
@@ -392,12 +392,16 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                     if item is not None}
         if previous != {(item["kind"], item["id"]) for item in items}:
             self.state.pop("project_override", None)
-        self.state.update(item=items[0], items=items, stage="资料读取中", error="")
+        self.state.update(item=items[0], items=items, stage="资料读取中", error="", collected_by_id=not require_assignee)
         self.state.pop("snapshot", None)
         self.save()
         try:
             with self.zentao_lock:
-                self.state["snapshot"] = self.zentao.collect_many(items, self.store.directory(self.state["id"]))
+                directory = self.store.directory(self.state["id"])
+                self.state["snapshot"] = (self.zentao.collect_many(items, directory) if require_assignee else
+                                          self.zentao.collect_many(items, directory, require_assignee=False))
+            self.state.update(item=self.state["snapshot"]["items"][0], items=self.state["snapshot"]["items"],
+                              collected_by_id=not require_assignee)
             self.state["project"] = self.state["snapshot"]["project"]
             if "project_override" in self.state:
                 assign_project(self.state, self.state["project_override"])
@@ -408,6 +412,21 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             self.state["stage"] = "资料读取失败"
             self.save()
             raise
+
+    def refresh_materials(self):
+        state = self.state
+        if not state.get("items") or state.get("pending") or not (
+                self.editable() or state["phase"] == "complete" or state["stage"] == "已暂停"):
+            raise WorkflowError("请先暂停当前操作并处理待答问题，再刷新禅道资料。")
+        # 新下载使用独立目录；读取失败不会覆盖当前快照使用的图片。
+        directory = self.store.directory(state["id"]) / "attachments" / ("zentao-" + str(time_ns()))
+        with self.zentao_lock:
+            snapshot = self.zentao.collect_many(state["items"], directory, require_assignee=False)
+        if "project_override" in state:
+            snapshot["project"] = deepcopy(state["project_override"])
+        state.update(snapshot=snapshot, error="")
+        self.save()
+        self.note("系统", "已刷新禅道正文、评论、图片及关联资料；后续消息将使用最新资料。")
 
     def editable(self):
         state = self.state

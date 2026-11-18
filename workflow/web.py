@@ -717,11 +717,11 @@ class WebApplication:
                 if any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
                     raise WorkflowError("会话模型配置已经固定，不能通过重复请求修改。")
                 return {"accepted": True, "duplicate": True, "session_id": created_id, "request_id": request_id}
-            if preview_id and action not in {"collect", "plan"}:
+            if preview_id and action not in {"collect", "collect_by_id", "refresh_materials", "plan"}:
                 raise WorkflowError("当前查看资料尚未创建会话。")
             global_action = action in {"connect", "refresh", "settings"}
             runtime = (self.sessions.get_preview(preview_id) if preview_id else
-                       None if global_action or action == "new_conversation" or (action == "collect" and not session_id)
+                       None if global_action or action == "new_conversation" or (action in {"collect", "collect_by_id"} and not session_id)
                        else self.sessions.get(session_id))
             engine = runtime.engine if runtime else self.sessions.connection
             state = engine.state
@@ -732,7 +732,7 @@ class WebApplication:
             if self.busy == "settings" or (global_action and self.busy):
                 raise WorkflowError("全局操作尚未完成，请等待。")
             if runtime:
-                if action not in RELEASE_ACTIONS | {"pause", "delete_session"}:
+                if action not in RELEASE_ACTIONS | {"pause", "delete_session", "refresh_materials"}:
                     require_attached_workspaces(state)
                 if state.get("workspace_handoff_request") and action not in {"preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff"}:
                     raise WorkflowError("请先完成或取消本地开发目录交接，再执行其他操作。")
@@ -744,7 +744,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "detect_repositories", "choose_repositories", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "detect_repositories", "choose_repositories", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "collect_by_id", "refresh_materials", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if action in RELEASE_ACTIONS and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
@@ -755,7 +755,7 @@ class WebApplication:
                     saved = state.get("codex")
                     if action != "configure_codex" and saved and any(key in data and data[key] != saved[key] for key in ("model", "reasoning_effort")):
                         raise WorkflowError("不能通过当前操作修改会话模型配置，请使用“更改模型”。")
-                    if not saved and action not in RELEASE_ACTIONS | {"collect", "pause", "delete_session", "configure_codex", "plan"}:
+                    if not saved and action not in RELEASE_ACTIONS | {"collect", "collect_by_id", "refresh_materials", "pause", "delete_session", "configure_codex", "plan"}:
                         raise WorkflowError("该历史会话尚未保存模型配置，请先选择模型和推理强度。")
             affects, control = True, action == "pause"
             if action == "connect":
@@ -784,20 +784,23 @@ class WebApplication:
                 if project:
                     assign_project(engine.state, project)
                 operation, arguments = engine.save, ()
-            elif action == "collect":
+            elif action == "refresh_materials":
+                operation, arguments = engine.refresh_materials, ()
+            elif action in {"collect", "collect_by_id"}:
                 choices = data.get("items")
-                if not isinstance(choices, list) or not choices:
+                by_id = action == "collect_by_id"
+                if not isinstance(choices, list) or not choices or (by_id and len(choices) != 1):
                     raise WorkflowError("请选择至少一个工作项。")
                 available = {(item["kind"], item["id"]): item for item in self.items}
                 selected, seen = [], set()
                 for choice in choices:
                     if (not isinstance(choice, dict) or not isinstance(choice.get("kind"), str) or choice["kind"] not in KINDS
-                            or type(choice.get("id")) is not int):
+                            or type(choice.get("id")) is not int or choice["id"] <= 0):
                         raise WorkflowError("工作项类型或编号无效。")
                     key = (choice["kind"], choice["id"])
-                    if key not in available or key in seen:
+                    if (not by_id and key not in available) or key in seen:
                         raise WorkflowError("请从当前登录账号的待处理列表中选择不重复的工作项。")
-                    selected.append(deepcopy(available[key]))
+                    selected.append({"kind": choice["kind"], "id": choice["id"], "title": ""} if by_id else deepcopy(available[key]))
                     seen.add(key)
                 if len(selected) > 1 and any(item["kind"] != "task" for item in selected):
                     raise WorkflowError("仅任务支持多选联合开发，需求和 Bug 请单独选择。")
@@ -808,7 +811,7 @@ class WebApplication:
                     engine = runtime.engine
                     preview_id = engine.state["id"]
                     self.emit(preview_id, "state", engine.state)
-                operation, arguments = engine.collect, (selected,)
+                operation, arguments = engine.collect, (selected, False) if by_id else (selected,)
             elif action in {"plan", "edit_branches"}:
                 supplement = data.get("supplement", "")
                 if not isinstance(supplement, str) or "selections" in data:

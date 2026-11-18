@@ -55,7 +55,7 @@ def prompt_catalog(settings):
                        "thread_rule": "分支专用规则" if key == "branch" else "通用工作流规则",
                        "templates": variants, "fragments": fragments, "notes": notes})
 
-    stage("collect", "资料读取", "读取人工选择工作项的正文、图片及附件。", [], [], controller=True,
+    stage("collect", "资料读取", "读取人工选择工作项的正文、评论、图片及附件；支持按编号读取已完成工作项和手动刷新会话资料。", [], [], controller=True,
           notes="由控制器执行，无独立模型提示词。模型回合中的资料读取指令见通用规则。")
     stage("branch", "分支识别", "结合项目地名和匹配分支的 Git 记录，排除功能分支，直接选择一条最新开发主线。", [
         {"id": "branch_thread", "title": "分支线程指令", "layer": "线程级指令", "condition": "新建或恢复分支识别线程",
