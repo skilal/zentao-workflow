@@ -51,7 +51,9 @@ button, input, textarea { font: inherit; }
 .compile-current .question:last-child { margin-bottom: 0; }
 .compile-history { margin-top: 14px; }
 .table-tools { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; flex-wrap: wrap; }
-.table-title { color: #25354b; font-weight: 500; line-height: 1.7; }
+.work-items-table .ant-table-pagination.ant-pagination { margin-block: 0 8px; }
+.work-items-table .ant-table.ant-table-small .ant-table-tbody > .item-row > td { padding-block: 4px; }
+.item-row .table-title { color: #25354b; font-weight: 500; }
 .item-row { cursor: pointer; }
 .data-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-top: 17px; border-top: 1px solid #f0f2f5; margin-top: 14px; }
 .muted { color: #8a94a6; font-size: 12px; }
@@ -206,7 +208,7 @@ button, input, textarea { font: inherit; }
 .project-info-actions .ant-btn, .project-info-confirm { height: auto; padding: 6px 10px; white-space: normal; font-size: 12px; }
 .project-info-confirm { margin-top: 12px; }
 .session-panel { position: sticky; top: calc(var(--app-header-height) + 18px); display: flex; flex-direction: column; min-width: 0;
-  max-height: max(280px, calc(100dvh - var(--app-header-height) - 116px)); }
+  max-height: max(280px, calc(100dvh - var(--app-header-height) - 30px)); }
 .session-panel > .ant-card-head { flex: none; min-height: 38px; padding-inline: 10px; }
 .session-panel > .ant-card-head .ant-typography { font-size: 12px; }
 .session-panel > .ant-card-body { display: flex; flex-direction: column; gap: 8px; min-height: 0; padding: 8px 10px; }
@@ -264,7 +266,7 @@ button, input, textarea { font: inherit; }
 @media (max-width: 1000px) {
   .session-workspace { grid-template-columns: minmax(0, 1fr); }
   .session-panel { position: static; max-height: none; }
-  .session-list { max-height: clamp(260px, 42dvh, 440px); }
+  .session-list { max-height: max(260px, 70dvh); }
 }
 @container (max-width: 1000px) { .repository-grid { grid-template-columns: 1fr; } }
 @media (max-width: 1100px) { .repository-grid { grid-template-columns: 1fr; } .app-header { padding: 0 18px; } .page-content { padding: 20px 18px; } }

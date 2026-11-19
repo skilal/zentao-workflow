@@ -55,19 +55,26 @@ class CommentCollectionChecks(TestCase):
         self.assertIn("李四", source["content"])
         self.assertEqual(len(snapshot["materials"]), 1)
 
-    def test_related_story_keeps_bound_version_body_and_reads_current_comments_once(self):
-        task = {"id": 7, "assignedTo": "测试账号", "story": 9, "storyVersion": 1,
+    def test_related_requirement_uses_execution_type_and_reads_current_comments_once(self):
+        self.client.settings["page_size"] = 1
+        task = {"id": 7, "assignedTo": "测试账号", "execution": 31, "story": 9, "storyVersion": 1,
                 "storySpec": "任务绑定的旧版需求正文"}
-        story = {"id": 9, "spec": "当前新版正文不应替换旧版", "actions": [self.comment]}
+        first_page = {"total": 2, "stories": [{"id": 10, "type": "epic"}]}
+        second_page = {"total": 2, "stories": [{"id": 9, "type": "requirement"}]}
+        story = {"id": 9, "type": "requirement", "spec": "当前新版正文不应替换旧版", "actions": [self.comment]}
         other = {**task, "id": 8}
-        with patch.object(self.client, "_fetch", side_effect=[task, story, other, (b"image", "image/png")]) as fetch:
+        with patch.object(self.client, "_fetch", side_effect=[task, first_page, second_page, story, other, (b"image", "image/png")]) as fetch:
             snapshot = self.client.collect_many([{"kind": "task", "id": 7}, {"kind": "task", "id": 8}], self.directory)
-        related, = [source for source in snapshot["sources"] if source["kind"] == "story"]
+        related, = [source for source in snapshot["sources"] if source["kind"] == "requirement"]
         self.assertEqual(related["version"], 1)
         self.assertIn("任务绑定的旧版需求正文", related["content"])
         self.assertIn("修改保存逻辑", related["content"])
         self.assertNotIn("当前新版正文", related["content"])
-        self.assertEqual([call.args[0] for call in fetch.call_args_list].count("api.php/v1/stories/9"), 1)
+        self.assertEqual([call.args[0] for call in fetch.call_args_list], [
+            "api.php/v1/tasks/7",
+            "api.php/v1/executions/31/stories?storyType=all&status=all&order=id_desc&limit=1&page=1",
+            "api.php/v1/executions/31/stories?storyType=all&status=all&order=id_desc&limit=1&page=2",
+            "api.php/v1/stories/9?type=requirement", "api.php/v1/tasks/8", "api.php/v1/files/21"])
 
     def test_read_by_id_allows_completed_or_reassigned_item_only_when_explicit(self):
         for kind in ("task", "bug", "story", "requirement", "epic"):
@@ -81,11 +88,25 @@ class CommentCollectionChecks(TestCase):
                 self.assertEqual(snapshot["items"][0]["title"], "已完成工作项")
 
     def test_related_comment_permission_failure_stops_without_retry(self):
-        task = {"id": 7, "assignedTo": "测试账号", "story": 9, "storyVersion": 1, "storySpec": "任务关联正文"}
-        with patch.object(self.client, "_fetch", side_effect=[task, WorkflowError("关联需求无权读取")]) as fetch:
+        task = {"id": 7, "assignedTo": "测试账号", "execution": 31,
+                "story": 9, "storyVersion": 1, "storySpec": "任务关联正文"}
+        stories = {"total": 1, "stories": [{"id": 9, "type": "epic"}]}
+        with patch.object(self.client, "_fetch", side_effect=[task, stories, WorkflowError("关联需求无权读取")]) as fetch:
             with self.assertRaisesRegex(WorkflowError, "关联需求无权读取"):
                 self.client.collect({"kind": "task", "id": 7}, self.directory)
-        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(fetch.call_args.args, ("api.php/v1/stories/9?type=epic",))
+
+    def test_missing_related_requirement_type_stops_before_detail(self):
+        task = {"id": 7, "assignedTo": "测试账号", "execution": 31, "story": 9}
+        for stories, reason in (
+                ([], "未返回关联需求 #9"),
+                ([{"id": 9, "type": "未知类型"}], "类型不符合预期")):
+            with self.subTest(stories=stories), patch.object(self.client, "_fetch", side_effect=[
+                    task, {"total": len(stories), "stories": stories}]) as fetch:
+                with self.assertRaisesRegex(WorkflowError, reason):
+                    self.client.collect({"kind": "task", "id": 7}, self.directory)
+                self.assertEqual(fetch.call_count, 2)
 
     def test_invalid_comments_stop_and_inaccessible_images_remain_blockers(self):
         for actions in ("错误协议", ["错误记录"], [{"comment": {"text": "错误内容"}}]):

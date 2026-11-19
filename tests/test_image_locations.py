@@ -68,13 +68,15 @@ class ImageLocationChecks(TestCase):
         self.assertEqual(snapshot["blockers"], [])
 
     def test_different_story_image_positions_are_not_merged(self):
-        task = {"id": 1, "assignedTo": "测试账号", "story": 8, "storyVersion": 1,
+        task = {"id": 1, "assignedTo": "测试账号", "execution": 31, "story": 8, "storyVersion": 1,
                 "storySpec": '<p>复现<img src="?fileID=200"></p><p>期望<img src="?fileID=100"></p>'}
         other = {**task, "id": 2, "storySpec":
                  '<p>复现<img src="?fileID=100"></p><p>期望<img src="?fileID=200"></p>'}
         with patch.object(self.client, "_fetch", side_effect=lambda path, **kwargs:
                           (b"simulated image", "image/png") if kwargs.get("binary") else
                           {"api.php/v1/tasks/1": task, "api.php/v1/tasks/2": other,
+                           "api.php/v1/executions/31/stories?storyType=all&status=all&order=id_desc&limit=50&page=1":
+                               {"total": 1, "stories": [{"id": 8, "type": "story"}]},
                            "api.php/v1/stories/8": {"id": 8, "actions": []}}[path]):
             snapshot = self.client.collect_many([{"kind": "task", "id": 1}, {"kind": "task", "id": 2}], self.directory)
         stories = [source for source in snapshot["sources"] if source["kind"] == "story"]

@@ -325,7 +325,7 @@ class ZentaoClient:
             items, total = data.get(key), data.get("total")
             if not isinstance(items, list) or type(total) is not int or total < 0:
                 raise WorkflowError("禅道产品或需求列表格式不符合预期，已停止。")
-            if key == "stories":
+            if key == "stories" and "type" in parameters:
                 kind = parameters["type"]
                 allowed_types = REQUIREMENT_KINDS[REQUIREMENT_KINDS.index(kind):]
                 if any(item.get("type") not in allowed_types for item in items):
@@ -479,7 +479,7 @@ class ZentaoClient:
     def collect_many(self, items, directory, require_assignee=True):
         documents, projects = [], []
         items = [dict(item) for item in items]
-        story_actions = {}
+        execution_stories, related_stories = {}, {}
         for item in items:
             primary = self.detail(item["kind"], item["id"], require_assignee=require_assignee)
             if not require_assignee:
@@ -493,12 +493,29 @@ class ZentaoClient:
             story_id = identifier(primary.get("story"))
             from_bug = identifier(primary.get("fromBug"))
             if item["kind"] == "task" and not from_bug and story_id:
-                if story_id not in story_actions:
-                    story_actions[story_id] = self.detail("story", story_id, require_assignee=False).get("actions", [])
-                documents.append({"kind": "story", "origin": "task", "version": primary.get("storyVersion"),
+                if story_id not in related_stories:
+                    execution_id = identifier(primary.get("execution"))
+                    if execution_id <= 0:
+                        raise WorkflowError(f"任务 #{item['id']} 缺少执行编号，无法确认关联需求 #{story_id} 的类型。")
+                    if execution_id not in execution_stories:
+                        execution_stories[execution_id] = ({}, self._pages(
+                            f"api.php/v1/executions/{execution_id}/stories", "stories",
+                            {"storyType": "all", "status": "all", "order": "id_desc"}))
+                    types, stories = execution_stories[execution_id]
+                    while story_id not in types:
+                        story = next(stories, None)
+                        if story is None:
+                            raise WorkflowError(f"执行 #{execution_id} 未返回关联需求 #{story_id}，无法确认需求类型。")
+                        types[identifier(story["id"])] = story.get("type")
+                    kind = types[story_id]
+                    if kind not in REQUIREMENT_KINDS:
+                        raise WorkflowError(f"关联需求 #{story_id} 的类型不符合预期。")
+                    related_stories[story_id] = (kind, self.detail(kind, story_id, require_assignee=False).get("actions", []))
+                kind, actions = related_stories[story_id]
+                documents.append({"kind": kind, "origin": "task", "version": primary.get("storyVersion"),
                                   "data": {"id": story_id, "title": primary.get("storyTitle", ""),
                                            "spec": primary.get("storySpec", ""), "verify": primary.get("storyVerify", ""),
-                                           "files": primary.get("storyFiles", []), "actions": story_actions[story_id]}})
+                                           "files": primary.get("storyFiles", []), "actions": actions}})
             elif item["kind"] in ("task", "bug") and story_id:
                 documents.append({"kind": "story", "data": self.detail("story", story_id, require_assignee=False)})
             if item["kind"] == "task" and from_bug:

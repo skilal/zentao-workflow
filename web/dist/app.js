@@ -579,7 +579,7 @@ function WorkflowApp() {
   const [filter, setFilter] = useState("all");
   const [query, setQuery] = useState("");
   const [itemProject, setItemProject] = useState("all");
-  const [itemPagination, setItemPagination] = useState({ current: 1, pageSize: 10 });
+  const [itemPagination, setItemPagination] = useState({ current: 1, pageSize: 30 });
   const [draft, setDraft] = useState(emptyDraft());
   const draftRef = useRef(draft);
   const imageInput = useRef(null);
@@ -1224,7 +1224,8 @@ function WorkflowApp() {
     }])).values()];
     const rows = model.items.filter(item => (filter === "all" || item.kind === filter) &&
       (itemProject === "all" || item.project_id === itemProject) &&
-      (!query.trim() || `${item.id} ${item.title}`.toLowerCase().includes(query.trim().toLowerCase())));
+      (!query.trim() || `${item.id} ${item.title}`.toLowerCase().includes(query.trim().toLowerCase())))
+      .sort((left, right) => right.id - left.id);
     const canCollect = !state || state.can_edit;
     const selectionDisabled = busy || !canCollect || !model.connected;
     function chooseItems(keys) {
@@ -1238,9 +1239,9 @@ function WorkflowApp() {
     const columns = [
       { title: "类型", dataIndex: "kind", width: 110, render: typeTag },
       { title: "编号", dataIndex: "id", width: 90, render: value => h(Typography.Text, { code: true }, `#${value}`) },
-      { title: "标题", dataIndex: "title", render: value => h("span", { className: "table-title" }, value) },
+      { title: "标题", dataIndex: "title", ellipsis: true, className: "table-title" },
       { title: "状态", dataIndex: "status", width: 100, render: value => h(Tag, null, STATUS_NAMES[value] || value) },
-      { title: "所属项目", dataIndex: "project", width: 120, render: (_, item) => itemProjectLabel(item) },
+      { title: "所属项目", dataIndex: "project", width: 120, ellipsis: true, render: (_, item) => itemProjectLabel(item) },
       { title: "优先级", dataIndex: "priority", width: 80, render: value => value ? `P${value}` : "—" }
     ];
     const snapshot = selectionMatches ? state?.snapshot : null;
@@ -1264,9 +1265,9 @@ function WorkflowApp() {
               onChange: value => { setItemProject(value); setItemPagination(previous => ({ ...previous, current: 1 })); } }),
             h(Input.Search, { placeholder: "搜索编号或标题", allowClear: true, value: query,
               onChange: event => { setQuery(event.target.value); setItemPagination(previous => ({ ...previous, current: 1 })); }, style: { width: 260 } }))),
-        h(Table, { columns, dataSource: rows, rowKey: itemKey, size: "middle", pagination: {
+        h(Table, { className: "work-items-table", columns, dataSource: rows, rowKey: itemKey, size: "small", pagination: {
           ...itemPagination, current: Math.min(itemPagination.current, Math.max(1, Math.ceil(rows.length / itemPagination.pageSize))),
-          showSizeChanger: true, pageSizeOptions: [10, 20, 50], showTotal: total => `共 ${total} 项`,
+          position: ["topRight"], showSizeChanger: true, pageSizeOptions: [30, 50, 100], showTotal: total => `共 ${total} 项`,
           onChange: (current, pageSize) => setItemPagination({ current: pageSize === itemPagination.pageSize ? current : 1, pageSize }) },
           scroll: { x: 700 }, locale: { emptyText: !model.connected ? "连接禅道后显示待处理工作项" : !loaded && sync?.status === "failed" ?
             "读取失败，请点击“刷新列表”重试" : !loaded && sync?.status === "loading" ? "正在读取工作项…" : "暂无符合条件的待处理工作项" }, rowClassName: "item-row",

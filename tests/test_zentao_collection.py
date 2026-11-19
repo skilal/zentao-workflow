@@ -28,10 +28,14 @@ class TaskCollectionChecks(TestCase):
         self.directory = Path(self.temporary.name)
         self.item = {"kind": "task", "id": 4228, "title": "示例任务"}
         self.task = {"id": 4228, "name": "示例任务", "assignedTo": {"account": "测试账号"},
-                     "desc": "完成示例查询功能", "story": 2872, "storyTitle": "示例关联需求",
+                     "desc": "完成示例查询功能", "execution": 31, "story": 2872, "storyTitle": "示例关联需求",
                      "storyVersion": 1, "latestStoryVersion": 2, "storySpec": "<p>支持范围查询</p>",
                      "storyVerify": "查询结果符合条件", "storyFiles": [], "files": [], "fromBug": 0}
-        # 这些用例关注任务绑定版本；当前需求评论的真实请求由评论用例单独覆盖。
+        # 这些用例关注任务绑定版本；需求类型与评论接口的请求由评论用例单独覆盖。
+        pages = patch.object(self.client, "_pages", side_effect=lambda *args: iter([
+            {"id": 2872, "type": "story"}, {"id": 2873, "type": "story"}]))
+        pages.start()
+        self.addCleanup(pages.stop)
         detail = self.client.detail
         def read_detail(kind, item_id, require_assignee=True):
             if kind == "story" and not require_assignee and not self.task["fromBug"] and item_id in (2872, 2873):
