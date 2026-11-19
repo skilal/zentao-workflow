@@ -1535,12 +1535,13 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                             collect_change_summary(self.store, state)
                     self._before_review()
         elif state["phase"] == "review":
-            if manifest(state["repos"]) != state["review_manifest"]:
-                raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
             protocol = 3 if any(repo.get("change_record") for repo in state["repos"]) else 2
+            if protocol == 2 and manifest(state["repos"]) != state["review_manifest"]:
+                raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
             result = parse_review(text, protocol)
             if protocol == 3:
-                state["review_manifest"] = select_scope(state["repos"], result["commit_scope"])
+                state["review_manifest"] = select_scope(state["repos"], result["commit_scope"],
+                                                        expected_manifest=state["review_manifest"])
                 approved_scope = {repo["name"]: repo["commit_scope"] for repo in state["repos"] if repo.get("change_record")}
                 for scope in result["commit_scope"]:
                     scope["include"] = approved_scope[scope["repository"]]

@@ -330,10 +330,17 @@ def record_write(repo, relative, before, after, message_index=None):
     save_record(repo["change_record"], record)
 
 
-def changes(repo):
+def review_fragments(record):
+    frozen = record["review"]
+    if frozen is None:
+        raise WorkflowError("缺少本轮差异快照，请重新 Review。")
+    return frozen
+
+
+def changes(repo, *, review=False):
     with repository_lock(repo["path"]):
-        fragments = candidates(repo)
         record = load_record(repo)
+        fragments = list(review_fragments(record).values()) if review else candidates(repo)
         summaries = [{key: fragment[key] for key in ("id", "path", "kind", "source", "owners")}
                      | {"line": fragment["new_start"] + 1} for fragment in fragments]
         owned = own_fragments(repo, fragments)
@@ -345,31 +352,33 @@ def changes(repo):
                 "note": "片段编号用于 commit_scope；来源仅供核对，相关片段经 Review 确认可纳入，无关改动须排除。"}
 
 
-def fragment_details(repo, identifiers):
-    lookup = {entry["id"]: entry for entry in candidates(repo)}
+def fragment_details(repo, identifiers, *, review=False):
+    lookup = review_fragments(load_record(repo)) if review else {entry["id"]: entry for entry in candidates(repo)}
     if any(identifier not in lookup for identifier in identifiers):
-        raise WorkflowError("差异片段已变化，请重新读取 changes。")
+        raise WorkflowError("当前差异清单中没有该片段，请重新读取 changes。")
     return [{key: lookup[identifier][key] for key in ("id", "path", "kind", "source", "old", "new")}
             for identifier in identifiers]
 
 
-def select_scope(repositories, selections):
+def select_scope(repositories, selections, *, expected_manifest=None):
     with ExitStack() as locks:
         for path in sorted({repo["path"] for repo in repositories}):
             locks.enter_context(repository_lock(path))
-        return select_locked_scope(repositories, selections)
+        return select_locked_scope(repositories, selections, expected_manifest)
 
 
-def select_locked_scope(repositories, selections):
+def select_locked_scope(repositories, selections, expected_manifest):
     shared = {repo["name"]: repo for repo in repositories if repo.get("change_record")}
     if len(selections) != len(shared) or {selection["repository"] for selection in selections} != set(shared):
         raise WorkflowError("commit_scope 必须逐一覆盖本轮共享仓库。")
+    current_manifest = {}
     prepared = []
     for selection in selections:
         repo = shared[selection["repository"]]
-        record = load_record(repo)
-        frozen = record.get("review") or {}
+        frozen = review_fragments(load_record(repo))
         current = {fragment["id"]: fragment for fragment in candidates(repo)}
+        if expected_manifest is not None:
+            current_manifest.update(fragment_manifest(repo, current.values()))
         included = selection["include"]
         excluded = {entry["id"]: entry["reason"] for entry in selection["exclude"]}
         if (len(set(included)) != len(included) or len(excluded) != len(selection["exclude"])
@@ -388,19 +397,25 @@ def select_locked_scope(repositories, selections):
                                  for identifier in sorted(missing)[:3])
             raise WorkflowError(f"{repo['name']}：本轮修改片段遗漏 {len(missing)} 个，请明确纳入或说明排除原因。"
                                 f" {examples}")
+        included_ids = set(included)
+        required_current = own | included_ids
         for identifier in [*included, *excluded]:
-            if identifier not in frozen or identifier not in current:
+            if identifier not in frozen or (identifier in required_current and identifier not in current):
                 raise WorkflowError(f"{repo['name']}：Review 使用了失效或未知的差异片段 {identifier}。")
-            if identifier in included:
+            if identifier in included_ids:
                 entry = current[identifier]
                 if entry["context"] != frozen[identifier]["context"]:
                     raise WorkflowError("Review 期间相关代码上下文已变化，请重新 Review。")
         review_reads_valid(repo)
-        prepared.append((repo, list(included), list(excluded)))
-    for repo, included, excluded in prepared:
+        prepared.append((repo, current, included, [identifier for identifier in excluded if identifier in current]))
+    if expected_manifest is not None and current_manifest != expected_manifest:
+        raise WorkflowError("Review 期间本轮改动发生变化，请重新 Review。")
+    selected_manifest = {}
+    for repo, current, included, excluded in prepared:
         repo["commit_scope"] = included
         record = load_record(repo)
         record["scope_claims"] = included
         record["excluded_claims"] = excluded
         save_record(repo["change_record"], record)
-    return {key: value for repo, _, _ in prepared for key, value in fragment_manifest(repo).items()}
+        selected_manifest.update(fragment_manifest(repo, current.values()))
+    return selected_manifest

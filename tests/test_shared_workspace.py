@@ -231,6 +231,43 @@ class SharedWorkspaceChecks(TestCase):
         self.assertEqual(set(repo["commit_scope"]), {identifiers["共享.txt"], identifiers["人工.txt"]})
         self.assertEqual(selection["include"], [INCLUDE_CURRENT])
 
+    def test_scope_allows_excluded_fragment_committed_during_review(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "其他会话")
+        self.replace(self.second, "共享.txt", "原始第12行", "本轮改动")
+        repo = self.second["repos"][0]
+        expected = snapshot_review(repo)
+        self.second.update(phase="review", stage="审查中")
+        self.store.save(self.second)
+        tool = Tools(self.second["id"])
+        request = {"repository": "前端"}
+        reviewed = tool.call("changes", request)
+        foreign = next(fragment["id"] for fragment in reviewed["fragments"] if fragment["source"] == "其他会话")
+        commit(self.first["repos"][0], "fix(共享): 提交其他会话改动", self.review(self.first))
+        self.replace(self.first, "甲.txt", "原始第9行", "并行修改")
+
+        self.assertEqual(tool.call("changes", request), reviewed)
+        detail = tool.call("changes", {**request, "fragment_ids": [foreign]})
+        self.assertIn("其他会话", detail["fragments"][0]["new"])
+
+        selection = {"repository": "前端", "include": [INCLUDE_CURRENT, foreign], "exclude": []}
+        with self.assertRaisesRegex(WorkflowError, foreign):
+            select_scope([repo], [selection])
+
+        selection["include"] = [INCLUDE_CURRENT]
+        selection["exclude"] = [{"id": "未知编号", "reason": "与本轮无关"}]
+        with self.assertRaisesRegex(WorkflowError, "未知编号"):
+            select_scope([repo], [selection])
+
+        selection["exclude"][0]["id"] = foreign
+        result = select_scope([repo], [selection], expected_manifest=expected)
+        self.assertEqual(result, expected)
+        self.assertEqual(load_record(repo)["excluded_claims"], [])
+        committed = commit(repo, "fix(共享): 提交本轮改动", result)
+        expected_text = self.original.replace("原始第3行", "其他会话").replace("原始第12行", "本轮改动")
+        self.assertEqual(git(self.path, "show", committed + ":共享.txt").splitlines(), expected_text.splitlines())
+        self.assertIn("并行修改", (self.path / "甲.txt").read_text(encoding="utf-8"))
+        self.assertEqual(git(self.path, "show", committed + ":甲.txt").splitlines(), self.original.splitlines())
+
     def test_overlap_sources_are_retained_and_require_scope_selection(self):
         self.replace(self.first, "共享.txt", "原始第3行", "甲需求")
         tool = Tools(self.second["id"])

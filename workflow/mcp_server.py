@@ -294,8 +294,8 @@ class Tools:
             if arguments.get("fragment_ids") is not None:
                 if not repository.get("change_record"):
                     raise WorkflowError("旧会话请先继续以建立片段记录。")
-                return {"fragments": fragment_details(repository, arguments["fragment_ids"])}
-            data = differences(repository)
+                return {"fragments": fragment_details(repository, arguments["fragment_ids"], review=self.reading_review)}
+            data = differences(repository, review=self.reading_review)
             if len(data["patch"]) > 100000:
                 data["patch"] = data["patch"][:100000]
                 data["truncated"] = True

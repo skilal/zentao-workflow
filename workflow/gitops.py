@@ -627,10 +627,10 @@ def manifest(repositories):
     return result
 
 
-def differences(repository):
+def differences(repository, *, review=False):
     if repository.get("change_record"):
         from workflow.shared_changes import changes
-        return changes(repository)
+        return changes(repository, review=review)
     paths = baseline_paths(repository) if repository.get("workspace_release") else changed_paths(repository)
     text = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--stat", repository["baseline"], "--", *paths) if paths else ""
     patch = git(repository["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-color", repository["baseline"], "--", *paths) if paths else ""
