@@ -1726,7 +1726,8 @@ function WorkflowApp() {
           fileChanges?.error && h(Typography.Text, { type: "secondary", role: "status" }, fileChanges.error),
           legacyRepositories.length > 0 && h(ChangedFiles, { key: `${state.id}:legacy`, repositories: legacyRepositories,
             total: legacyRepositories.reduce((total, repo) => total + repo.paths.length, 0) }),
-          state.phase === "complete" && h(ChangeSummary, { key: `${state.id}:locations`, pages: state.change_summary })),
+          (state.phase === "complete" || state.change_summary?.length > 0) &&
+            h(ChangeSummary, { key: `${state.id}:locations`, pages: state.change_summary })),
         h(CardBox, { className: "app-card followup-composer", title: questions.length ? "需要你的回答" : continuing ? "后续对话" : "补充说明与回复",
           extra: hasWorkItemMaterials && h(Button, { size: "small", "aria-controls": "work-item-materials", "aria-expanded": materialsOpen,
             onClick: () => setMaterialsOpen(true) }, "工作项资料") },

@@ -1,4 +1,4 @@
-"""整体页面说明仅在完成后展示，覆盖刷新、替换、会话隔离和窄屏。"""
+"""整体页面说明在续聊期间保留展示，覆盖刷新、替换、会话隔离和窄屏。"""
 
 from pathlib import Path
 import sys
@@ -23,6 +23,7 @@ def run():
                                     snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []})
         runtime.engine.save()
     state["change_summary"] = [{"page": "系统管理 → 用户管理", "description": "新增保存时的必填校验"}]
+    state.update(phase="complete", stage="已完成（未审查）")
     # 历史逐回合记录保留在旧会话数据中，界面不再读取。
     state["change_locations"] = [{"turn_id": "旧回合", "items": [{"files": ["旧文件.js"]}]}]
     engine.save()
@@ -44,16 +45,25 @@ def run():
             page.goto(server.origin)
             panel = page.locator(".change-locations")
             expect(page.get_by_text("工作流会话", exact=True)).to_be_visible()
-            expect(panel).to_have_count(0)
-            state.update(phase="complete", stage="已完成（未审查）")
-            engine.save()
             expect(panel.get_by_text("整体改动说明", exact=True)).to_be_visible()
             expect(panel.get_by_text("系统管理 → 用户管理", exact=True)).to_be_visible()
             expect(panel.get_by_text("新增保存时的必填校验", exact=True)).to_be_visible()
             expect(panel).not_to_contain_text("旧文件.js")
             expect(panel).not_to_contain_text("回合")
+            state.update(phase="followup", stage="准备工作区中", delivery_round=2)
+            engine.save()
+            expect(page.locator(".conversation-card").get_by_text("准备工作区中", exact=True)).to_be_visible()
+            expect(panel.get_by_text("系统管理 → 用户管理", exact=True)).to_be_visible()
+            state.update(stage="续聊处理中")
+            engine.save()
             page.reload()
+            expect(page.locator(".conversation-card").get_by_text("续聊处理中", exact=True)).to_be_visible()
+            expect(panel.get_by_text("系统管理 → 用户管理", exact=True)).to_be_visible()
             expect(panel.get_by_text("新增保存时的必填校验", exact=True)).to_be_visible()
+            state.update(phase="review", stage="审查中")
+            engine.save()
+            expect(page.locator(".conversation-card").get_by_text("审查中", exact=True)).to_be_visible()
+            expect(panel.get_by_text("系统管理 → 用户管理", exact=True)).to_be_visible()
             state["change_summary"] = [{"page": "档案管理 → 检索页面", "description": "调整查询条件"}]
             engine.save()
             expect(panel.get_by_text("调整查询条件", exact=True)).to_be_visible()
@@ -62,9 +72,11 @@ def run():
                 page.set_viewport_size({"width": width, "height": 1050})
                 assert panel.evaluate("element => element.scrollWidth <= element.clientWidth"), width
             page.set_viewport_size({"width": 1440, "height": 1050})
+            page.locator(".session-entry-custom-title").get_by_text("汇总其他会话", exact=True).click()
+            expect(page.locator(".conversation-card").get_by_text("续聊处理中", exact=True)).to_be_visible()
+            expect(panel).to_have_count(0)
             fixture.second.engine.state.update(phase="complete", stage="已完成（未审查）")
             fixture.second.engine.save()
-            page.locator(".session-entry-custom-title").get_by_text("汇总其他会话", exact=True).click()
             expect(panel.get_by_text("暂无整体改动说明", exact=True)).to_be_visible()
             page.locator(".session-entry-custom-title").get_by_text("汇总主会话", exact=True).click()
             expect(panel.get_by_text("调整查询条件", exact=True)).to_be_visible()
