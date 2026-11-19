@@ -17,7 +17,7 @@ const ACTIVE = new Set(["识别分支中", "刷新分支中", "拉取分支中",
 const COMPLETE = new Set(["已完成（静态审查）", "已完成（未审查）"]);
 const PAGES = {
   items: ["工作项与资料", "可从指派给你的需求、任务和 Bug 中选择处理对象，也可新建会话直接输入需求。"],
-  plan: ["计划与会话", "每轮计划未提问且一次完整生成时自动实施；需要决策时等待你的答复。"],
+  plan: ["计划与会话"],
   prompts: ["内置提示词", "查看各阶段提示词原文、组装模板和生效条件。"],
   settings: ["工作流设置", "管理禅道账号、后端编译检查、固定 Review 提示词和默认修复轮次。"]
 };
@@ -2089,7 +2089,7 @@ function WorkflowApp() {
           workPage && state?.error && stage !== "资料读取失败" && h(Alert, { type: "error", showIcon: true, message: "当前流程需要处理", description: state.error, style: { marginBottom: 16 } }),
           workPage && state?.workspaces_released && h(Alert, { type: "info", showIcon: true, message: "分支占用正在释放或已释放",
             description: "可查看会话记录与代码差异。请在各仓库的分支与工作区中完成或取消预览，并确认改用本地开发目录后继续任务。", style: { marginBottom: 16 } }),
-          h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
+          heading[1] && h("div", { className: "page-heading" }, h("div", null, h("h1", null, heading[0]), h("div", { className: "page-subtitle" }, heading[1]))),
           h("div", { className: workPage ? "session-workspace" : "" }, workPage && renderSessions(), h("div", { className: "session-content" },
           workPage && h(Card, { className: "workflow-strip", size: "small" }, h("div", { className: "workflow-strip-top" }, h("div", { className: "current-item", title: state ? itemLabel(state) : "" }, state ? itemLabel(state) : "选择工作项，开始一次完整的需求交付"),
             h("div", { className: "workflow-strip-actions" }, stageTag(stage), model.selectedSessionId && state?.codex &&
