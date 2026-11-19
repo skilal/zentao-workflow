@@ -375,7 +375,8 @@ def confirm_checkout(repository, store, state, baseline=None):
 
 def acquire_workspace(selection, destination, store, state):
     if selection.get("allocate"):
-        candidates = list(dict.fromkeys([*selection.get("candidate_paths", []), selection["path"]]))
+        paths = [*selection.get("candidate_paths", []), selection["path"]]
+        candidates = [str(path) for path in dict.fromkeys(Path(path).resolve() for path in paths)]
         matching = [path for path in candidates if git(path, "branch", "--show-current") == selection["branch"]]
         if matching:
             dates = {path: int(git(path, "log", "-1", "--format=%ct")) for path in matching}

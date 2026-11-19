@@ -158,6 +158,29 @@ class WorkspaceAllocationChecks(TestCase):
         self.assertEqual(record["path"], str(second))
         self.assertEqual(git(source, "branch", "--show-current"), "其他项目/develop")
 
+    def test_matching_directory_aliases_are_counted_once(self):
+        source = self.root / "frontend"
+        git(source, "switch", "项目/develop")
+        selection = self.selection()
+        selection["candidate_paths"].extend([source.as_posix(), f"{source}/../{source.name}"])
+
+        record = self.acquire(selection)
+
+        self.assertEqual(record["path"], str(source))
+        self.assertEqual(record["workspace_mode"], "reused")
+
+    def test_different_matching_directories_with_same_head_require_selection(self):
+        source = self.root / "frontend"
+        second = self.root / "frontend-2"
+        git(source, "switch", "项目/develop")
+        git(self.root, "clone", str(source), str(second))
+        selection = self.selection()
+        selection["candidate_paths"].append(str(second))
+
+        with self.assertRaisesRegex(WorkflowError, "匹配目录的 HEAD 提交者时间相同"):
+            self.acquire(selection)
+        self.assertFalse(self.state["repos"])
+
     def test_snapshot_change_invalidates_ai_decision(self):
         path = self.root / "frontend"
         (path / "logback.xml").write_text("本机配置\n", encoding="utf-8")
