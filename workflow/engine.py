@@ -41,7 +41,7 @@ from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.workspace_release import WorkspaceReleaseFlow
 from workflow.workspace_paths import DEFAULT_WORKSPACE_ROOT, validate_workspace_root, workspace_directory
 from workflow.workspace_idle import IDLE_SCHEMA, IdleAnalysisRequired
-from workflow.shared_changes import (SCOPE_SCHEMA, initialize_session, select_scope, snapshot_review)
+from workflow.shared_changes import (SCOPE_SCHEMA, ReviewChanged, initialize_session, select_scope, snapshot_review)
 from workflow.zentao import KINDS, ZentaoClient, project_context
 
 
@@ -1540,8 +1540,12 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
             result = parse_review(text, protocol)
             if protocol == 3:
-                state["review_manifest"] = select_scope(state["repos"], result["commit_scope"],
-                                                        expected_manifest=state["review_manifest"])
+                try:
+                    state["review_manifest"] = select_scope(state["repos"], result["commit_scope"])
+                except ReviewChanged as change:
+                    self.note("控制器", f"{change} 正在按当前差异重新 Review。", display_text="审查依据已更新，正在自动复审。")
+                    self._before_review()
+                    return
                 approved_scope = {repo["name"]: repo["commit_scope"] for repo in state["repos"] if repo.get("change_record")}
                 for scope in result["commit_scope"]:
                     scope["include"] = approved_scope[scope["repository"]]

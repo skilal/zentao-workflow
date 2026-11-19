@@ -128,7 +128,7 @@ def commit_fragments(repo, message, expected_manifest):
             reconciled_index.write_bytes(original_index)
         for relative, fragments in grouped.items():
             fragments.sort(key=lambda fragment: (fragment["old_start"], fragment["old_end"], fragment["new_start"]))
-            base, mode = head_file(repo, relative)
+            base, mode = head_file(repo, relative, head)
             if fragments[0]["kind"] == "二进制":
                 selected = read_blob(repo, fragments[0]["binary_blob"])
             else:

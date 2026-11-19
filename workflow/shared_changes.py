@@ -24,6 +24,10 @@ SCOPE_SCHEMA = {"type": "array", "items": {"type": "object", "properties": {
     "required": ["repository", "include", "exclude"], "additionalProperties": False}}
 
 
+class ReviewChanged(WorkflowError):
+    """Review 所依据的工作区内容已变化。"""
+
+
 def digest(value):
     return sha256(dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -172,16 +176,16 @@ def line_owners(relative, current_lines, records):
 
 
 def candidates(repo, paths=None):
-    ensure_baseline(repo)
+    head = ensure_baseline(repo)
     record, records = journals(repo)
     if paths is None:
-        raw = git(repo["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", "HEAD", binary=True)
+        raw = git(repo["path"], "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", head, binary=True)
         raw += git(repo["path"], "ls-files", "--others", "--exclude-standard", "-z", binary=True)
         paths = {part.decode("utf-8") for part in raw.split(b"\0") if part}
     result = []
     for relative in sorted(paths):
         path = safe_file(repo, relative)
-        before_data, mode = head_file(repo, relative)
+        before_data, mode = head_file(repo, relative, head)
         after_data = path.read_bytes() if path.is_file() else None
         if before_data == after_data:
             continue
@@ -285,13 +289,13 @@ def review_reads_valid(repo):
         current = lines(path.read_bytes() if exists else None)
         for read in reads:
             if exists != read.get("exists", True):
-                raise WorkflowError(f"Review 所依据的文件存在状态已变化，请重新 Review：{relative}")
+                raise ReviewChanged(f"Review 所依据的文件存在状态已变化：{relative}")
             text = "".join(current[read["start"]:read["end"]])
             if digest(text) != read["digest"]:
                 expected = read_blob(repo, read["blob"]).decode("utf-8")
                 if expected and "".join(current).count(expected) == 1:
                     continue
-                raise WorkflowError(f"Review 所依据的代码片段已变化，请重新 Review：{relative}")
+                raise ReviewChanged(f"Review 所依据的代码片段已变化：{relative}")
 
 
 def remember_read(repo, relative, start, count, review=False, content=None):
@@ -360,56 +364,52 @@ def fragment_details(repo, identifiers, *, review=False):
             for identifier in identifiers]
 
 
-def select_scope(repositories, selections, *, expected_manifest=None):
+def select_scope(repositories, selections):
     with ExitStack() as locks:
         for path in sorted({repo["path"] for repo in repositories}):
             locks.enter_context(repository_lock(path))
-        return select_locked_scope(repositories, selections, expected_manifest)
+        return select_locked_scope(repositories, selections)
 
 
-def select_locked_scope(repositories, selections, expected_manifest):
+def select_locked_scope(repositories, selections):
     shared = {repo["name"]: repo for repo in repositories if repo.get("change_record")}
     if len(selections) != len(shared) or {selection["repository"] for selection in selections} != set(shared):
         raise WorkflowError("commit_scope 必须逐一覆盖本轮共享仓库。")
-    current_manifest = {}
     prepared = []
     for selection in selections:
         repo = shared[selection["repository"]]
+        unscoped = {key: value for key, value in repo.items() if key != "commit_scope"}
         frozen = review_fragments(load_record(repo))
         current = {fragment["id"]: fragment for fragment in candidates(repo)}
-        if expected_manifest is not None:
-            current_manifest.update(fragment_manifest(repo, current.values()))
         included = selection["include"]
         excluded = {entry["id"]: entry["reason"] for entry in selection["exclude"]}
         if (len(set(included)) != len(included) or len(excluded) != len(selection["exclude"])
                 or set(included) & set(excluded) or any(not reason.strip() for reason in excluded.values())):
             raise WorkflowError("提交片段重复、状态冲突或缺少排除原因。")
-        own = {identifier for identifier, fragment in frozen.items() if fragment["source"] == "本轮"
-               or fragment["path"] in repo.get("review_paths", [])}
+        # 排除只撤销快照中的候选项，审查期间出现的片段不能因此归入已审查范围。
+        known_exclusions = excluded.keys() & frozen.keys()
+        own = {fragment["id"] for fragment in own_fragments(unscoped, frozen.values())}
         if INCLUDE_CURRENT in included:
             included = [identifier for identifier in included if identifier != INCLUDE_CURRENT]
             if any(identifier in own for identifier in included):
                 raise WorkflowError(f"{repo['name']}：“{INCLUDE_CURRENT}”与单独列出的本轮片段重复。")
-            included.extend(identifier for identifier in frozen if identifier in own and identifier not in excluded)
-        missing = own.difference(included, excluded)
+            included.extend(identifier for identifier in frozen if identifier in own and identifier not in known_exclusions)
+        missing = own.difference(included, known_exclusions)
         if missing:
             examples = "、".join(f"{frozen[identifier]['path']}:{frozen[identifier]['new_start'] + 1}（{identifier}）"
                                  for identifier in sorted(missing)[:3])
             raise WorkflowError(f"{repo['name']}：本轮修改片段遗漏 {len(missing)} 个，请明确纳入或说明排除原因。"
                                 f" {examples}")
-        included_ids = set(included)
-        required_current = own | included_ids
-        for identifier in [*included, *excluded]:
-            if identifier not in frozen or (identifier in required_current and identifier not in current):
-                raise WorkflowError(f"{repo['name']}：Review 使用了失效或未知的差异片段 {identifier}。")
-            if identifier in included_ids:
-                entry = current[identifier]
-                if entry["context"] != frozen[identifier]["context"]:
-                    raise WorkflowError("Review 期间相关代码上下文已变化，请重新 Review。")
+        for identifier in included:
+            if identifier not in frozen:
+                raise WorkflowError(f"{repo['name']}：Review 纳入了快照中不存在的差异片段 {identifier}。")
+            if identifier not in current or current[identifier]["context"] != frozen[identifier]["context"]:
+                raise ReviewChanged(f"{repo['name']}：待提交片段 {identifier} 或其上下文已变化。")
+        covered = own.union(included)
+        if any(fragment["id"] not in covered for fragment in own_fragments(unscoped, current.values())):
+            raise ReviewChanged(f"{repo['name']}：Review 期间出现新的本轮差异片段。")
         review_reads_valid(repo)
-        prepared.append((repo, current, included, [identifier for identifier in excluded if identifier in current]))
-    if expected_manifest is not None and current_manifest != expected_manifest:
-        raise WorkflowError("Review 期间本轮改动发生变化，请重新 Review。")
+        prepared.append((repo, current, included, [identifier for identifier in excluded if identifier in known_exclusions and identifier in current]))
     selected_manifest = {}
     for repo, current, included, excluded in prepared:
         repo["commit_scope"] = included

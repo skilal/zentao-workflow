@@ -256,10 +256,12 @@ class SharedWorkspaceChecks(TestCase):
         selection["include"] = [INCLUDE_CURRENT]
         selection["exclude"] = [{"id": "未知编号", "reason": "与本轮无关"}]
         with self.assertRaisesRegex(WorkflowError, "未知编号"):
-            select_scope([repo], [selection])
+            select_scope([repo], [{**selection, "include": [INCLUDE_CURRENT, "未知编号"], "exclude": []}])
 
-        selection["exclude"][0]["id"] = foreign
-        result = select_scope([repo], [selection], expected_manifest=expected)
+        live_only = next(fragment["id"] for fragment in candidates(repo) if fragment["path"] == "甲.txt")
+        for identifier in (foreign, live_only):
+            selection["exclude"].append({"id": identifier, "reason": "与本轮无关"})
+        result = select_scope([repo], [selection])
         self.assertEqual(result, expected)
         self.assertEqual(load_record(repo)["excluded_claims"], [])
         committed = commit(repo, "fix(共享): 提交本轮改动", result)
@@ -419,6 +421,37 @@ class SharedWorkspaceChecks(TestCase):
         self.assertIn("甲需求", git(self.path, "show", "HEAD:共享.txt"))
         self.assertNotIn("乙需求", git(self.path, "show", "HEAD:共享.txt"))
         self.assertIn("乙需求", (self.path / "共享.txt").read_text(encoding="utf-8"))
+
+    def test_review_refreshes_after_another_session_changes_adjacent_code(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "本轮改动")
+        settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        flow = Workflow(settings, Mock(), store=self.store)
+        self.addCleanup(flow.close)
+        flow.state = self.first
+        self.first.update(snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []},
+                          stage="实施中", turn_id="检查回合", max_fix_rounds=3)
+        result = dumps({"summary": "无待处理问题", "findings": [], "resolved_previous": [],
+            "commit_scope": [{"repository": "前端", "include": [INCLUDE_CURRENT], "exclude": []}],
+            "commit_messages": [{"repository": "前端", "type": "fix", "scope": "共享", "summary": "提交本轮改动"}]})
+        head = git(self.path, "rev-parse", "HEAD")
+        with patch.object(flow, "_start_turn") as start_turn:
+            flow._begin_review()
+            self.replace(self.second, "共享.txt", "原始第4行", "并行改动")
+            self.first["stage"] = "审查中"
+            flow.last_message = result
+            flow._completed({"status": "completed"}, self.first["id"], flow.connection_epoch)
+            self.assertEqual(start_turn.call_count, 2)
+            self.assertEqual(git(self.path, "rev-parse", "HEAD"), head)
+            self.assertEqual(self.first["reviews"], [])
+            self.assertEqual(self.first["fix_round"], 0)
+            self.first["stage"] = "审查中"
+            flow.last_message = result
+            flow._completed({"status": "completed"}, self.first["id"], flow.connection_epoch)
+        self.assertEqual(self.first["phase"], "complete")
+        committed = git(self.path, "show", "HEAD:共享.txt")
+        self.assertIn("本轮改动", committed)
+        self.assertNotIn("并行改动", committed)
+        self.assertIn("并行改动", (self.path / "共享.txt").read_text(encoding="utf-8"))
 
     def test_claimed_fragment_can_be_reviewed_by_another_session_but_cannot_be_committed_twice(self):
         (self.path / "甲.txt").write_text("人工修复\n", encoding="utf-8")

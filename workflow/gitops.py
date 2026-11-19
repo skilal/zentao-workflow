@@ -555,13 +555,14 @@ def _acquire_workspace(selection, destination, store, state):
 
 
 def ensure_baseline(repository):
+    if git(repository["path"], "branch", "--show-current") != repository["branch"]:
+        raise WorkflowError("工作区分支已改变，已停止。")
     expected = repository.get("checkout_head", repository["baseline"])
     head = git(repository["path"], "rev-parse", "HEAD")
     if head != expected and not (repository.get("change_record")
                                 and git(repository["path"], "merge-base", expected, head, optional=True) == expected):
         raise WorkflowError("工作区 HEAD 已改变，不能继续使用原审查基线。")
-    if git(repository["path"], "branch", "--show-current") != repository["branch"]:
-        raise WorkflowError("工作区分支已改变，已停止。")
+    return head
 
 
 def changed_paths(repository):
