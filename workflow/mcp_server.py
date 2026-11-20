@@ -53,7 +53,7 @@ TOOLS = [
     }, ("attachment_id",))),
     ("read_answer_attachment", "按编号只读已提交的问题附件；图片返回图片内容，文本按行分页，无法解析时明确返回限制。", schema({"attachment_id": STRING, **LINE_ARGS}, ("attachment_id",))),
     ("task_context", "读取当前授权、计划和工作区；首次分析或资料版本变化时设置 include_materials=true 读取完整归一化资料。", schema({"include_materials": {"type": "boolean"}})),
-    ("set_session_title", "结合已读资料为新建工作项会话登记简短中文概括名称；只传首个工作项的概括标题，多任务后缀由控制器添加。仅计划分析阶段可用，不修改业务文件或人工名称。", schema({"title": STRING}, ("title",))),
+    ("set_session_title", "结合已读资料为新建会话登记简短中文概括名称；已关联工作项时概括首个工作项，未关联时概括首条需求消息及图片，多任务后缀由控制器添加。仅首次交付的计划分析阶段可用，不修改业务文件或人工名称。", schema({"title": STRING}, ("title",))),
     ("list_files", "列出指定仓库的文件；pattern 为 glob；不访问依赖、Git 和输出目录。", schema({"repository": STRING, "pattern": STRING}, ("repository",))),
     ("read_file", "读取当前 UTF-8 文件；默认 200 行，最多 500 行；next_line 指明续读位置。多文件优先使用 read_files。", schema({**FILE_ARGS, **LINE_ARGS}, ("repository", "path"))),
     ("read_files", "一次读取多个当前或基线文件片段；最多 10 项、合计 2000 行；每项 baseline=true 表示基线。", schema({

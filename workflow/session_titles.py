@@ -8,15 +8,16 @@ from workflow.store import session_lock
 
 def title_generation_context(state):
     if (not state.get("title_pending") or state.get("custom_title") or state.get("auto_title")
-            or state["item"] is None or state.get("followup") or state.get("delivery_round", 1) != 1):
+            or state.get("followup") or state.get("delivery_round", 1) != 1):
         return None
     items = state.get("items", [state["item"]])
     suffix = f"等 {len(items)} 项" if len(items) > 1 else ""
-    return {"max_length": 20 - len(suffix), "suffix": suffix, "primary_item": items[0]}
+    return {"max_length": 20 - len(suffix), "suffix": suffix,
+            "primary_item": items[0] if items else None}
 
 
 def title_tool_authorized(state):
-    return bool("title_pending" in state and state["item"] is not None
+    return bool("title_pending" in state
                 and state["phase"] == "plan" and state["stage"] == "计划中"
                 and state.get("thread_id") and state.get("turn_id")
                 and state.get("delivery_round", 1) == 1 and not state.get("followup")
@@ -25,7 +26,7 @@ def title_tool_authorized(state):
 
 def register_session_title(store, state, title):
     if not title_tool_authorized(state):
-        raise WorkflowError("只有新建工作项会话的计划分析回合可以登记自动标题。")
+        raise WorkflowError("只有新建会话的首次交付计划分析回合可以登记自动标题。")
     context = title_generation_context(state)
     if context is None:
         return {"status": "unchanged", "title": state.get("custom_title") or state.get("auto_title", "")}

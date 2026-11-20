@@ -673,7 +673,7 @@ class WebApplication:
             for entry in [*material_files(materials), *state["supplement_images"]]:
                 entry["path"] = str(directory / Path(entry["path"]).relative_to(previous))
             if state["item"] is None:
-                state["conversation_title"] = " ".join(supplement.split())[:50] or "图片需求"
+                state.update(auto_title="", title_pending=True)
                 state["history"].append({"time": timestamp(), "role": "用户", "text": state["supplement"],
                                          "phase": "plan", "delivery_round": 1, "image_purpose": "supplement",
                                          "images": deepcopy(state["supplement_images"])})

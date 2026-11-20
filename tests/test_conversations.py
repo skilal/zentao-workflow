@@ -15,6 +15,7 @@ from workflow.gitops import git
 from review_fixtures import VersionedTools as Tools, scoped_result
 from workflow.projects import project_locked
 from workflow.settings import ROOT, WorkflowError
+from workflow.store import session_title
 from workflow.web import WebApplication
 
 
@@ -107,7 +108,8 @@ class ConversationChecks(TestCase):
         self.assertEqual(result["session_id"], same["session_id"])
         self.assertEqual(result["session_id"], repeated["session_id"])
         state = runtime.engine.state
-        self.assertEqual(self.application.session(state["id"])["state"]["title"], " ".join(text.split())[:50])
+        self.assertEqual(self.application.session(state["id"])["state"]["title"], "待命名会话")
+        self.assertTrue(state["title_pending"])
         self.assertEqual(state["supplement"], text.strip())
         self.assertEqual(state["history"][0]["text"], text.strip())
         self.assertEqual(state["history"][0]["role"], "用户")
@@ -127,6 +129,8 @@ class ConversationChecks(TestCase):
         self.assertEqual(context["items"], [])
         self.assertEqual(context["supplement"], text.strip())
         self.assertEqual(context["snapshot"]["sources"], [])
+        self.assertEqual(context["session_title_generation"],
+                         {"max_length": 20, "suffix": "", "primary_item": None})
 
     def test_images_only_and_mixed_messages_keep_image_history_and_paths(self):
         for text in ("", "按照图片调整"):
@@ -141,7 +145,28 @@ class ConversationChecks(TestCase):
                 path = Path(history["images"][0]["path"])
                 self.assertTrue(path.is_relative_to(self.application.sessions.store.directory(state["id"])))
                 self.assertEqual(path.read_bytes(), PNG)
-                self.assertEqual(self.application.session(state["id"])["state"]["title"], text or "图片需求")
+                self.assertEqual(self.application.session(state["id"])["state"]["title"], "待命名会话")
+                state.update(stage="计划中", thread_id="命名线程", turn_id="命名回合")
+                runtime.engine.save()
+                Tools(state["id"]).call("set_session_title", {"title": "页面交互优化"})
+                runtime.engine.save()
+                self.assertEqual(session_title(state), "页面交互优化")
+                self.assertFalse(state["title_pending"])
+
+    def test_manual_title_overrides_uncollected_conversation_title_and_survives_restart(self):
+        runtime = self.promote(self.conversation(41), "希望把档案列表里的查询条件改为支持范围检索")
+        engine, state = runtime.engine, runtime.engine.state
+        state.update(stage="计划中", thread_id="命名线程", turn_id="命名回合")
+        engine.save()
+        Tools(state["id"]).call("set_session_title", {"title": "档案范围检索"})
+        self.application.rename_session({"session_id": state["id"], "title": "人工指定名称", "request_id": uuid4().hex})
+        engine.save()
+        self.assertEqual(session_title(state), "人工指定名称")
+        self.assertEqual(state["auto_title"], "")
+        self.assertEqual(Tools(state["id"]).call("set_session_title", {"title": "另一个名称"})["status"], "unchanged")
+        restored = WebApplication(self.settings)
+        self.addCleanup(restored.close)
+        self.assertEqual(restored.session(state["id"])["state"]["title"], "人工指定名称")
 
     def test_empty_message_stale_selection_and_uploading_cannot_promote(self):
         preview = self.conversation()
@@ -231,6 +256,14 @@ class ConversationChecks(TestCase):
             self.assertEqual(state["stage"], "计划中")
             self.assertTrue(all(entry["source"] == "common" for entry in state["branch_resolution"]["repositories"]))
             self.assertIn("未关联禅道工作项", calls[-1][1]["input"][0]["text"])
+            self.assertIn("workflow.set_session_title(title)", calls[-1][1]["input"][0]["text"])
+            self.assertIn("首条需求消息", calls[-1][1]["input"][0]["text"])
+            Tools(state["id"]).call("set_session_title", {"title": "页面交互优化"})
+            engine._event({"method": "item/completed", "params": {
+                "threadId": state["thread_id"], "turnId": state["turn_id"],
+                "item": {"type": "mcpToolCall", "server": "workflow", "tool": "set_session_title"}}},
+                engine.connection_epoch)
+            self.assertEqual(self.application.session(state["id"])["state"]["title"], "页面交互优化")
             complete(engine, "<proposed_plan>调整页面交互</proposed_plan>")
             self.assertEqual(state["stage"], "实施中")
             self.assertEqual(state["approval_source"], "auto")
@@ -244,7 +277,11 @@ class ConversationChecks(TestCase):
             images = engine.validate_followup("解释修改内容", [])
             engine.followup("解释修改内容", images, uuid4().hex, False)
             self.assertEqual(state["stage"], "续聊处理中")
+            self.assertNotIn("workflow.set_session_title(title)", calls[-1][1]["input"][0]["text"])
             complete(engine, "已说明修改内容")
             self.assertEqual(state["stage"], "已完成（未审查）")
             self.assertIsNone(state["item"])
-            self.assertEqual(self.application.session(state["id"])["state"]["title"], "调整页面交互")
+            self.assertEqual(self.application.session(state["id"])["state"]["title"], "页面交互优化")
+            restored = WebApplication(self.settings)
+            self.addCleanup(restored.close)
+            self.assertEqual(restored.session(state["id"])["state"]["title"], "页面交互优化")

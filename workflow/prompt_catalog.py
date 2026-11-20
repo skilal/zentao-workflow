@@ -26,7 +26,7 @@ def prompt_catalog(settings):
     material_fragments = [
         fragment("material_changed", "首次读取或资料变更", templates.MATERIAL_CHANGED, "workflow/prompt_templates.py · MATERIAL_CHANGED", "变化上下文包含 materials_revision，且无需自动命名"),
         fragment("material_cached", "复用已读资料", templates.MATERIAL_CACHED, "workflow/prompt_templates.py · MATERIAL_CACHED", "资料版本未变，且无需自动命名"),
-        fragment("material_naming", "计划回合自动命名", templates.MATERIAL_NAMING, "workflow/prompt_templates.py · MATERIAL_NAMING", "计划阶段有待生成的首次工作项会话名称时，替代其他资料读取指令")]
+        fragment("material_naming", "计划回合自动命名", templates.MATERIAL_NAMING, "workflow/prompt_templates.py · MATERIAL_NAMING", "计划阶段有待生成的首次会话名称时，替代其他资料读取指令，包含直接输入需求的会话")]
     review_fragments = [
         fragment("review_ids", "审查编号约束", templates.REVIEW_IDS, "workflow/prompt_templates.py · REVIEW_IDS", "所有 Review 阶段回合，包括恢复和回答继续"),
         fragment("review_skipped", "本轮不修复项", templates.REVIEW_SKIPPED, "workflow/prompt_templates.py · REVIEW_SKIPPED", "所有 Review 阶段回合，列表可为空"),

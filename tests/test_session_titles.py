@@ -261,7 +261,7 @@ class GeneratedSessionTitleChecks(SessionTitleFixture):
         self.assertEqual(saved["plan"], "保留后台计划")
         self.assertEqual(session_title(saved), "人工并发名称")
 
-    def test_legacy_and_regular_conversations_never_request_generation(self):
+    def test_legacy_and_unsent_conversations_never_request_generation(self):
         legacy = deepcopy(self.state)
         legacy.pop("auto_title")
         legacy.pop("title_pending")

@@ -11,7 +11,8 @@ SCOPE_ITEMS = "本次选中的所有工作项属于同一次交付，须逐项�
 MATERIAL_CHANGED = "资料首次读取或版本已变更，先调用 workflow.task_context(include_materials=true)。"
 MATERIAL_CACHED = "先调用 workflow.task_context 获取当前授权；原需求资料沿用本线程，需核对时再设置 include_materials=true。"
 MATERIAL_NAMING = (
-    "先调用 workflow.task_context(include_materials=true)。结合资料概括首个工作项，"
+    "先调用 workflow.task_context(include_materials=true)。已关联工作项时结合资料概括首个工作项；"
+    "未关联工作项时，根据 supplement 中的首条需求消息及 supplement_images 概括实际需求。"
     "用 workflow.set_session_title(title) 登记中文名称，建议 6～12 字、最多 {max_length} 字符，"
     "不带类型、编号、引号或解释，多任务后缀由控制器追加。随后继续计划；命名失败不阻塞、不增加回合或循环重试。"
 )
