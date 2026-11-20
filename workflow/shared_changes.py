@@ -373,11 +373,16 @@ def select_scope(repositories, selections):
 
 def select_locked_scope(repositories, selections):
     shared = {repo["name"]: repo for repo in repositories if repo.get("change_record")}
-    if len(selections) != len(shared) or {selection["repository"] for selection in selections} != set(shared):
-        raise WorkflowError("commit_scope 必须逐一覆盖本轮共享仓库。")
+    by_repository = {selection["repository"]: selection for selection in selections}
+    unknown = by_repository.keys() - shared.keys()
+    if unknown:
+        raise WorkflowError(f"Review 提交范围包含未登记的仓库：{'、'.join(sorted(unknown))}。请重新 Review。")
+    if len(by_repository) != len(selections):
+        raise WorkflowError("Review 提交范围重复列出同一仓库，请重新 Review。")
     prepared = []
-    for selection in selections:
-        repo = shared[selection["repository"]]
+    for name, repo in shared.items():
+        # 省略仓库等同于空范围，仍检查快照遗漏、本轮新增差异和审查读取记录。
+        selection = by_repository.get(name, {"include": [], "exclude": []})
         unscoped = {key: value for key, value in repo.items() if key != "commit_scope"}
         frozen = review_fragments(load_record(repo))
         current = {fragment["id"]: fragment for fragment in candidates(repo)}

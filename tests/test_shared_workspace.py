@@ -14,7 +14,7 @@ from workflow.gitops import acquire_workspace, cleanup_workspaces, commit, ensur
 from workflow.delivery import previous_task_changes, validate_review_request
 from workflow.mcp_server import Tools
 from workflow.settings import WorkflowError
-from workflow.shared_changes import INCLUDE_CURRENT, candidates, initialize, load_record, select_scope, snapshot_review
+from workflow.shared_changes import INCLUDE_CURRENT, ReviewChanged, candidates, initialize, load_record, select_scope, snapshot_review
 from workflow.store import SessionStore
 from workflow.engine import Workflow
 from workflow.settings import ROOT
@@ -402,6 +402,17 @@ class SharedWorkspaceChecks(TestCase):
     def test_existing_review_pipeline_automatically_commits_only_confirmed_scope(self):
         self.replace(self.first, "共享.txt", "原始第3行", "甲需求")
         self.replace(self.second, "共享.txt", "原始第12行", "乙需求")
+        backend_path = self.root / "backend"
+        git(self.root, "clone", "--quiet", str(self.path), str(backend_path))
+        backend = {**self.first["repos"][0], "name": "后端", "role": "backend",
+                   "path": str(backend_path), "source": str(backend_path)}
+        initialize(self.store, self.first, backend)
+        self.first["repos"].append(backend)
+        (backend_path / "人工.txt").write_text("后端无关改动\n", encoding="utf-8")
+        git(backend_path, "add", "人工.txt")
+        backend_head = git(backend_path, "rev-parse", "HEAD")
+        backend_staged = git(backend_path, "diff", "--cached")
+        self.assertTrue(backend_staged)
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
         flow = Workflow(settings, Mock(), store=self.store)
         self.addCleanup(flow.close)
@@ -421,6 +432,20 @@ class SharedWorkspaceChecks(TestCase):
         self.assertIn("甲需求", git(self.path, "show", "HEAD:共享.txt"))
         self.assertNotIn("乙需求", git(self.path, "show", "HEAD:共享.txt"))
         self.assertIn("乙需求", (self.path / "共享.txt").read_text(encoding="utf-8"))
+        self.assertEqual(self.first["commits"]["后端"], "无代码修改")
+        self.assertEqual(git(backend_path, "rev-parse", "HEAD"), backend_head)
+        self.assertEqual(git(backend_path, "diff", "--cached"), backend_staged)
+
+    def test_omitted_scope_still_checks_new_and_frozen_task_changes(self):
+        repo = self.first["repos"][0]
+        snapshot_review(repo)
+        self.replace(self.first, "共享.txt", "原始第3行", "本轮改动")
+        with self.assertRaisesRegex(ReviewChanged, "前端.*新的本轮差异片段"):
+            select_scope([repo], [])
+        snapshot_review(repo)
+        with self.assertRaisesRegex(WorkflowError, "前端.*本轮修改片段遗漏"):
+            select_scope([repo], [])
+        self.assertNotIn("commit_scope", repo)
 
     def test_review_refreshes_after_another_session_changes_adjacent_code(self):
         self.replace(self.first, "共享.txt", "原始第3行", "本轮改动")
