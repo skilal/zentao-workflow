@@ -10,12 +10,13 @@ from unittest import TestCase
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
-from workflow.engine import Workflow
+from workflow.engine import PHASE_STAGE, Workflow
 from workflow.gitops import git
 from review_fixtures import VersionedTools as Tools, scoped_result
 from workflow.projects import project_locked
 from workflow.settings import ROOT, WorkflowError
 from workflow.store import session_title
+from workflow.user_input import INPUT_STAGES, register_input
 from workflow.web import WebApplication
 
 
@@ -230,6 +231,95 @@ class ConversationChecks(TestCase):
         self.settings["project_branches"] = {self.settings["zentao"]["base_url"].rstrip("/"): {
             "41": {"name": "项目甲", "branches": {"frontend": "项目分支", "backend": "项目分支"}}}}
 
+    def steering_session(self):
+        runtime = self.promote(self.conversation(41))
+        engine = runtime.engine
+        engine.state.update(stage="计划中", phase="plan", thread_id="原线程", turn_id="原回合", rpc_connected=True)
+        engine.rpc = Mock()
+        engine.rpc.request.return_value = {"turnId": "原回合"}
+        engine.turn_running = True
+        engine.start_progress("原回合")
+        return runtime
+
+    def test_steer_saves_ordered_messages_in_the_current_turn_once(self):
+        runtime = self.steering_session()
+        engine, state = runtime.engine, runtime.engine.state
+        runtime.busy = "plan"
+        requests = [self.request("steer", data={"text": text, "turn_id": "原回合"},
+                                 session_id=state["id"], revision=-1) for text in ("先核对输入", "再考虑分页")]
+        for request in requests:
+            self.assertEqual(self.application.dispatch(request)["turn_id"], "原回合")
+        engine.turn_running = False
+        self.assertTrue(self.application.dispatch(requests[0])["duplicate"])
+        with self.assertRaisesRegex(WorkflowError, "请求标识已被使用"):
+            self.application.dispatch({**requests[0], "data": {"text": "不同文字", "turn_id": "原回合"}})
+        for call, request in zip(engine.rpc.request.call_args_list, requests):
+            self.assertEqual(call.args, ("turn/steer", {"threadId": "原线程", "expectedTurnId": "原回合",
+                "input": [{"type": "text", "text": request["data"]["text"]}], "clientUserMessageId": request["request_id"]}))
+        self.assertEqual(engine.rpc.request.call_count, 2)
+        history = engine.store.load(state["id"])["history"]
+        self.assertEqual([entry["text"] for entry in history], ["调整页面交互", "先核对输入", "再考虑分页"])
+        self.assertTrue(all((entry["role"], entry["turn_id"], entry["delivery_round"]) == ("用户", "原回合", 1)
+                            for entry in history[1:]))
+        self.assertEqual(len(state["progress_turns"]), 1)
+        self.assertEqual(state["supplement"], "调整页面交互")
+
+    def test_steer_cannot_target_another_turn_or_bypass_a_pending_question(self):
+        runtime = self.steering_session()
+        engine, state = runtime.engine, runtime.engine.state
+        before = deepcopy(state["history"])
+        request = self.request("steer", data={"text": "补充说明", "turn_id": "原回合"}, session_id=state["id"])
+        for phase, stage in PHASE_STAGE.items():
+            state.update(phase=phase, stage=stage)
+            self.assertEqual(self.application.session(state["id"])["state"]["steer_turn_id"],
+                             "原回合" if stage in INPUT_STAGES else None)
+        state.update(phase="plan", stage="计划中")
+        for changes in ({"turn_id": "旧回合"}, {"text": " "}, {"attachment_ids": ["附件"]}):
+            with self.subTest(changes=changes), self.assertRaises(WorkflowError):
+                self.application.dispatch({**request, "data": {**request["data"], **changes}})
+        for key, value in (("pause_requested", True), ("rpc_connected", False), ("stage", "编译检查中"),
+                           ("pending", {"id": 1, "params": {"questions": []}})):
+            old = state.get(key)
+            state[key] = value
+            with self.subTest(key=key), self.assertRaises(WorkflowError):
+                self.application.dispatch(request)
+            state[key] = old
+        register_input(engine.store, state, [{"id": "scope", "header": "范围", "question": "是否调整范围？"}])
+        with self.assertRaises(WorkflowError):
+            self.application.dispatch(request)
+        engine.rpc.request.assert_not_called()
+        self.assertEqual(state["history"], before)
+
+    def test_steer_rejects_a_mismatched_response_without_stopping_the_turn(self):
+        runtime = self.steering_session()
+        engine, state = runtime.engine, runtime.engine.state
+        request = self.request("steer", data={"text": "补充说明", "turn_id": "原回合"}, session_id=state["id"])
+        for response in (None, {"turnId": "下一回合"}):
+            engine.rpc.request.return_value = response
+            with self.assertRaisesRegex(WorkflowError, "发送结果未确认"):
+                self.application.dispatch(request)
+        self.assertEqual(state["stage"], "计划中")
+        self.assertTrue(engine.turn_running)
+        self.assertEqual(len(state["history"]), 1)
+
+    def test_steer_is_recorded_before_completion_even_if_captured_first(self):
+        runtime = self.steering_session()
+        engine, state = runtime.engine, runtime.engine.state
+        engine.last_message = "已纳入补充说明"
+
+        def request_steer(method, params):
+            engine._event({"method": "turn/completed", "params": {"threadId": "原线程",
+                           "turn": {"id": "原回合", "status": "completed"}}}, engine.connection_epoch)
+            self.assertFalse(engine.turn_running)
+            return {"turnId": "原回合"}
+
+        engine.rpc.request.side_effect = request_steer
+        self.application.dispatch(self.request("steer", data={"text": "补充说明", "turn_id": "原回合"}, session_id=state["id"]))
+        self.drain(runtime)
+        self.assertEqual([(entry["role"], entry["text"]) for entry in state["history"][-2:]],
+                         [("用户", "补充说明"), ("Codex", "已纳入补充说明")])
+        self.assertEqual(state["stage"], "等待计划补充")
+
     def test_plan_implementation_review_commit_and_followup_without_a_work_item(self):
         self.prepare_repositories()
         turns, calls = count(1), []
@@ -240,6 +330,8 @@ class ConversationChecks(TestCase):
                 engine.rpc = Mock(model="示例模型")
                 def request(method, params):
                     calls.append((method, params))
+                    if method == "turn/steer":
+                        return {"turnId": params["expectedTurnId"]}
                     return {"turn": {"id": f"模拟回合-{next(turns)}"}}
                 engine.rpc.request.side_effect = request
         def complete(engine, text):
@@ -253,6 +345,11 @@ class ConversationChecks(TestCase):
             runtime = self.application.sessions.get(result["session_id"])
             self.drain(runtime)
             engine, state = runtime.engine, runtime.engine.state
+            def steer(text):
+                turn_id = state["turn_id"]
+                result = self.application.dispatch(self.request("steer", data={"text": text, "turn_id": turn_id}, session_id=state["id"]))
+                self.assertEqual(result["turn_id"], turn_id)
+                self.assertEqual(state["turn_id"], turn_id)
             self.assertEqual(state["stage"], "计划中")
             self.assertTrue(all(entry["source"] == "common" for entry in state["branch_resolution"]["repositories"]))
             self.assertIn("未关联禅道工作项", calls[-1][1]["input"][0]["text"])
@@ -264,12 +361,14 @@ class ConversationChecks(TestCase):
                 "item": {"type": "mcpToolCall", "server": "workflow", "tool": "set_session_title"}}},
                 engine.connection_epoch)
             self.assertEqual(self.application.session(state["id"])["state"]["title"], "页面交互优化")
+            steer("先核对交互入口")
             complete(engine, "<proposed_plan>调整页面交互</proposed_plan>")
             self.assertEqual(state["stage"], "实施中")
             self.assertEqual(state["approval_source"], "auto")
             Tools(state["id"]).call("write_file", {"repository": "前端", "path": "页面.txt", "content": "更新交互\n"})
             complete(engine, "已完成修改")
             self.assertEqual(state["stage"], "审查中")
+            steer("重点看没有数据的场景")
             complete(engine, dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": [{"repository": "前端", "type": "feat", "scope": "页面", "summary": "调整页面交互"}]}))
             self.assertEqual(state["stage"], "已完成（静态审查）")
             frontend = next(repo for repo in state["repos"] if repo["role"] == "frontend")

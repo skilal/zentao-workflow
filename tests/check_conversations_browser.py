@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from test_conversations import ConversationChecks, PNG
 from workflow.engine import Workflow
+from workflow.rpc import CodexRequestError
 from workflow.web import LocalServer
 
 
@@ -25,7 +26,16 @@ def run():
         engine.state["thread_id"] = "模拟线程"
         engine.state["rpc_connected"] = True
         engine.rpc = Mock(model="示例模型")
-        engine.rpc.request.return_value = {"turn": {"id": "模拟回合"}}
+        def request(method, params):
+            if method == "turn/steer":
+                if params["input"][0]["text"] == "回合结束时的草稿":
+                    engine.last_message = "已处理前两条补充消息"
+                    engine._event({"method": "turn/completed", "params": {"threadId": "模拟线程",
+                                   "turn": {"id": "模拟回合", "status": "completed"}}}, engine.connection_epoch)
+                    raise CodexRequestError("原回合已结束")
+                return {"turnId": params["expectedTurnId"]}
+            return {"turn": {"id": "模拟回合"}}
+        engine.rpc.request.side_effect = request
     server = LocalServer(("127.0.0.1", 0), app)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -91,6 +101,33 @@ def run():
             expect(user_message).to_be_visible()
             expect(user_message.get_by_alt_text("需求截图.png")).to_be_visible()
 
+            user_texts = page.locator(".chat-entry.user .chat-body")
+            original_count = user_texts.count()
+            supplements = user_texts.filter(has_text="先看空列表").or_(user_texts.filter(has_text="再核对筛选条件"))
+            steer_input = page.get_by_placeholder("在模型处理中补充说明或调整方向…")
+            steer_send = page.locator(".followup-composer button.ant-btn-primary")
+            expect(steer_input).to_be_enabled()
+            expect(steer_send).to_be_disabled()
+            steer_input.fill("先看空列表")
+            steer_input.press("Shift+Enter")
+            expect(steer_input).to_have_value("先看空列表\n")
+            steer_input.press("Enter")
+            expect(steer_input).to_have_value("")
+            steer_input.fill("再核对筛选条件")
+            steer_send.click()
+            expect(steer_input).to_have_value("")
+            expect(supplements).to_have_text(["先看空列表", "再核对筛选条件"])
+            expect(page.locator(".process-turn")).to_have_count(1)
+            page.reload()
+            expect(supplements).to_have_text(["先看空列表", "再核对筛选条件"])
+
+            steer_input.fill("回合结束时的草稿")
+            steer_input.press("Enter")
+            expect(page.get_by_text("补充消息发送失败", exact=True)).to_be_visible()
+            expect(page.get_by_placeholder("输入回复、需要调整的计划内容或补充业务规则…")).to_have_value("回合结束时的草稿")
+            expect(page.locator(".chat-entry.assistant").filter(has_text="已处理前两条补充消息")).to_be_visible()
+            expect(user_texts).to_have_count(original_count + 2)
+
             # 当前项目在下一次新建中继承，纯图片也可以发送。
             page.get_by_role("button", name="新建会话", exact=True).click()
             expect(message).to_be_enabled()
@@ -108,8 +145,9 @@ def run():
             page.screenshot(path=str(output / "新建无关联会话.png"), full_page=True)
             send.click()
             expect(page.get_by_text("计划中", exact=True).first).to_be_visible()
-            assert len(app.snapshot()["history"]) == 2
-            assert app.snapshot()["history"][0]["title"] == "图片需求"
+            history = app.snapshot()["history"]
+            assert len(history) == 2
+            assert next(entry for entry in history if entry["id"] != runtime.engine.state["id"])["title"] == "待命名会话"
             assert not errors, errors
             browser.close()
     finally:

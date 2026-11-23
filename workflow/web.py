@@ -183,6 +183,7 @@ class WebApplication:
                                     if "name" in repo and entry["role"] == repo.get("role")}
         repositories = session_repositories(state)
         state["can_edit"] = runtime.engine.editable() and not runtime.engine.closed and not state.get("cleanup", {}).get("finalizing")
+        state["steer_turn_id"] = runtime.engine.steer_turn_id(state)
         state["project"] = session_project(state)
         state["project_move_reason"] = project_move_error(runtime)
         state["can_move_project"] = not state["project_move_reason"]
@@ -694,6 +695,15 @@ class WebApplication:
         request_id = request.get("request_id")
         if not isinstance(data, dict) or not isinstance(request_id, str) or not 8 <= len(request_id) <= 100:
             raise WorkflowError("操作参数或请求标识无效。")
+        if action == "steer":
+            with self.condition:
+                if self.closed or self.busy == "settings":
+                    raise WorkflowError("服务正在关闭或更新设置，请查看最新状态后再发送。")
+                if request.get("preview_id") is not None or data.keys() - {"text", "turn_id"}:
+                    raise WorkflowError("回合内补充消息仅接受目标回合与文字内容。")
+                runtime = self.sessions.get(request.get("session_id"))
+            # 等待 Codex 确认时允许事件发布、其他会话操作及暂停请求继续处理。
+            return runtime.engine.steer(data.get("text"), data.get("turn_id"), request_id)
         with self.condition:
             if self.closed:
                 raise WorkflowError("服务正在关闭。")

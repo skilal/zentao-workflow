@@ -34,8 +34,8 @@ from workflow.pdf_materials import material_files
 from workflow.rpc import MAX_INPUT_CHARACTERS, AppServer, CodexRequestError, thread_parameters
 from workflow.settings import ROOT, WorkflowError, save_settings
 from workflow.session_titles import collect_session_title, title_generation_context
-from workflow.store import SessionStore, followup_available, require_attached_workspaces, timestamp
-from workflow.user_input import input_request_path, pending_input
+from workflow.store import SessionStore, followup_available, require_attached_workspaces, timestamp, workspaces_released
+from workflow.user_input import INPUT_STAGES, input_request_path, pending_input
 from workflow.workspace_reuse import WorkspaceReuseFlow
 from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.workspace_release import WorkspaceReleaseFlow
@@ -129,6 +129,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self.rpc = None
         self.state = None
         self.lock = RLock()
+        self.steer_lock = Lock()
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.control_executor = ThreadPoolExecutor(max_workers=1)
         self.title_executor = ThreadPoolExecutor(max_workers=1)
@@ -203,6 +204,47 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         return [entry for index, entry in enumerate(self.state["reviews"])
                 if entry.get("delivery_round", 1) == self.state.get("delivery_round", 1)
                 and index >= self.state.get("review_start", 0)]
+
+    def steer_turn_id(self, state):
+        cleanup = state.get("cleanup", {})
+        if (self.turn_running and self.rpc and not self.closed and state.get("rpc_connected")
+                and state.get("thread_id") and state["stage"] in INPUT_STAGES
+                and not state.get("pause_requested") and not state.get("pending")
+                and not state.get("workspace_handoff_request") and not workspaces_released(state)
+                and not (cleanup.get("removed") or cleanup.get("finalizing"))):
+            return state.get("turn_id")
+        return None
+
+    def steer(self, text, turn_id, request_id):
+        if not isinstance(text, str) or not (text := text.strip()) or len(text) > MAX_INPUT_CHARACTERS:
+            raise WorkflowError("请输入有效的补充文字，且不要超过消息长度限制。")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise WorkflowError("缺少目标回合，请刷新会话后再发送。")
+        with self.steer_lock:
+            with self.lock:
+                state = self.state
+                result = {"accepted": True, "session_id": state["id"], "request_id": request_id, "turn_id": turn_id}
+                for entry in reversed(state["history"]):
+                    if entry.get("steer_request_id") == request_id:
+                        if entry["turn_id"] != turn_id or entry["text"] != text:
+                            raise WorkflowError("补充消息的请求标识已被使用。")
+                        return {**result, "duplicate": True}
+                if self.steer_turn_id(state) != turn_id:
+                    status = state["stage"] if state.get("rpc_connected") else "Codex 连接已断开"
+                    raise WorkflowError(f"该回合已不能接收补充消息，当前状态为「{status}」。")
+                if pending_input(self.store, state):
+                    raise WorkflowError("模型正在等待明确答复，请使用回答入口。")
+                rpc, thread_id = self.rpc, state["thread_id"]
+                metadata = {"phase": state["phase"], "delivery_round": state["delivery_round"],
+                            "turn_id": turn_id, "steer_request_id": request_id}
+            response = rpc.request("turn/steer", {"threadId": thread_id, "expectedTurnId": turn_id,
+                                                  "input": [{"type": "text", "text": text}],
+                                                  "clientUserMessageId": request_id})
+            if not isinstance(response, dict) or response.get("turnId") != turn_id:
+                raise WorkflowError("Codex 返回的回合与本次补充消息的目标不一致，发送结果未确认。")
+            with self.lock:
+                self.note("用户", text, **metadata)
+            return result
 
     def validate_followup(self, text, image_ids, attachments=()):
         if self.state.get("manual_compile"):
@@ -1458,11 +1500,14 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 self.emit("error", params["message"])
 
     def _completed(self, turn, session_id, epoch):
-        state = self.state
-        if state["id"] != session_id or epoch != self.connection_epoch or self.closed:
-            return
-        if turn.get("id") and state.get("turn_id") and turn["id"] != state["turn_id"]:
-            return
+        # 完成通知可能比插话响应先抵达，等已受理的文字写入后再记录最终回复。
+        with self.steer_lock:
+            state = self.state
+            if state["id"] != session_id or epoch != self.connection_epoch or self.closed:
+                return
+            if turn.get("id") and state.get("turn_id") and turn["id"] != state["turn_id"]:
+                return
+            self.turn_running = False
         apply_followup_replacements(self.store, state)
         self.set_progress_status("waiting" if state.get("pending") else
                              {"completed": "completed", "interrupted": "interrupted"}.get(turn.get("status"), "failed"))

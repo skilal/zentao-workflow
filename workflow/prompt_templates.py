@@ -2,7 +2,7 @@
 
 SCOPE_CONTINUATION = "本次续接未完成任务，结合 continuation_context、原需求和 followup 消息完成本轮剩余工作；已有代码保留。"
 SCOPE_FOLLOWUP = (
-    "原需求资料与历史计划用于理解业务背景，本轮只处理 followup 中的消息。"
+    "原需求资料与历史计划用于理解业务背景，本轮处理 followup 消息及当前回合内的补充说明。"
     "获取信息时只读取并回答；明确要求修改时才处理对应修改。是否自动 Review 由控制器决定。"
 )
 SCOPE_CONVERSATION = "本次未关联禅道工作项，以 supplement 中的首条消息和 supplement_images 为需求资料，按当前阶段和控制器授权处理。"
@@ -18,6 +18,7 @@ MATERIAL_NAMING = (
 )
 TURN = (
     "当前阶段：{phase}。{scope}\n{text}\n{policy_instruction}{material_instruction}"
+    "\n结合当前回合内的用户补充说明调整处理重点，遵守本阶段职责、输出要求和现有授权。涉及授权变化时按原流程提问。"
     "\n工作流上下文：\n{context}"
 )
 BRANCH_INPUT = "依据线程中的分支规则分析上下文，按 Schema 返回。\n{context}"

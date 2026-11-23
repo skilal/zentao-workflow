@@ -565,6 +565,7 @@ function WorkflowApp() {
   const eventSource = useRef(null);
   const [fatal, setFatal] = useState("");
   const [requestsPending, setRequestsPending] = useState({});
+  const steeringRequests = useRef(new Set());
   const sending = requestsPending[model?.selectedSessionId || model?.preview?.preview_id || "new"] || requestsPending.new || requestsPending.global || "";
   const [sessionQuery, setSessionQuery] = useState("");
   const [sessionFilter, setSessionFilter] = useState("all");
@@ -1087,7 +1088,8 @@ function WorkflowApp() {
     const current = modelRef.current;
     const id = ["connect", "refresh", "settings", "new_conversation"].includes(action) ? null : targetId;
     const previewId = !id && ["collect", "collect_by_id", "refresh_materials", "plan"].includes(action) ? current.preview?.preview_id : null;
-    const pendingKey = id || previewId || (["collect", "collect_by_id", "new_conversation"].includes(action) ? "new" : "global");
+    const pendingKey = action === "steer" ? `steer:${id}` :
+      id || previewId || (["collect", "collect_by_id", "new_conversation"].includes(action) ? "new" : "global");
     const epoch = viewEpoch.current;
     setRequestsPending(previous => ({ ...previous, [pendingKey]: action }));
     try {
@@ -1114,7 +1116,10 @@ function WorkflowApp() {
         if (epoch === viewEpoch.current) receiveState(payload);
       }
       return result;
-    } catch (error) { notice.error({ message: "操作未提交", description: error.message }); return null; }
+    } catch (error) {
+      notice.error({ message: action === "steer" ? "补充消息发送失败" : "操作未提交", description: error.message });
+      return null;
+    }
     finally { setRequestsPending(previous => { const next = { ...previous }; delete next[pendingKey]; return next; }); }
   }
   async function startPlan() {
@@ -1125,6 +1130,22 @@ function WorkflowApp() {
       const [kind, number] = key.split(":"); return { kind, id: Number(number) };
     }) });
     if (result && epoch === viewEpoch.current && modelRef.current.selectedSessionId === result.session_id) navigate("plan");
+  }
+  async function steer(turnId) {
+    const { id } = state;
+    const text = draftRef.current.reply;
+    if (!text.trim() || steeringRequests.current.has(id)) return;
+    steeringRequests.current.add(id);
+    try {
+      if (!await act("steer", { text, turn_id: turnId }, id)) return;
+      if (modelRef.current.selectedSessionId === id) {
+        if (draftRef.current.reply === text) changeDraft({ reply: "" });
+      } else {
+        const key = `workflow-draft:${id}`;
+        const saved = JSON.parse(sessionStorage.getItem(key) || "{}");
+        if (saved.reply === text) sessionStorage.setItem(key, JSON.stringify({ ...saved, reply: "" }));
+      }
+    } finally { steeringRequests.current.delete(id); }
   }
   async function answer() {
     if (state.can_followup) {
@@ -1633,13 +1654,18 @@ function WorkflowApp() {
         h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"))));
     const questions = state.pending?.params?.questions || [];
     const continuing = Boolean(state.can_followup);
+    const activeTurn = state.progress_turns?.at(-1);
+    const steerTurnId = activeTurn?.status === "running" && activeTurn.id === state.steer_turn_id ? activeTurn.id : null;
+    const steerPending = Boolean(requestsPending[`steer:${state.id}`]);
+    const canSteer = Boolean(steerTurnId && !stopped);
+    const canSendSteer = canSteer && !steerPending && Boolean(draft.reply.trim());
     const answerFiles = (state.answer_attachments || []).filter(entry => entry.request_id === answerRequestId && entry.history_index === undefined);
     const answerTransfers = transfers.filter(task => task.purpose === "answer" && task.answer_request_id === answerRequestId);
     const answersComplete = questions.every(question => {
       const value = draft.answers[`${state.pending.id}:${question.id}:${question.question}`] || {};
       return value.choice || value.custom?.trim() || answerFiles.some(entry => entry.question_id === question.id);
     });
-    const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
+    const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy && !steerPending &&
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const canSend = canAnswer && answersComplete && !answerTransfers.length && (!continuing || !transfers.length);
     const sendAnswerOnEnter = event => sendOnEnter(event, canSend, answer);
@@ -1768,10 +1794,12 @@ function WorkflowApp() {
             h(Button, { disabled: !followupEditable, onClick: () => followupZipInput.current.click() }, "上传文件"),
             h(Tooltip, { title: "支持 PDF、Word、文本、图片及 ZIP；ZIP 仅读取目录与 XML" },
               h(Typography.Text, { type: "secondary", className: "muted" }, `可多选或粘贴，单个 ≤ ${model.settings.max_attachment_mb} MB`))),
-          h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer,
-            onKeyDown: sendAnswerOnEnter,
+          h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer && !canSteer, readOnly: steerPending,
+            onKeyDown: steerTurnId ? event => sendOnEnter(event, canSendSteer, () => steer(steerTurnId)) : sendAnswerOnEnter,
             onPaste: continuing && followupEditable ? event => pasteImages(event, "followup") : undefined,
-            placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片和文件…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
+            placeholder: steerTurnId ? "在模型处理中补充说明或调整方向…" : questions.length ? "其他补充说明（可选）" :
+              continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片和文件…" : "输入回复、需要调整的计划内容或补充业务规则…",
+            onChange: event => changeDraft({ reply: event.target.value }) }),
           h(Typography.Text, { type: "secondary" }, "Enter 发送，Shift+Enter 换行"),
           continuing && h(React.Fragment, null,
             renderFeedbackImages(state.followup_images.filter(image => image.history_index === undefined), followupEditable),
@@ -1789,7 +1817,9 @@ function WorkflowApp() {
               h(Tooltip, { title: "检查后端并修复相关问题" }, h("label", { className: "followup-option" },
                 h(Switch, { size: "small", checked: draft.followup_compile_enabled, disabled: !followupEditable, "aria-label": "本轮后端编译检查", onChange: checked => changeDraft({ followup_compile_enabled: checked }) }),
                 h("span", null, "后端检查")))),
-            h(Button, { type: "primary", disabled: !canSend, onClick: answer }, questions.length ? "提交回答并继续" : continuing ? "发送" : "提交补充说明"))),
+            h(Button, { type: "primary", disabled: steerTurnId ? !canSendSteer : !canSend,
+              onClick: steerTurnId ? () => steer(steerTurnId) : answer },
+              questions.length ? "提交回答并继续" : steerTurnId || continuing ? "发送" : "提交补充说明"))),
         h(CardBox, { title: "流程操作" }, h(Space, { wrap: true },
           h(Button, { disabled: stopped || !canPause, onClick: () => act("pause") }, "暂停当前阶段"),
           h(Button, { disabled: busy || !["已暂停", "已停止"].includes(stage), onClick: () => act("resume") }, "从暂停点继续"),
@@ -1806,7 +1836,7 @@ function WorkflowApp() {
             } }, "变更目录与审查基线"),
           h(Button, { disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
-            "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。审查通过后本地提交。需要推送时可在续聊中发送“推送前端”或“推送全部仓库”。" :
+            "后续消息可手动开启计划模式。计划模式和自动 Review 开关均在发送后恢复关闭。审查通过后本地提交。需要推送时可在续聊中发送“推送前端”或“推送全部仓库”。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地提交。")),
         state.baseline_change_request && h(CardBox, { title: "确认变更审查基线" },
           h(Alert, { type: "warning", showIcon: true, message: "将当前 HEAD 设为本轮新基线", description:

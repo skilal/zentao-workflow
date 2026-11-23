@@ -132,6 +132,8 @@ class AppServer:
             try:
                 response = waiter.get(timeout=self.settings["codex"]["rpc_timeout_seconds"])
             except Empty:
+                if method == "turn/steer":
+                    raise WorkflowError("补充消息的发送结果未确认，请核对当前会话后再决定是否重发。") from None
                 raise WorkflowError("Codex 接口响应超时，流程已停止，未自动重试。") from None
             if "error" in response:
                 raise CodexRequestError(str(response["error"].get("message", "未知错误")))
