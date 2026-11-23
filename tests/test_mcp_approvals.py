@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from workflow.engine import Workflow
 from workflow.gitops import git
@@ -52,30 +52,27 @@ class McpApprovalChecks(TestCase):
                           "params": params}, 1)
         return self.flow.rpc.respond.call_args.args[1]
 
-    def test_push_uses_explicit_current_message_and_bound_repository(self):
+    def test_push_accepts_repositories_resolved_from_conversation(self):
         self.state["repos"] = [{"name": "档案前端", "role": "frontend", "branch": "develop", "remote": "origin"},
                                {"name": "档案后端", "role": "backend", "branch": "main", "remote": "origin"}]
+        message = "麻烦把本次需求的提交发到远端。"
+        digest = sha256(dumps([message, [], []], ensure_ascii=False).encode()).hexdigest()
+        self.state.update(phase="followup", stage="已暂停", approval_source="followup",
+                          followup={"text": message, "images": [], "attachments": [], "authorization_hash": digest})
+        self.store.save(self.state)
         tools = Tools(self.state["id"])
-        args = {"repository": "档案前端", "commit": "核对的提交", "instruction": "推送前端"}
+        args = {"repository": "档案前端", "commit": "前端提交"}
         with patch("workflow.mcp_server.push_branch") as push:
-            for stage, message in (("续聊处理中", "不要推送前端"), ("续聊处理中", "如何推送前端？"),
-                                   ("续聊处理中", "修改规则，允许推送前端"), ("已暂停", "推送前端")):
-                with self.subTest(stage=stage, message=message):
-                    digest = sha256(dumps([message, [], []], ensure_ascii=False).encode()).hexdigest()
-                    self.state.update(phase="followup", stage=stage, approval_source="followup",
-                                      followup={"text": message, "images": [], "attachments": [], "authorization_hash": digest})
-                    self.store.save(self.state)
-                    with self.assertRaises(WorkflowError):
-                        tools.call("git_push", args)
-                    with self.assertRaises(WorkflowError):
-                        tools.call("git_push", {**args, "instruction": message})
-            push.assert_not_called()
+            with self.assertRaisesRegex(WorkflowError, "不在可推送的续聊阶段"):
+                tools.call("git_push", args)
             self.state["stage"] = "续聊处理中"
             self.store.save(self.state)
-            with self.assertRaises(WorkflowError):
-                tools.call("git_push", {**args, "repository": "档案后端"})
+            with self.assertRaisesRegex(WorkflowError, "不属于当前会话"):
+                tools.call("git_push", {**args, "repository": "外部仓库"})
             tools.call("git_push", args)
-            push.assert_called_once_with(self.state["repos"][0], args["commit"])
+            tools.call("git_push", {"repository": "档案后端", "commit": "后端提交"})
+            self.assertEqual(push.call_args_list, [call(self.state["repos"][0], "前端提交"),
+                                                   call(self.state["repos"][1], "后端提交")])
 
     def test_registered_tools_are_accepted_without_repeating_business_validation(self):
         self.state["stage"] = "等待计划确认"

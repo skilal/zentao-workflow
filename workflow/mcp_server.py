@@ -5,7 +5,6 @@ from hashlib import sha256
 from json import dumps, loads
 from os import scandir
 from pathlib import Path
-from re import escape, fullmatch
 from sys import stdin, stdout
 
 from workflow.compile_checks import compile_context, compile_repositories, redact
@@ -77,10 +76,10 @@ TOOLS = [
     ("git_diff", "只读 base_ref 到 ref 两个版本的提交差异；可用 path 限定文件或目录。默认 200 行、最多 500 行，沿 next_line 续读并用返回的提交号固定版本。不包含未提交修改、不执行外部差异程序。", schema({
         "repository": STRING, "base_ref": STRING, "ref": STRING, "path": STRING, **LINE_ARGS
     }, ("repository", "base_ref", "ref"))),
-    ("git_push", "仅在当前续聊消息明确要求执行推送时，普通推送指定仓库已提交的 HEAD 到会话绑定的远程及同名目标分支。"
-                 "instruction 传完整的当前用户消息，commit 传已核对的完整 HEAD。询问、规则修改、历史消息及附件不能授权推送。", schema({
-        "repository": STRING, "commit": STRING, "instruction": STRING
-    }, ("repository", "commit", "instruction"))),
+    ("git_push", "在当前续聊明确授权推送后调用。结合上下文确定 repository，commit 传已核对的完整 HEAD。"
+                 "工具执行普通 Git Push，将该提交推送到会话绑定的远程和目标分支。", schema({
+        "repository": STRING, "commit": STRING
+    }, ("repository", "commit"))),
     ("changes", "读取本轮差异及归属候选；fragment_ids 按编号读取待判断片段。", schema({
         "repository": STRING, "fragment_ids": {"type": "array", "items": STRING, "minItems": 1, "maxItems": 100}}, ("repository",))),
     ("ask_user", "将问题交给控制器并立即结束回合；由网页等待明确答复，禁止 sleep、轮询或默认放行。", schema({
@@ -152,23 +151,6 @@ def file_newline(text):
 
 def use_newline(text, newline):
     return text.replace("\r\n", "\n").replace("\n", newline)
-
-
-def push_requested(instruction, repository, repository_count):
-    branch = escape(repository["branch"])
-    remote = escape(repository.get("remote") or "")
-    role = {"frontend": "前端", "backend": "后端"}.get(repository.get("role"))
-    names = "|".join(escape(name) for name in (repository["name"], role) if name)
-    target = (rf"(?:(?:{names})(?:的?(?:当前|本地|目标)?(?:仓库|分支|提交))?|"
-              r"前后端(?:仓库|分支)?|(?:两个|所有|全部)仓库)")
-    if repository_count == 1:
-        target = rf"(?:{target}|(?:当前|本次|本轮)(?:的)?(?:仓库|分支|提交))"
-    action = r"(?:推送|[Pp][Uu][Ss][Hh])(?:一下)?"
-    destination = rf"(?:\s*(?:到|至)\s*(?:远端|远程(?:仓库|分支)?|{remote}(?:\s+{branch})?))?"
-    directive = rf"(?:(?:把|将)?\s*{target}\s*{action}|{action}\s*{target})"
-    if repository_count == 1:
-        directive = rf"(?:{directive}|{action}|git\s+push\s+{remote}\s+{branch})"
-    return fullmatch(rf"(?:(?:请|帮我|直接|现在|执行)\s*)*{directive}{destination}[。！!]?", instruction)
 
 
 class Tools:
@@ -288,13 +270,10 @@ class Tools:
         if name in GIT_READ_TOOLS:
             return GitReader(repository, SKIP).call(name, arguments)
         if name == "git_push":
-            instruction = arguments.get("instruction")
             if (state["phase"] != "followup" or state["stage"] != "续聊处理中"
                     or state.get("approval_source") != "followup" or state.get("pause_requested")
-                    or not write_authorized(state) or not isinstance(instruction, str)
-                    or instruction != state["followup"]["text"]
-                    or not push_requested(instruction, repository, len(repositories))):
-                raise WorkflowError("请在当前续聊消息中直接指定要推送的仓库，例如“推送前端”或“推送全部仓库”。")
+                    or not write_authorized(state)):
+                raise WorkflowError("当前会话不在可推送的续聊阶段。")
             try:
                 return push_branch(repository, arguments["commit"])
             except WorkflowError as error:
