@@ -58,10 +58,11 @@ class McpApprovalChecks(TestCase):
         message = "麻烦把本次需求的提交发到远端。"
         digest = sha256(dumps([message, [], []], ensure_ascii=False).encode()).hexdigest()
         self.state.update(phase="followup", stage="已暂停", approval_source="followup",
+                          deliveries=[{"repos": self.state["repos"], "commits": {"档案前端": "前端提交", "档案后端": "后端提交"}}],
                           followup={"text": message, "images": [], "attachments": [], "authorization_hash": digest})
         self.store.save(self.state)
         tools = Tools(self.state["id"])
-        args = {"repository": "档案前端", "commit": "前端提交"}
+        args = {"repository": "档案前端"}
         with patch("workflow.mcp_server.push_branch") as push:
             with self.assertRaisesRegex(WorkflowError, "不在可推送的续聊阶段"):
                 tools.call("git_push", args)
@@ -69,10 +70,12 @@ class McpApprovalChecks(TestCase):
             self.store.save(self.state)
             with self.assertRaisesRegex(WorkflowError, "不属于当前会话"):
                 tools.call("git_push", {**args, "repository": "外部仓库"})
+            with self.assertRaisesRegex(WorkflowError, "指定提交不属于当前会话"):
+                tools.call("git_push", {**args, "commit": "其他提交"})
             tools.call("git_push", args)
-            tools.call("git_push", {"repository": "档案后端", "commit": "后端提交"})
-            self.assertEqual(push.call_args_list, [call(self.state["repos"][0], "前端提交"),
-                                                   call(self.state["repos"][1], "后端提交")])
+            tools.call("git_push", {"repository": "档案后端"})
+            self.assertEqual(push.call_args_list, [call(self.state["repos"][0], "前端提交", ["前端提交"]),
+                                                   call(self.state["repos"][1], "后端提交", ["后端提交"])])
 
     def test_registered_tools_are_accepted_without_repeating_business_validation(self):
         self.state["stage"] = "等待计划确认"

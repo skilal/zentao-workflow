@@ -13,7 +13,7 @@ from workflow.artifacts import ARTIFACT_TOOLS, create_artifact, manifests
 from workflow.answer_attachments import read_answer_attachment, submitted_attachments
 from workflow.context import context_hash, requirement_context
 from workflow.followup_attachments import read_followup_attachment, submitted_attachments as submitted_followup_attachments
-from workflow.delivery import followup_replacements, previous_task_changes, validate_review_request
+from workflow.delivery import delivery_commits, followup_replacements, previous_task_changes, validate_review_request
 from workflow.gitops import differences, git, push_branch, repository_lock, safe_file
 from workflow.git_read import GIT_READ_TOOLS, GitReader
 from workflow.shared_changes import (file_version, fragment_details, load_record, read_blob,
@@ -76,10 +76,10 @@ TOOLS = [
     ("git_diff", "只读 base_ref 到 ref 两个版本的提交差异；可用 path 限定文件或目录。默认 200 行、最多 500 行，沿 next_line 续读并用返回的提交号固定版本。不包含未提交修改、不执行外部差异程序。", schema({
         "repository": STRING, "base_ref": STRING, "ref": STRING, "path": STRING, **LINE_ARGS
     }, ("repository", "base_ref", "ref"))),
-    ("git_push", "在当前续聊明确授权推送后调用。结合上下文确定 repository，commit 传已核对的完整 HEAD。"
-                 "工具执行普通 Git Push，将该提交推送到会话绑定的远程和目标分支。", schema({
+    ("git_push", "在当前续聊明确要求推送后，逐仓库执行普通 Git Push。repository 使用 task_context 中有本会话提交的仓库。"
+                 "默认使用该仓库最近一条会话提交，commit 仅在用户指定其他会话提交时传入。", schema({
         "repository": STRING, "commit": STRING
-    }, ("repository", "commit"))),
+    }, ("repository",))),
     ("changes", "读取本轮差异及归属候选；fragment_ids 按编号读取待判断片段。", schema({
         "repository": STRING, "fragment_ids": {"type": "array", "items": STRING, "minItems": 1, "maxItems": 100}}, ("repository",))),
     ("ask_user", "将问题交给控制器并立即结束回合；由网页等待明确答复，禁止 sleep、轮询或默认放行。", schema({
@@ -216,6 +216,7 @@ class Tools:
             if type(include) is not bool:
                 raise WorkflowError("include_materials 必须为布尔值。")
             snapshot = requirement_context(state)
+            repositories = compile_repositories(state)
             return {**{key: state.get(key) for key in ("item", "items", "project", "supplement", "repos", "approved_plan", "approval_source", "plan_round", "phase", "stage", "commit_message")},
                     "snapshot": snapshot if include else {key: snapshot[key] for key in ("blockers", "feishu_links")},
                     "materials_revision": context_hash(snapshot), "materials_included": include,
@@ -230,8 +231,10 @@ class Tools:
                     "baseline_change": (state.get("baseline_changes") or [None])[-1],
                     "review_enabled": state.get("review_enabled", True),
                     "previous_task_changes": previous_task_changes(state) if state["phase"] == "followup" else [],
+                    "delivery_commits": {repo["name"]: delivery_commits(state, repo)
+                                         for repo in repositories} if state["phase"] == "followup" else {},
                     "compile_check": state.get("compile_check", {"enabled": False}),
-                    "repos": compile_repositories(state),
+                    "repos": repositories,
                     "compile_checks": compile_context(state)}
         if name == "set_session_title":
             return register_session_title(self.store, state, arguments.get("title"))
@@ -274,8 +277,14 @@ class Tools:
                     or state.get("approval_source") != "followup" or state.get("pause_requested")
                     or not write_authorized(state)):
                 raise WorkflowError("当前会话不在可推送的续聊阶段。")
+            commits = delivery_commits(state, repository)
+            if not commits:
+                raise WorkflowError("当前会话在此目标分支上没有本地提交可推送。")
+            commit_id = arguments.get("commit", commits[-1])
+            if commit_id not in commits:
+                raise WorkflowError("指定提交不属于当前会话在该目标分支上的本地交付。")
             try:
-                return push_branch(repository, arguments["commit"])
+                return push_branch(repository, commit_id, commits)
             except WorkflowError as error:
                 raise WorkflowError(redact(str(error))) from None
         if name == "list_files":

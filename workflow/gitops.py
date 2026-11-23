@@ -566,20 +566,32 @@ def ensure_baseline(repository):
 
 
 @locked_repository
-def push_branch(repository, commit_id):
+def push_branch(repository, commit_id, delivery_commits):
     path, branch, remote = repository["path"], repository["branch"], repository.get("remote")
     head = ensure_baseline(repository)
-    if head != commit_id:
-        raise WorkflowError("当前 HEAD 与核对的提交不一致，请重新核对推送范围。")
+    if git(path, "merge-base", head, commit_id, optional=True) != commit_id:
+        raise WorkflowError("会话提交已不在当前目标分支上，请核对分支历史。")
     if not remote or remote not in git(path, "remote").splitlines():
         raise WorkflowError("当前会话的远程仓库不可用，请核对配置。")
     urls = git(path, "remote", "get-url", "--push", "--all", "--", remote).splitlines()
     if len(urls) != 1:
         raise WorkflowError("当前远程仓库须只有一个推送地址，请核对配置。")
     reject_hooks(path, ("pre-push", "reference-transaction", "pre-auto-gc"))
+    ref = f"refs/heads/{branch}"
+    remote_head = git(path, "ls-remote", "--refs", "--", urls[0], ref).split()
+    result = {"repository": repository["name"], "remote": remote, "branch": branch, "commit": commit_id}
+    if remote_head:
+        if git(path, "merge-base", remote_head[0], commit_id, optional=True) == commit_id:
+            return {**result, "status": "已在远程"}
+        bases = [remote_head[0]]
+    else:
+        bases = git(path, "rev-list", "--parents", "-n", "1", delivery_commits[0]).split()[1:]
+    outgoing = git(path, "rev-list", commit_id, "--not", *bases).splitlines()
+    if set(outgoing).difference(delivery_commits):
+        raise WorkflowError("此次推送会带上其他本地提交，已停止。请先核对目标分支的提交范围。")
     git(path, "-c", f"remote.{remote}.mirror=false", "push", "--no-follow-tags",
-        "--recurse-submodules=no", "--", remote, f"{head}:refs/heads/{branch}")
-    return {"repository": repository["name"], "remote": remote, "branch": branch, "commit": head}
+        "--recurse-submodules=no", "--", remote, f"{commit_id}:{ref}")
+    return {**result, "status": "已推送"}
 
 
 def changed_paths(repository):

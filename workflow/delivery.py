@@ -1,4 +1,4 @@
-"""续聊中显式审查提交请求的范围校验，不执行 Git 提交。"""
+"""续聊中的历史交付记录与显式提交请求。"""
 
 from hashlib import sha256
 from json import loads
@@ -7,6 +7,17 @@ from pathlib import Path
 from workflow.gitops import manifest, safe_file
 from workflow.settings import WorkflowError
 from workflow.store import write_authorized
+
+
+def delivery_commits(state, repository):
+    commits = []
+    name, branch = repository["name"], repository["branch"]
+    for delivery in [*state.get("deliveries", []), state]:
+        commit_id = (delivery.get("commits") or {}).get(name)
+        if commit_id and commit_id != "无代码修改" and any(
+                repo["name"] == name and repo["branch"] == branch for repo in delivery["repos"]):
+            commits.append(commit_id)
+    return commits
 
 
 def previous_task_changes(state):

@@ -1836,7 +1836,7 @@ function WorkflowApp() {
             } }, "变更目录与审查基线"),
           h(Button, { disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
-            "后续消息可手动开启计划模式。计划模式和自动 Review 开关均在发送后恢复关闭。审查通过后本地提交。需要推送时可直接在续聊中提出。" :
+            "后续消息可手动开启计划模式。计划模式和自动 Review 开关均在发送后恢复关闭。审查通过后本地提交。在续聊中发送 push 可推送本会话的提交。" :
             "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地提交。")),
         state.baseline_change_request && h(CardBox, { title: "确认变更审查基线" },
           h(Alert, { type: "warning", showIcon: true, message: "将当前 HEAD 设为本轮新基线", description:

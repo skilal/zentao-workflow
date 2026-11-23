@@ -112,6 +112,32 @@ class FollowupChecks(TestCase):
         if self.state["phase"] == "review":
             self.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
 
+    def test_plain_push_followup_pushes_archived_session_commits(self):
+        delivered = self.state["commits"].copy()
+        remotes = {}
+        for repo in self.state["repos"]:
+            path = repo["path"]
+            remote = self.root / f"{repo['role']}.git"
+            remotes[repo["name"]] = remote
+            git(self.root, "init", "--bare", str(remote))
+            git(path, "remote", "add", "origin", str(remote))
+            git(path, "push", "origin", f"{repo['baseline']}:refs/heads/项目分支")
+            git(path, "commit", "--allow-empty", "-m", "其他会话提交")
+
+        self.send("push", review_enabled=False)
+        tools = RawTools(self.state["id"])
+        context = tools.call("task_context", {})
+        self.assertEqual(context["delivery_commits"], {name: [commit_id] for name, commit_id in delivered.items()})
+        self.assertEqual(context["followup"]["text"], "push")
+        for repo in context["repos"]:
+            result = tools.call("git_push", {"repository": repo["name"]})
+            self.assertEqual(result["status"], "已推送")
+            self.assertEqual(git(remotes[repo["name"]], "rev-parse", "refs/heads/项目分支"), delivered[repo["name"]])
+            self.assertNotEqual(git(repo["path"], "rev-parse", "HEAD"), delivered[repo["name"]])
+        self.complete("本会话提交已推送")
+        self.assertEqual(self.state["phase"], "complete")
+        self.assertFalse(self.state["commits"])
+
     def request(self, **changes):
         return {"action": "followup", "data": {"text": "测试反馈", "image_ids": [], "review_enabled": True},
                 "session_id": self.state["id"], "revision": self.runtime.revision,

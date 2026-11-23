@@ -488,26 +488,39 @@ class LocalCommitChecks(TestCase):
         self.assertIsNone(commit(self.repository, "feat(workflow): 无修改", {}))
         self.assertEqual(git(self.source, "rev-parse", "HEAD"), self.baseline)
 
-    def test_explicit_push_updates_only_the_bound_remote_branch(self):
+    def test_explicit_push_updates_only_the_bound_branch_to_the_delivered_commit(self):
         self.file.write_text("updated\n", encoding="utf-8")
         head = commit(self.repository, "feat(workflow): 本地交付", manifest([self.repository]))
         git(self.source, "tag", "-a", "local-only", "-m", "本地标签", head)
         git(self.source, "config", "push.followTags", "true")
         git(self.source, "config", "remote.origin.mirror", "true")
-        self.repository.update(remote="origin", checkout_head=head)
+        git(self.source, "commit", "--allow-empty", "-m", "其他会话提交")
+        later = git(self.source, "rev-parse", "HEAD")
+        self.repository.update(remote="origin", checkout_head=later)
         self.file.write_text("uncommitted\n", encoding="utf-8")
-        result = push_branch(self.repository, head)
-        self.assertEqual(result, {"repository": "前端", "remote": "origin", "branch": "delivery", "commit": head})
+        result = push_branch(self.repository, head, [head])
+        self.assertEqual(result, {"repository": "前端", "remote": "origin", "branch": "delivery", "commit": head, "status": "已推送"})
         self.assertEqual(git(self.remote, "show-ref"), f"{head} refs/heads/delivery")
+        self.assertEqual(git(self.source, "rev-parse", "HEAD"), later)
         self.assertEqual(self.file.read_text(encoding="utf-8"), "uncommitted\n")
+        self.assertEqual(push_branch(self.repository, head, [head])["status"], "已在远程")
 
-    def test_push_checks_head_and_stops_at_active_hook(self):
+    def test_push_stops_if_it_would_include_other_local_commits(self):
+        git(self.source, "commit", "--allow-empty", "-m", "其他会话提交")
+        git(self.source, "commit", "--allow-empty", "-m", "本会话提交")
+        head = git(self.source, "rev-parse", "HEAD")
+        self.repository.update(remote="origin", checkout_head=head)
+        with self.assertRaisesRegex(WorkflowError, "会带上其他本地提交"):
+            push_branch(self.repository, head, [head])
+        self.assertEqual(git(self.remote, "show-ref"), self.remote_refs)
+
+    def test_push_checks_branch_history_and_stops_at_active_hook(self):
         self.repository["remote"] = "origin"
-        with self.assertRaisesRegex(WorkflowError, "核对的提交不一致"):
-            push_branch(self.repository, "old-head")
+        with self.assertRaisesRegex(WorkflowError, "不在当前目标分支"):
+            push_branch(self.repository, "old-head", ["old-head"])
         (self.source / ".git" / "hooks" / "pre-push").write_text("exit 1\n", encoding="utf-8")
         with self.assertRaisesRegex(WorkflowError, "pre-push"):
-            push_branch(self.repository, self.baseline)
+            push_branch(self.repository, self.baseline, [self.baseline])
         self.assertEqual(git(self.remote, "show-ref"), self.remote_refs)
 
     def test_changed_code_branch_head_and_external_index_block_commit(self):
