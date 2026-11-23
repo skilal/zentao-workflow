@@ -253,6 +253,59 @@ class WorkspaceAllocationChecks(TestCase):
         self.assertEqual(self.state["phase"], "plan")
         self.assertTrue(all(repo["workspace_mode"] == "switched" for repo in self.state["repos"]))
 
+    def test_shared_preparation_and_followup_do_not_create_session_workspace_directories(self):
+        for repository in self.settings["repositories"]:
+            git(repository["path"], "switch", "项目/develop")
+        other = self.engine.store.new({"kind": "task", "id": 8, "title": "共享目录会话"})
+        other["repos"] = [{**repository, "branch": "项目/develop", "workspace_owned": False}
+                          for repository in self.settings["repositories"]]
+        self.engine.store.save(other)
+        self.engine.prepare_and_plan([self.selection("frontend"), self.selection("backend")], "")
+        self.assertTrue(all(repo["workspace_mode"] == "reused" for repo in self.state["repos"]))
+        self.assertFalse(Path(self.settings["workspace_root"]).exists())
+        self.assertFalse((self.engine.store.directory(self.state["id"]) / "workspace").exists())
+        self.state.update(followup={"text": "继续处理"}, delivery_round=2)
+        self.engine._prepare_followup()
+        self.assertFalse(Path(self.settings["workspace_root"]).exists())
+
+    def test_new_worktree_uses_item_number_and_cleanup_preserves_shared_source(self):
+        path = self.root / "frontend"
+        (path / "业务.txt").write_text("本机业务改动\n", encoding="utf-8")
+        self.assess(path, "functional")
+        self.engine.prepare_and_plan([self.selection()], "")
+        record = self.state["repos"][0]
+        expected = Path(self.settings["workspace_root"]) / "task-7" / "repo-1"
+        self.assertEqual(Path(record["path"]), expected)
+        self.assertTrue(expected.is_dir())
+        self.assertEqual(managed_workspace(self.engine.store, expected, [self.state]), self.state["id"])
+        git(path, "branch", "项目/续聊")
+        self.state.update(deliveries=[{"repos": self.state["repos"]}], repos=[], delivery_round=2,
+                          followup={"text": "继续处理"}, selections=[{**self.selection(),
+                          "branch": "项目/续聊", "base": "refs/heads/项目/续聊"}])
+        self.engine._prepare_followup()
+        current = Path(self.state["repos"][0]["path"])
+        self.assertEqual(current, expected.with_name("repo-1-delivery-2"))
+        self.assertTrue(current.is_dir())
+        cleanup_workspaces(self.engine.store, self.state, self.settings["repositories"])
+        self.assertFalse(expected.exists())
+        self.assertFalse(current.exists())
+        self.assertTrue(path.exists())
+
+    def test_turn_and_thread_use_the_same_shared_repository_directory(self):
+        from workflow.rpc import thread_parameters
+        self.engine.prepare_and_plan([self.selection()], "")
+        self.engine.ensure_rpc = Mock()
+        self.engine.rpc = Mock()
+        self.engine.rpc.request.return_value = {"turn": {"id": "模拟回合"}}
+        self.engine._start_turn = Workflow._start_turn.__get__(self.engine)
+        self.engine._start_turn("继续计划")
+        parameters = self.engine.rpc.request.call_args.args[1]
+        thread = thread_parameters(self.state, "测试模型", {})
+        expected = Path(self.state["repos"][0]["path"])
+        self.assertEqual(Path(parameters["cwd"]), expected)
+        self.assertEqual(Path(thread["cwd"]), expected)
+        self.assertFalse(Path(self.settings["workspace_root"]).exists())
+
     def test_ai_idle_round_resumes_preparation_and_keeps_decision(self):
         path = self.root / "frontend"
         (path / "logback.xml").write_text("本机日志目录\n", encoding="utf-8")
@@ -385,11 +438,12 @@ class WorkspaceAllocationChecks(TestCase):
         self.assertTrue(git(path, "rev-parse", request["stash"]))
         self.assertFalse(self.state["repos"])
 
-    def test_business_thread_cwd_uses_central_root(self):
+    def test_business_thread_cwd_uses_bound_repository(self):
         from workflow.rpc import thread_parameters
+        record = self.acquire()
         self.state["phase"] = "plan"
         parameters = thread_parameters(self.state, "测试模型", {})
-        self.assertEqual(Path(parameters["cwd"]), workspace_directory(self.engine.store, self.state))
+        self.assertEqual(Path(parameters["cwd"]), Path(record["path"]))
 
     def test_ai_sees_real_competing_feature_history_before_dev_selection(self):
         path = self.root / "frontend"

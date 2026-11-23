@@ -14,6 +14,7 @@ from threading import Event, Lock, Thread, current_thread
 from workflow.branching import BRANCH_INSTRUCTIONS
 from workflow.mcp_server import BRANCH_COMPARE_TOOL, TOOLS
 from workflow.settings import ROOT, WorkflowError
+from workflow.workspace_paths import working_directory
 
 
 MAX_INPUT_CHARACTERS = 1048576
@@ -224,7 +225,7 @@ def thread_parameters(state, model, disabled_mcp):
                            "features.remote_plugin": False, "web_search": "disabled",
                            "mcp_servers": {**disabled_mcp, "workflow": server}},
                 "developerInstructions": BRANCH_INSTRUCTIONS}
-    workspace = Path(state["workspace_root"]) / state["id"] if state.get("workspace_root") else session_path / "workspace"
+    workspace = working_directory(state, session_path)
     return {"cwd": str(workspace), "model": model,
             "approvalPolicy": "on-request", "sandbox": "read-only",
             "config": {"model_reasoning_effort": state["codex"]["reasoning_effort"],

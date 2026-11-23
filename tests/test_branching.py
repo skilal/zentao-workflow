@@ -498,7 +498,7 @@ class BranchWorkflowChecks(TestCase):
                 self.assertEqual(server["command"], python_executable)
                 self.assertNotIn("全局服务", params["config"]["mcp_servers"])
                 self.assertNotIn("features.shell_tool", params["config"])
-                self.assertEqual(Path(params["cwd"]).name, "workspace")
+                self.assertEqual(Path(params["cwd"]).name, self.flow.state["id"])
 
     def test_disabling_inherited_mcp_preserves_stdio_and_http_transports(self):
         configuration = {"mcp_servers": {

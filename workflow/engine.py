@@ -39,7 +39,7 @@ from workflow.user_input import INPUT_STAGES, input_request_path, pending_input
 from workflow.workspace_reuse import WorkspaceReuseFlow
 from workflow.workspace_handoff import WorkspaceHandoffFlow
 from workflow.workspace_release import WorkspaceReleaseFlow
-from workflow.workspace_paths import DEFAULT_WORKSPACE_ROOT, validate_workspace_root, workspace_directory
+from workflow.workspace_paths import DEFAULT_WORKSPACE_ROOT, reserve_workspace_directory, validate_workspace_root, working_directory
 from workflow.workspace_idle import IDLE_SCHEMA, IdleAnalysisRequired
 from workflow.shared_changes import (SCOPE_SCHEMA, ReviewChanged, initialize_session, select_scope, snapshot_review)
 from workflow.zentao import KINDS, ZentaoClient, project_context
@@ -343,8 +343,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self.save()
         self._close_rpc()
         state.setdefault("workspace_root", validate_workspace_root(self.settings.get("workspace_root", DEFAULT_WORKSPACE_ROOT)))
-        workspace = workspace_directory(self.store, state)
-        workspace.mkdir(parents=True, exist_ok=True)
+        workspace = reserve_workspace_directory(self.store, state)
         prepared = {repo["name"] for repo in state["repos"]}
         for index, selection in enumerate(state["selections"]):
             if self.closed or state.get("pause_requested"):
@@ -787,8 +786,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self.save()
         state["max_fix_rounds"] = self.settings["review"]["max_fix_rounds"]
         state.setdefault("workspace_root", validate_workspace_root(self.settings.get("workspace_root", DEFAULT_WORKSPACE_ROOT)))
-        workspace = workspace_directory(self.store, state)
-        workspace.mkdir(parents=True, exist_ok=True)
+        workspace = reserve_workspace_directory(self.store, state)
         existing = {repository["name"]: repository for repository in state["repos"]}
         for index, selection in enumerate(selections):
             if self.closed or state.get("pause_requested"):
@@ -925,7 +923,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                                              if phase == "review" else ""))
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
-        turn_cwd = session_path if phase == "branch" else workspace_directory(self.store, state)
+        turn_cwd = session_path if phase == "branch" else working_directory(state, session_path)
         context = {"items": state.get("items", [state["item"]]), "supplement": state["supplement"],
                    "followup_attachments": submitted_followup_attachments(state),
                    "supplement_images": state.get("supplement_images", []), "plan": state.get("approved_plan"),
