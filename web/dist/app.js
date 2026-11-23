@@ -1642,6 +1642,7 @@ function WorkflowApp() {
     const canAnswer = (["等待人工回答", "等待计划补充", "等待计划确认"].includes(stage) || continuing) && !busy &&
       (state.pending?.method !== "workflow/ask_user" || state.pending.turn_completed === true);
     const canSend = canAnswer && answersComplete && !answerTransfers.length && (!continuing || !transfers.length);
+    const sendAnswerOnEnter = event => sendOnEnter(event, canSend, answer);
     const reviewsByMessage = new Map(state.reviews.map(entry => [entry.history_index, entry]));
     const changesByMessage = new Map((fileChanges?.groups || []).map(group => [group.message_index, group]));
     let messageIndex = -1;
@@ -1738,8 +1739,10 @@ function WorkflowApp() {
             function update(change) { changeDraft({ answers: { ...draft.answers, [key]: { ...value, ...change } } }); }
             return h("div", { className: "question", key }, h("div", { className: "question-title" }, question.question),
               question.options?.length > 0 && h(Radio.Group, { value: value.choice, onChange: event => update({ choice: event.target.value }), disabled: !canAnswer, className: "question-options" },
-                question.options.map(option => h("div", { key: option.label }, h(Radio, { value: option.label }, option.label), option.description && h("div", { className: "option-note" }, option.description)))),
+                question.options.map(option => h("div", { key: option.label }, h(Radio, { value: option.label, onKeyDown: sendAnswerOnEnter }, option.label),
+                  option.description && h("div", { className: "option-note" }, option.description)))),
               h(Input.TextArea, { value: value.custom || "", rows: 2, disabled: !canAnswer, placeholder: "也可以填写自定义答案或补充说明",
+                onKeyDown: sendAnswerOnEnter,
                 onPaste: answerAttachmentEditable ? event => pasteAnswerImages(event, question.id, value, update) : undefined,
                 onChange: event => update({ custom: event.target.value }) }),
               h("div", { className: "supplement-image-tools" },
@@ -1766,7 +1769,7 @@ function WorkflowApp() {
             h(Tooltip, { title: "支持 PDF、Word、文本、图片及 ZIP；ZIP 仅读取目录与 XML" },
               h(Typography.Text, { type: "secondary", className: "muted" }, `可多选或粘贴，单个 ≤ ${model.settings.max_attachment_mb} MB`))),
           h(Input.TextArea, { rows: 3, value: draft.reply, disabled: !canAnswer,
-            onKeyDown: event => sendOnEnter(event, canSend, answer),
+            onKeyDown: sendAnswerOnEnter,
             onPaste: continuing && followupEditable ? event => pasteImages(event, "followup") : undefined,
             placeholder: questions.length ? "其他补充说明（可选）" : continuing ? "输入问题、需要获取的信息或修改要求，可粘贴图片和文件…" : "输入回复、需要调整的计划内容或补充业务规则…", onChange: event => changeDraft({ reply: event.target.value }) }),
           h(Typography.Text, { type: "secondary" }, "Enter 发送，Shift+Enter 换行"),
