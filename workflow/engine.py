@@ -1234,7 +1234,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         state["stage"] = "已完成（静态审查）"
         state["phase"] = "complete"
         self.save()
-        self.note("系统", "本轮已完成：Review 已完成，本地提交已完成。未 push，未修改禅道状态，功能运行与验收未验证。")
+        self.note("系统", "本轮已完成：Review 已完成，本地提交已完成。未修改禅道状态，功能运行与验收未验证。")
 
     def pause(self):
         state = self.state
@@ -1583,7 +1583,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 return
             skipped = skipped_review_ids(state, state.get("delivery_round", 1))
             if not any(finding["id"] not in skipped for finding in result["findings"]) and not state.get("pause_requested") and not self.closed:
-                self.note("控制器", "Review 无待处理问题，已选择不修复的问题保留记录，自动执行本地提交，不 push。",
+                self.note("控制器", "Review 无待处理问题，已选择不修复的问题保留记录，自动执行本地提交。",
                           display_text="Review 无待处理问题，正在执行本地提交。")
                 self.finalize([], "", automatic=True)
 

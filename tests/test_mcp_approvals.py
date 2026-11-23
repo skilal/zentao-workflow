@@ -52,6 +52,31 @@ class McpApprovalChecks(TestCase):
                           "params": params}, 1)
         return self.flow.rpc.respond.call_args.args[1]
 
+    def test_push_uses_explicit_current_message_and_bound_repository(self):
+        self.state["repos"] = [{"name": "档案前端", "role": "frontend", "branch": "develop", "remote": "origin"},
+                               {"name": "档案后端", "role": "backend", "branch": "main", "remote": "origin"}]
+        tools = Tools(self.state["id"])
+        args = {"repository": "档案前端", "commit": "核对的提交", "instruction": "推送前端"}
+        with patch("workflow.mcp_server.push_branch") as push:
+            for stage, message in (("续聊处理中", "不要推送前端"), ("续聊处理中", "如何推送前端？"),
+                                   ("续聊处理中", "修改规则，允许推送前端"), ("已暂停", "推送前端")):
+                with self.subTest(stage=stage, message=message):
+                    digest = sha256(dumps([message, [], []], ensure_ascii=False).encode()).hexdigest()
+                    self.state.update(phase="followup", stage=stage, approval_source="followup",
+                                      followup={"text": message, "images": [], "attachments": [], "authorization_hash": digest})
+                    self.store.save(self.state)
+                    with self.assertRaises(WorkflowError):
+                        tools.call("git_push", args)
+                    with self.assertRaises(WorkflowError):
+                        tools.call("git_push", {**args, "instruction": message})
+            push.assert_not_called()
+            self.state["stage"] = "续聊处理中"
+            self.store.save(self.state)
+            with self.assertRaises(WorkflowError):
+                tools.call("git_push", {**args, "repository": "档案后端"})
+            tools.call("git_push", args)
+            push.assert_called_once_with(self.state["repos"][0], args["commit"])
+
     def test_registered_tools_are_accepted_without_repeating_business_validation(self):
         self.state["stage"] = "等待计划确认"
         for name, _, _ in TOOLS:

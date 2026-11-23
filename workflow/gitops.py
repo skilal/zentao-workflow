@@ -1,4 +1,4 @@
-"""分支元数据、工作目录分配和本地提交；不执行项目脚本。"""
+"""分支元数据、工作目录分配、本地提交和按请求推送。"""
 
 from hashlib import sha256
 from contextlib import ExitStack
@@ -190,7 +190,7 @@ def fetch_branch(repository, name):
     return entry
 
 
-def reject_hooks(repository):
+def reject_hooks(repository, hook_names=HOOK_NAMES):
     configured = git(repository, "config", "--path", "--get", "core.hooksPath", optional=True)
     if configured:
         path = Path(configured)
@@ -200,7 +200,7 @@ def reject_hooks(repository):
         path = Path(git(repository, "rev-parse", "--git-path", "hooks"))
         if not path.is_absolute():
             path = Path(repository) / path
-    active = [name for name in HOOK_NAMES if (path / name).is_file()]
+    active = [name for name in hook_names if (path / name).is_file()]
     if active:
         raise WorkflowError("仓库存在可能执行程序的 Git 钩子：" + "、".join(active) +
                             "。按禁止运行验证的规范停止；不会自动禁用钩子。")
@@ -563,6 +563,23 @@ def ensure_baseline(repository):
                                 and git(repository["path"], "merge-base", expected, head, optional=True) == expected):
         raise WorkflowError("工作区 HEAD 已改变，不能继续使用原审查基线。")
     return head
+
+
+@locked_repository
+def push_branch(repository, commit_id):
+    path, branch, remote = repository["path"], repository["branch"], repository.get("remote")
+    head = ensure_baseline(repository)
+    if head != commit_id:
+        raise WorkflowError("当前 HEAD 与核对的提交不一致，请重新核对推送范围。")
+    if not remote or remote not in git(path, "remote").splitlines():
+        raise WorkflowError("当前会话的远程仓库不可用，请核对配置。")
+    urls = git(path, "remote", "get-url", "--push", "--all", "--", remote).splitlines()
+    if len(urls) != 1:
+        raise WorkflowError("当前远程仓库须只有一个推送地址，请核对配置。")
+    reject_hooks(path, ("pre-push", "reference-transaction", "pre-auto-gc"))
+    git(path, "-c", f"remote.{remote}.mirror=false", "push", "--no-follow-tags",
+        "--recurse-submodules=no", "--", remote, f"{head}:refs/heads/{branch}")
+    return {"repository": repository["name"], "remote": remote, "branch": branch, "commit": head}
 
 
 def changed_paths(repository):

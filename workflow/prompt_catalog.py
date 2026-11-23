@@ -103,7 +103,7 @@ def prompt_catalog(settings):
             fragment("fix_input", "修复输入拼接", templates.FIX_INPUT, "workflow/prompt_templates.py · FIX_INPUT", "只注入选中问题及人工说明"),
             *scope_fragments, *material_fragments])
     stage("commit", "本地提交", "审查通过且满足提交条件后，由控制器提交确认的代码片段。", [], [review_fragments[-1]], controller=True,
-          notes="由控制器执行，无独立模型提示词。提交消息由 Review 阶段生成；不推送远程仓库。")
+          notes="由控制器执行，无独立模型提示词。提交消息由 Review 阶段生成。远程推送须由用户在续聊中明确要求。")
     stage("followup", "后续对话", "按续聊意图只读回答或处理授权修改。", [
         variant("followup", "非计划模式续聊", "followup", prompts.FOLLOWUP, "续聊未选择计划模式；是否自动 Review 由控制器决定")], [
             fragment("followup", "续聊指令", prompts.FOLLOWUP, "workflow/prompts.py · FOLLOWUP", "非计划模式续聊"),

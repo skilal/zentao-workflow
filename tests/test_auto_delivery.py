@@ -12,7 +12,7 @@ from review_fixtures import commit_messages
 
 from workflow.approvals import is_workflow_tool_call
 from workflow.engine import FINDING_SCHEMA, Workflow
-from workflow.gitops import commit, git, manifest
+from workflow.gitops import commit, git, manifest, push_branch
 from workflow.mcp_server import Tools, TOOLS
 from workflow.settings import ROOT, WorkflowError
 from workflow.web import public_state
@@ -487,6 +487,28 @@ class LocalCommitChecks(TestCase):
     def test_unchanged_repository_creates_no_commit(self):
         self.assertIsNone(commit(self.repository, "feat(workflow): 无修改", {}))
         self.assertEqual(git(self.source, "rev-parse", "HEAD"), self.baseline)
+
+    def test_explicit_push_updates_only_the_bound_remote_branch(self):
+        self.file.write_text("updated\n", encoding="utf-8")
+        head = commit(self.repository, "feat(workflow): 本地交付", manifest([self.repository]))
+        git(self.source, "tag", "-a", "local-only", "-m", "本地标签", head)
+        git(self.source, "config", "push.followTags", "true")
+        git(self.source, "config", "remote.origin.mirror", "true")
+        self.repository.update(remote="origin", checkout_head=head)
+        self.file.write_text("uncommitted\n", encoding="utf-8")
+        result = push_branch(self.repository, head)
+        self.assertEqual(result, {"repository": "前端", "remote": "origin", "branch": "delivery", "commit": head})
+        self.assertEqual(git(self.remote, "show-ref"), f"{head} refs/heads/delivery")
+        self.assertEqual(self.file.read_text(encoding="utf-8"), "uncommitted\n")
+
+    def test_push_checks_head_and_stops_at_active_hook(self):
+        self.repository["remote"] = "origin"
+        with self.assertRaisesRegex(WorkflowError, "核对的提交不一致"):
+            push_branch(self.repository, "old-head")
+        (self.source / ".git" / "hooks" / "pre-push").write_text("exit 1\n", encoding="utf-8")
+        with self.assertRaisesRegex(WorkflowError, "pre-push"):
+            push_branch(self.repository, self.baseline)
+        self.assertEqual(git(self.remote, "show-ref"), self.remote_refs)
 
     def test_changed_code_branch_head_and_external_index_block_commit(self):
         self.file.write_text("updated\n", encoding="utf-8")

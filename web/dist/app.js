@@ -1806,8 +1806,8 @@ function WorkflowApp() {
             } }, "变更目录与审查基线"),
           h(Button, { disabled: !review, onClick: () => document.getElementById(`review-${review.number}`)?.scrollIntoView({ behavior: "smooth", block: "start" }) }, "定位最新 Review")),
           h("p", { className: "muted", style: { margin: "15px 0 0", lineHeight: 1.8 } }, continuing || state.followup ?
-            "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。需要澄清时等待明确回答；审查通过后仅本地 commit，不 push。" :
-            "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地 commit，不 push。")),
+            "后续消息可手动开启计划模式；实施或审查中请先暂停再补充，原目标与补充需求合并处理。计划模式和自动 Review 开关均在发送后恢复关闭。审查通过后本地提交。需要推送时可在续聊中发送“推送前端”或“推送全部仓库”。" :
+            "未提问且一次成稿的计划自动实施；有提问或多回合补充时等待确认。Review 无遗留问题后自动本地提交。")),
         state.baseline_change_request && h(CardBox, { title: "确认变更审查基线" },
           h(Alert, { type: "warning", showIcon: true, message: "将当前 HEAD 设为本轮新基线", description:
             "原线程、聊天、计划、附件和历史记录保留，确认前备份完整会话。将采用下方展示的目录当前分支作为本会话目标分支，并以当前 HEAD 建立基线。旧审查及检查结论失效；新基线之前的已提交代码将移出本轮审查范围。同目录保留本轮未提交差异与原有本机文件排除规则；更换目录时，旧文件留在原处，新目录已有改动全部排除。" }),
