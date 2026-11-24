@@ -6,7 +6,7 @@
 
 ## 启动与停止
 
-使用 Windows、Python 3.11 或以上、Git，以及已登录的 Codex CLI。运行时只使用 Python 标准库和已随项目保存的前端资源，不需要 Tkinter、Node、npm 或联网加载页面组件。
+使用 Windows、Python 3.11 或以上、Git，以及已登录的 Codex CLI。基础工作流使用 Python 标准库和随项目保存的前端资源，不需要 Tkinter、Node、npm 或联网加载页面组件。
 
 首次下载并配置：
 
@@ -30,6 +30,16 @@ Set-Location -LiteralPath 'D:\wkproj\zentao-codex-workflow'
 脚本启动本地服务并打开浏览器，默认地址为 **http://127.0.0.1:8765/**。需要只启动服务时运行 `py -3 -X utf8 app.py --no-browser`。端口在 `settings.json` 的 `web.port` 中明确配置，占用时会停止，不自动更换端口。
 
 关闭网页不会终止已确认的后台任务；需要停止时，在“工作流设置”点击“暂停并停止本地服务”，或在启动终端按 Ctrl+C。会话会保存，服务重新启动后恢复查看，业务执行不会自动继续。
+
+### 成果文件依赖
+
+生成和预览 Word、Excel、PDF 成果文件前，在项目根目录使用启动工作流的同一个 Python 安装依赖。按默认脚本启动时执行：
+
+```powershell
+py -3 -m pip install --upgrade --target .local/artifact-dependencies -r requirements-artifacts.txt
+```
+
+网页服务和成果工具共用此目录。更换工作流使用的 Python 版本后，用新解释器重新安装。
 
 ## 内置提示词
 

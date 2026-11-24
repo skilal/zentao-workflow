@@ -179,17 +179,18 @@ class ArtifactChecks(ArtifactFixture):
                 self.create("说明.docx", "docx", content)
         self.assertEqual(Tools(self.state["id"]).call("task_context", {})["artifacts"], [])
 
-    def test_dependency_refreshes_user_directory_created_after_startup(self):
-        directory = self.root / "new-user-site"
-        directory.mkdir()
-        (directory / "新成果依赖.py").write_text("验证值 = '用户目录新安装依赖'\n", encoding="utf-8")
+    def test_dependency_loads_project_directory_created_after_startup(self):
+        directory = self.root / "artifact-dependencies"
         original = sys.path[:]
         self.addCleanup(lambda: sys.path.__setitem__(slice(None), original))
         self.addCleanup(lambda: sys.modules.pop("新成果依赖", None))
-        with patch("workflow.artifacts.site.getusersitepackages", return_value=str(directory)), \
-             patch("workflow.artifacts.site.ENABLE_USER_SITE", True):
+        with patch("workflow.artifacts.ARTIFACT_DEPENDENCIES", directory):
+            with self.assertRaisesRegex(WorkflowError, "artifact-dependencies"):
+                dependency("新成果依赖", "验证依赖")
+            directory.mkdir()
+            (directory / "新成果依赖.py").write_text("验证值 = '项目目录新安装依赖'\n", encoding="utf-8")
             loaded = dependency("新成果依赖", "验证依赖")
-        self.assertEqual(loaded.验证值, "用户目录新安装依赖")
+        self.assertEqual(loaded.验证值, "项目目录新安装依赖")
 
     def test_broken_dependency_reports_import_cause_instead_of_missing_package(self):
         with patch("workflow.artifacts.import_module", side_effect=ImportError("DLL load failed: 模拟传递依赖损坏")):

@@ -8,7 +8,6 @@ from mimetypes import guess_type
 from pathlib import Path, PureWindowsPath
 from re import fullmatch
 from shutil import rmtree
-import site
 import sys
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -16,7 +15,7 @@ from xml.sax.saxutils import escape
 
 from workflow.gitops import safe_file
 from workflow.pdf_materials import read_pdf
-from workflow.settings import WorkflowError
+from workflow.settings import LOCAL, WorkflowError
 
 
 ARTIFACT_STAGES = {"计划中", "实施中", "修复中", "续聊处理中"}
@@ -27,21 +26,21 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 MIME_TYPES = {".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
               ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".pdf": "application/pdf"}
 PAGE_SIZE = 100
+ARTIFACT_DEPENDENCIES = LOCAL / "artifact-dependencies"
 
 
 def dependency(module, package):
-    # pip 首次安装到用户目录时，已启动的 Python 不会自动把新目录加入 sys.path。
-    # 只刷新当前解释器自身的用户依赖目录，不切换解释器或搜索其他环境。
-    user_site = site.getusersitepackages()
-    if site.ENABLE_USER_SITE and Path(user_site).is_dir() and user_site not in sys.path:
-        site.addsitedir(user_site)
+    # 网页服务和 MCP 共用项目中明确安装的成果依赖目录。
+    package_dir = str(ARTIFACT_DEPENDENCIES)
+    if package_dir not in sys.path and ARTIFACT_DEPENDENCIES.is_dir():
+        sys.path.insert(0, package_dir)
         invalidate_caches()
     try:
         return import_module(module)
     except ImportError as error:
         if isinstance(error, ModuleNotFoundError) and error.name == module.split(".")[0]:
             raise WorkflowError(f"成果文件功能缺少依赖 {package}；当前解释器：{sys.executable}。"
-                                "请使用该解释器按 README 安装 requirements-artifacts.txt 后重试；未自动安装。") from error
+                                f"请使用该解释器按 README 将 requirements-artifacts.txt 安装到 {package_dir} 后重试。") from error
         raise WorkflowError(f"成果文件依赖 {package} 加载失败：{error}；当前解释器：{sys.executable}。"
                             "请处理实际导入错误；未自动重装或切换环境。") from error
 
