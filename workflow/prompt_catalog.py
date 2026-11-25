@@ -29,7 +29,6 @@ def prompt_catalog(settings):
         fragment("material_naming", "计划回合自动命名", templates.MATERIAL_NAMING, "workflow/prompt_templates.py · MATERIAL_NAMING", "计划阶段有待生成的首次会话名称时，替代其他资料读取指令，包含直接输入需求的会话")]
     review_fragments = [
         fragment("review_ids", "审查编号约束", templates.REVIEW_IDS, "workflow/prompt_templates.py · REVIEW_IDS", "所有 Review 阶段回合，包括恢复和回答继续"),
-        fragment("review_skipped", "本轮不修复项", templates.REVIEW_SKIPPED, "workflow/prompt_templates.py · REVIEW_SKIPPED", "所有 Review 阶段回合，列表可为空"),
         fragment("commit_instructions", "提交消息规则", COMMIT_INSTRUCTIONS, "workflow/commit_messages.py · COMMIT_INSTRUCTIONS", "Review 阶段生成提交消息，由控制器执行 Git 提交")]
     summary = fragment("summary", "整体页面改动说明", SUMMARY_INSTRUCTIONS, "workflow/change_locations.py · SUMMARY_INSTRUCTIONS",
                        "Review 汇总全部改动；关闭自动 Review 的续聊在修改结束时汇总，纯问答不更新")
@@ -39,7 +38,6 @@ def prompt_catalog(settings):
             text += "\n" + SUMMARY_INSTRUCTIONS
         if phase == "review":
             text += templates.REVIEW_IDS.format(delivery_round="【交付轮次】", previous_ids="【可引用旧编号 JSON】")
-            text += templates.REVIEW_SKIPPED.format(skipped_ids="【本轮不修复编号 JSON】")
             text += "\n" + COMMIT_INSTRUCTIONS
         return templates.TURN.format(phase=phase, scope="【需求范围说明：按条件选择一项】", text=text,
                                      policy_instruction="【页面说明规则：首次或变更时发送】",
@@ -96,11 +94,11 @@ def prompt_catalog(settings):
             fragment("review_input", "审查输入拼接", templates.REVIEW_INPUT, "workflow/prompt_templates.py · REVIEW_INPUT", "固定文件原文、审查职责、上轮审查依次拼接"),
             summary, *review_fragments, *scope_fragments, *material_fragments],
           notes="这里显示当前配置文件内容，不代表某个已有会话实际使用的审查快照。原“工作流设置”中的 Review 编辑入口保持不变。")
-    stage("fix", "问题修复", "只修复人工选中的问题，随后由控制器复审。", [
-        variant("fix", "修复选中问题", "fix", templates.FIX_INPUT.format(
-            fix=prompts.FIX, chosen="【选中问题 JSON】", note="【人工修复说明】"), "人工选择问题并点击修复后")], [
-            fragment("fix", "修复职责", prompts.FIX, "workflow/prompts.py · FIX", "修复选中的问题"),
-            fragment("fix_input", "修复输入拼接", templates.FIX_INPUT, "workflow/prompt_templates.py · FIX_INPUT", "只注入选中问题及人工说明"),
+    stage("fix", "问题修复", "自动处理待修复问题，随后由控制器复审。", [
+        variant("fix", "自动修复 Review 问题", "fix", templates.FIX_INPUT.format(
+            fix=prompts.FIX, findings="【待修复问题 JSON】"), "审查发现待修复问题且还有修复轮次时")], [
+            fragment("fix", "修复职责", prompts.FIX, "workflow/prompts.py · FIX", "自动处理待修复问题"),
+            fragment("fix_input", "修复输入拼接", templates.FIX_INPUT, "workflow/prompt_templates.py · FIX_INPUT", "注入待修复问题"),
             *scope_fragments, *material_fragments])
     stage("commit", "本地提交", "审查通过且满足提交条件后，由控制器提交确认的代码片段。", [], [review_fragments[-1]], controller=True,
           notes="由控制器执行，无独立模型提示词。提交消息由 Review 阶段生成。远程推送须由用户在续聊中明确要求。")
@@ -138,11 +136,11 @@ def prompt_catalog(settings):
         {"name": "【变化上下文 JSON】", "description": "动态需求、仓库、计划、授权决定、附件引用及 compile_checks（含诊断与修复范围）等，仅发送变化字段，不在本页读取实际值。"},
         {"name": "【页面说明规则：首次或变更时发送】", "description": "当前线程未接收或内容变化时发送历史页面说明规则及换行；其余回合为空。"},
         {"name": "【分支上下文 JSON】", "description": "所属项目、工作项、补充说明、正文及待识别仓库的分支元数据。"},
-        {"name": "【上轮审查结果 JSON；首次为 null】／【可引用旧编号 JSON】／【本轮不修复编号 JSON】／【交付轮次】", "description": "来自当前交付审查记录，不在本页读取或代入。"},
-        {"name": "【选中问题 JSON】／【人工修复说明】／【人工补充回答】", "description": "来自人工选择和输入，不在本页读取或代入。"},
+        {"name": "【上轮审查结果 JSON；首次为 null】／【可引用旧编号 JSON】／【交付轮次】", "description": "来自当前交付审查记录，不在本页读取或代入。"},
+        {"name": "【待修复问题 JSON】／【人工补充回答】", "description": "来自 Review 结果或人工输入，不在本页读取或代入。"},
         {"name": "{phase}／{scope}／{text}／{policy_instruction}／{material_instruction}／{context}", "description": "源码模板槽位，依次为阶段标识、唯一范围说明、阶段指令及附加规则、按版本去重的页面说明规则、唯一资料读取指令、变化上下文 JSON。"},
         {"name": "{prompt}／{review}／{previous}", "description": "Review 文件原文（已有会话可采用快照）、审查职责、上轮审查 JSON；首次上轮结果为 null。"},
-        {"name": "{fix}／{chosen}／{note}／{reply}", "description": "修复职责、选中问题 JSON、人工修复说明、人工补充回答。"},
-        {"name": "{delivery_round}／{previous_ids}／{skipped_ids}", "description": "当前交付轮次、可引用旧问题编号 JSON、本轮不修复编号 JSON，编号列表可为空。"},
+        {"name": "{fix}／{findings}／{reply}", "description": "修复职责、待修复问题 JSON、人工补充回答。"},
+        {"name": "{delivery_round}／{previous_ids}", "description": "当前交付轮次和可引用旧问题编号 JSON，编号列表可为空。"},
         {"name": "{max_length}", "description": "自动命名允许的标题长度，由控制器根据多任务后缀计算。"}],
         "description": "只读展示当前服务的固定原文与组装模板。占位符代表运行时数据，不是实际发送的会话内容。"}

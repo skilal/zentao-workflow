@@ -70,7 +70,7 @@ def run():
             page.get_by_role("tab", name="暂停恢复", exact=True).click()
             page.locator(".prompt-variant:visible .ant-select-selector").click()
             page.get_by_title("恢复Review", exact=True).click()
-            expect(page.locator(".prompt-text:visible")).to_contain_text("本轮不修复编号")
+            expect(page.locator(".prompt-text:visible")).to_contain_text("可引用旧编号")
             page.get_by_role("tab", name="通用规则", exact=True).click()
             expect(page.locator(".prompt-text:visible")).to_contain_text("通用规则")
             page.screenshot(path=str(output / "prompts-desktop.png"), full_page=True)

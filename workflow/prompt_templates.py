@@ -27,8 +27,7 @@ REVIEW_IDS = (
     "\n第 {delivery_round} 轮交付，可引用旧编号：{previous_ids}"
     "；previous_id 仅限以上编号或空字符串，resolved_previous 仅列有证据的解决项。其他交付的问题仅作背景。"
 )
-REVIEW_SKIPPED = "\n本轮不修复编号：{skipped_ids}；沿用编号保留，不重复报告、修改或要求选择，不阻塞提交。"
-FIX_INPUT = "{fix}\n{chosen}\n用户说明：{note}"
+FIX_INPUT = "{fix}\n{findings}"
 ANSWER_INPUT = (
     "用户已补充信息：\n{reply}"
     "\n请从上次暂停点继续；若在计划阶段，输出最终 proposed_plan，由控制器判断是否需要人工确认。"

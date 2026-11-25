@@ -80,7 +80,9 @@ def public_state(state):
     # 旧记录只在响应副本中关联原文，不修改磁盘上的会话数据。
     cursor = 0
     for review in result.get("reviews", []):
-        review["skipped_ids"] = sorted(skipped_review_ids(state, review.get("delivery_round", 1)))
+        review["auto_fix"] = "skipped_ids" in review
+        if not review["auto_fix"]:
+            review["skipped_ids"] = sorted(skipped_review_ids(state, review.get("delivery_round", 1)))
         if "history_index" in review:
             cursor = review["history_index"] + 1
             continue
@@ -757,7 +759,7 @@ class WebApplication:
                     raise WorkflowError("该会话仍在执行，请等待或先暂停。")
                 if action != "delete_session" and (engine.closed or state.get("cleanup", {}).get("removed") or state.get("cleanup", {}).get("finalizing")):
                     raise WorkflowError("该会话已进入清理阶段，只能继续删除。")
-                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "detect_repositories", "choose_repositories", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "fix", "finalize", "collect", "collect_by_id", "refresh_materials", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
+                if action in {"plan", "configure_codex", "confirm_project", "choose_branches", "edit_branches", "detect_repositories", "choose_repositories", "smart_checkout", "checkout_resolved", "preview_workspace_reuse", "confirm_workspace_reuse", "cancel_workspace_reuse", "preview_workspace_handoff", "confirm_workspace_handoff", "cancel_workspace_handoff", "preview_baseline", "confirm_baseline", "cancel_baseline", "approve_plan", "finalize", "collect", "collect_by_id", "refresh_materials", "delete_session", "followup", "rereview", "add_round", "compile_decision", "compile_now", "answer"} and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
                 if action in RELEASE_ACTIONS and request.get("revision") != runtime.revision:
                     raise WorkflowError("页面显示的流程版本已过期，请查看最新内容后再确认。")
@@ -928,9 +930,6 @@ class WebApplication:
                 if data.get("plan_hash") != state.get("plan_hash"):
                     raise WorkflowError("你确认的计划版本已经变化，请重新查看。")
                 operation, arguments = engine.approve_plan, ()
-            elif action == "fix":
-                ids = self._ids(data)
-                operation, arguments = engine.fix, (ids, str(data.get("note", "")))
             elif action == "add_round":
                 operation, arguments = engine.add_round, ()
             elif action == "rereview":

@@ -165,16 +165,14 @@ button, input, textarea { font: inherit; }
 .review-heading .ant-tag, .finding-meta .ant-tag { margin-inline-end: 0; }
 .finding-list { display: grid; gap: 12px; margin-top: 18px; }
 .finding-card { min-width: 0; padding: 13px 14px 5px; border: 1px solid #e7ebf1; border-radius: 6px; background: #fff; }
-.finding-card.selected { border-color: #91caff; background: #f7fbff; }
-.finding-title .ant-checkbox-wrapper { align-items: flex-start; color: #25354b; line-height: 1.8; }
-.finding-title .ant-checkbox { margin-top: 5px; }
+.finding-title { color: #25354b; line-height: 1.8; }
 .finding-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .finding-location { margin: 8px 0; color: #7a8597; font: 12px/1.7 Consolas, "Microsoft YaHei", monospace; overflow-wrap: anywhere; }
 .finding-card .ant-collapse-header { padding-inline: 0 !important; font-size: 12px; color: #687386 !important; }
 .finding-card .ant-collapse-content-box { padding-inline: 0 !important; }
 .review-actions { margin-top: 18px; padding-top: 16px; border-top: 1px solid #edf0f4; }
-.review-finalize { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
-.review-actions .ant-btn, .review-finalize .ant-btn { height: auto; white-space: normal; }
+.review-actions .ant-alert { margin-bottom: 12px; }
+.review-actions .ant-btn { height: auto; white-space: normal; }
 .review-original { max-height: 320px; margin: 0; overflow: auto; white-space: pre; font: 12px/1.8 Consolas, "Microsoft YaHei", monospace; }
 .finding-details { display: grid; gap: 12px; padding: 4px 10px; }
 .finding-details strong { display: block; font-size: 12px; color: #7e8a9d; margin-bottom: 4px; font-weight: 500; }

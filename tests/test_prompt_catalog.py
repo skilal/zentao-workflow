@@ -90,7 +90,7 @@ class PromptCatalogChecks(TestCase):
                      prompt=(ROOT / self.settings["review"]["prompt_file"]).read_text(encoding="utf-8").strip(),
                      review=prompts.REVIEW, previous="【上轮审查结果 JSON；首次为 null】")),
                  ("fix", "fix", "fix", prompt_templates.FIX_INPUT.format(
-                     fix=prompts.FIX, chosen="【选中问题 JSON】", note="【人工修复说明】"))]
+                     fix=prompts.FIX, findings="【待修复问题 JSON】"))]
         cases += [(stage, phase, phase, prompts.RESTORE if stage == "restore" else
                    prompt_templates.ANSWER_INPUT.format(reply="【人工补充回答】"))
                   for stage in ("restore", "answer") for phase in ("plan", "implement", "review", "compile_analysis", "compile_fix")]
@@ -106,7 +106,7 @@ class PromptCatalogChecks(TestCase):
                 expected = expected.replace("【资料读取指令：按条件选择一项】", prompt_templates.MATERIAL_CHANGED)
                 expected = expected.replace("【页面说明规则：首次或变更时发送】", SUMMARY_POLICY + "\n")
                 expected = expected.replace("【变化上下文 JSON】", context).replace("【交付轮次】", "1")
-                expected = expected.replace("【可引用旧编号 JSON】", "[]").replace("【本轮不修复编号 JSON】", "[]")
+                expected = expected.replace("【可引用旧编号 JSON】", "[]")
                 self.assertEqual(sent, expected)
 
     def test_scope_naming_cached_materials_and_branch_use_actual_conditions(self):

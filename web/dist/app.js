@@ -43,9 +43,10 @@ function plainDescription(value) {
     .replaceAll("【desc】", "【详细描述】").replaceAll("【steps】", "【复现步骤】").replaceAll("【bugSteps】", "【来源 Bug 描述】");
 }
 function typeTag(kind) { return h(Tag, { color: { epic: "purple", requirement: "geekblue", story: "blue", task: "cyan", bug: "orange" }[kind] }, TYPE_NAMES[kind]); }
+function stageLabel(stage) { return stage === "等待修复选择" ? "等待继续 Review" : stage; }
 function stageTag(stage) {
   const color = stage?.includes("等待") ? "gold" : stage?.includes("完成") ? "success" : stage?.includes("停止") || stage?.includes("失败") ? "error" : ACTIVE.has(stage) ? "processing" : "default";
-  return h(Tag, { color }, stage || "尚未选择工作项");
+  return h(Tag, { color }, stageLabel(stage) || "尚未选择工作项");
 }
 function stepOf(state) {
   if (!state) return 0;
@@ -206,7 +207,7 @@ function mergeHistory(history, state) {
   summary.handoff_pending = Boolean(state.workspace_handoff_request);
   return [summary, ...(history || []).filter(entry => entry.id !== state.id)].sort(compareSessions);
 }
-function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", plan_mode: false, review_enabled: false, answers: {}, review_note: "", selected_findings: [], review_number: state?.reviews?.at(-1)?.number || null,
+function emptyDraft(state, settings) { return { supplement: state?.supplement || "", reply: "", plan_mode: false, review_enabled: false, answers: {},
   followup_compile_enabled: Boolean(state?.compile_check?.enabled ?? settings?.compile_check_enabled),
   compile_check_enabled: state?.plan_started_at ? Boolean(state.compile_check?.enabled) : Boolean(settings?.compile_check_enabled),
   codex: state?.codex || { model: settings?.model ?? "", reasoning_effort: settings?.reasoning_effort ?? "" } }; }
@@ -1067,10 +1068,6 @@ function WorkflowApp() {
     }, 300);
     return () => clearTimeout(timer);
   }, [selectedKey, loadedKey, busy, model?.connected]);
-  useEffect(() => {
-    if (!state || !review) return;
-    if (draftRef.current.review_number !== review.number) changeDraft({ selected_findings: [], review_note: "", review_number: review.number });
-  }, [state?.id, review?.number]);
   useLayoutEffect(() => { followBottom.current = true; }, [page, state?.id]);
   useLayoutEffect(() => {
     if (feedRef.current && followBottom.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
@@ -1952,42 +1949,37 @@ function WorkflowApp() {
     const latest = !validationError && entry.number === review?.number && (entry.delivery_round || 1) === state.delivery_round && state.phase !== "complete";
     const findings = entry.result.findings;
     const skipped = new Set(entry.skipped_ids || []);
-    const pending = findings.filter(finding => !skipped.has(finding.id));
-    const selected = latest ? draft.selected_findings.filter(id => pending.some(finding => finding.id === id)) : [];
+    const legacyPartial = latest && !entry.auto_fix && stage === "部分提交";
+    const pending = findings.filter(finding => !skipped.has(finding.id) && (legacyPartial || finding.origin !== "原有问题"));
     const limitReached = state.fix_round >= state.max_fix_rounds;
-    const canSelect = latest && !busy && ["等待修复选择", "部分提交"].includes(stage);
-    const canFix = latest && stage === "等待修复选择" && !busy;
-    const canCommit = canSelect && !selected.length;
+    const waiting = stage === "等待修复选择";
+    const canAppend = entry.auto_fix && waiting && limitReached && pending.length > 0;
+    const canCommit = !state.scope_review_required && (stage === "部分提交" || (waiting && findings.every(finding => finding.origin === "原有问题")));
     return h("section", { className: "review-content", id: validationError ? undefined : `review-${entry.number}`, "aria-label": validationError ? "未通过校验的 Review" : `第 ${entry.number} 次 Review` },
       h("div", { className: "review-heading" }, h("strong", null, validationError ? "未通过校验的 Review" : `第 ${entry.number} 次 Review`),
         validationError ? h(Tag, { color: "error" }, "校验失败 · 只读") : h(React.Fragment, null,
           h(Tag, null, latest ? `修复 ${state.fix_round} / ${state.max_fix_rounds} 轮` : `修复第 ${entry.fix_round} 轮后`), !latest && h(Tag, null, "历史记录 · 只读"))),
       validationError && h(Alert, { type: "error", showIcon: true, message: "此结果不能作为修复或提交依据", description: validationError }),
-      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, pending.length, h("span", null, validationError ? "返回问题" : "待处置问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
+      h("div", { className: "review-summary" }, h("div", { className: "review-number" }, validationError ? findings.length : pending.length, h("span", null, validationError ? "返回问题" : "待修复问题")), h("div", { className: "review-copy" }, h(Markdown, { text: entry.result.summary }))),
       entry.result.commit_scope?.length > 0 && h("p", { className: "muted" }, entry.result.commit_scope.map(scope => `${scope.repository}：纳入 ${scope.include.length} 个片段，排除 ${scope.exclude.length} 个片段`).join("；")),
       h("div", { className: "finding-list" }, findings.length === 0 && h(Empty, { image: Empty.PRESENTED_IMAGE_SIMPLE, description: validationError ? "返回结果中没有问题，尚未通过校验" : "本轮没有发现待处理问题" }),
-        findings.map((finding, index) => h("div", { className: `finding-card${selected.includes(finding.id) ? " selected" : ""}`, key: validationError ? index : finding.id },
-          h("div", { className: "finding-title" }, h(Checkbox, { checked: selected.includes(finding.id), disabled: !canSelect || skipped.has(finding.id),
-            onChange: event => changeDraft({ selected_findings: event.target.checked ? [...selected, finding.id] : selected.filter(id => id !== finding.id) }) },
+        findings.map((finding, index) => h("div", { className: "finding-card", key: validationError ? index : finding.id },
+          h("div", { className: "finding-title" },
             h(Tag, { color: ["P0", "P1"].includes(finding.severity) ? "error" : finding.severity === "P2" ? "warning" : "default" }, finding.severity),
-            h("strong", null, finding.title))),
+            h("strong", null, finding.title)),
           h("div", { className: "finding-meta" }, h(Typography.Text, { code: true }, validationError ? `问题 ${index + 1}` : finding.id), h(Tag, null, finding.category),
-            h(Tag, { color: finding.origin === "本次引入" ? "volcano" : finding.origin === "证据不足" ? "gold" : "default" }, finding.origin), skipped.has(finding.id) && h(Tag, null, "不修复")),
+            h(Tag, { color: finding.origin === "本次引入" ? "volcano" : finding.origin === "证据不足" ? "gold" : "default" }, finding.origin),
+            skipped.has(finding.id) && h(Tag, null, entry.auto_fix ? "仅记录" : "本轮不修复")),
           h("div", { className: "finding-location" }, `${finding.repository}/${finding.path}:${finding.line}`),
           h(Collapse, { ghost: true, size: "small", items: [{ key: "details", label: "判断依据、处理建议与业务影响",
             children: h("div", { className: "finding-details" }, ...[["判断依据", finding.evidence], ["处理建议", finding.suggestion], ["业务影响", finding.impact]].map(([label, value]) => h("div", { key: label }, h("strong", null, label), h(Markdown, { text: value })))) }] })))),
       latest && h("div", { className: "review-actions" },
-        h(Button, { onClick: openDiff, disabled: stopped }, "查看累计代码差异"),
-        limitReached && pending.length > 0 && h(Alert, { type: "warning", showIcon: true, style: { marginTop: 14 }, message: "已达到本次修复轮次上限", description: "如需继续修复，请明确追加一轮；也可选择不修复剩余问题并本地提交。" }),
-        h(Field, { label: "修复说明（可选）" }, h(Input.TextArea, { rows: 3, value: draft.review_note, disabled: !canSelect,
-          placeholder: "可补充选中问题的修复要求，无需填写不修复原因。", onChange: event => changeDraft({ review_note: event.target.value }) })),
-        h("div", { className: "action-bar" },
-          h(Button, { disabled: !canFix, onClick: () => act("add_round") }, "追加一轮"),
-          h(Button, { disabled: busy || !["等待修复选择", "已暂停", "已停止"].includes(stage), onClick: () => act("rereview") }, "重新 Review"),
-          h(Button, { type: "primary", disabled: !canFix || !selected.length || limitReached, onClick: () => act("fix", { ids: selected, note: draft.review_note }) }, `修复选中 ${selected.length} 项并复审`)),
-        h(Divider), h("div", { className: "review-finalize" },
-          h("span", { className: "muted" }, pending.length ? "只勾选要修复的问题；点击修复后，未选项本轮不再修复，无需填写原因" : state.phase === "complete" ? "本地提交已完成，未 push" : "无待处理问题时自动本地提交；提交失败后可手动继续"),
-          h(Button, { disabled: !canCommit, onClick: () => act("finalize", { ids: pending.map(finding => finding.id), note: "" }) }, pending.length ? "不修复剩余问题并本地提交" : "继续本地提交"))),
+        canAppend && h(Alert, { type: "warning", showIcon: true, message: "已达到本次修复轮次上限", description: "追加一轮可自动修复剩余问题。" }),
+        h(Space, { wrap: true },
+          h(Button, { onClick: openDiff, disabled: stopped }, "查看累计代码差异"),
+          (waiting || ["已暂停", "已停止"].includes(stage)) && h(Button, { disabled: busy, onClick: () => act("rereview") }, "重新 Review"),
+          canAppend && h(Button, { type: "primary", disabled: busy, onClick: () => act("add_round") }, "追加一轮并继续修复"),
+          canCommit && h(Button, { disabled: busy, onClick: () => act("finalize", { ids: legacyPartial ? pending.map(finding => finding.id) : [] }) }, "继续本地提交"))),
       h(Collapse, { ghost: true, size: "small", items: [{ key: "original", label: "输出原文", children: h("pre", { className: "review-original" }, originalText) }] }));
   }
 
@@ -2034,7 +2026,7 @@ function WorkflowApp() {
           h(Button, { size: "small", onClick: addProjectPartition, disabled: stopped || !model.connected }, "添加项目分区")),
         h(Input.Search, { size: "small", value: sessionQuery, allowClear: true, placeholder: "搜索会话或项目名称、编号", onChange: event => setSessionQuery(event.target.value) }),
         h(Select, { size: "small", value: sessionFilter, className: "full-width", "aria-label": "筛选会话状态", onChange: setSessionFilter,
-          options: [{ value: "all", label: "全部状态" }, ...stages.map(value => ({ value, label: value }))] })),
+          options: [{ value: "all", label: "全部状态" }, ...stages.map(value => ({ value, label: stageLabel(value) }))] })),
       h("div", { className: "session-list" }, groups.map(project => {
         const key = String(project.id);
         return h("section", { key, "data-project-id": key, className: `session-project${dropProjectId === key ? " drop-target" : ""}`,

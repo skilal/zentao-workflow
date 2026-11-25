@@ -104,10 +104,10 @@ def parse_review(text, protocol_version=2):
 
 def skipped_review_ids(state, delivery_round):
     reviews = {entry.get("fix_round", 0): entry for entry in state["reviews"]
-               if entry.get("delivery_round", 1) == delivery_round}
+               if entry.get("delivery_round", 1) == delivery_round and "skipped_ids" not in entry}
     skipped = set()
     for decision in state["decisions"]:
-        if decision.get("delivery_round", 1) != delivery_round:
+        if decision.get("delivery_round", 1) != delivery_round or decision.get("source") == "auto":
             continue
         review = reviews.get(decision["round"] - 1)
         if review:
@@ -894,7 +894,6 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 resolved_schema["maxItems"] = 0
             text += prompt_templates.REVIEW_IDS.format(delivery_round=state.get("delivery_round", 1),
                                                        previous_ids=dumps(previous_ids, ensure_ascii=False))
-            text += prompt_templates.REVIEW_SKIPPED.format(skipped_ids=dumps(sorted(skipped_review_ids(state, state.get("delivery_round", 1)))))
             text += "\n" + COMMIT_INSTRUCTIONS
         for repository in compile_repositories(state):
             ensure_baseline(repository)
@@ -919,8 +918,10 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         if phase == "plan" and state.get("plan_round") is not None:
             state["plan_round"]["turns"] += 1
         self.save()
-        self.note("控制器", text, display_text=("已进入 Review，正在审查本轮代码；无待处理问题后自动本地提交。"
-                                             if phase == "review" else ""))
+        self.note("控制器", text, display_text={
+            "review": "正在审查本轮代码，发现可修复问题后自动处理。",
+            "fix": "正在自动修复 Review 问题，完成后复审。",
+        }.get(phase, ""))
         mode = "plan" if phase == "plan" else "default"
         session_path = self.store.directory(state["id"])
         turn_cwd = session_path if phase == "branch" else working_directory(state, session_path)
@@ -1168,33 +1169,41 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         self._start_turn(prompt_templates.REVIEW_INPUT.format(prompt=prompt, review=prompts.REVIEW,
                                                              previous=dumps(previous, ensure_ascii=False)), FINDING_SCHEMA)
 
-    def fix(self, selected_ids, note):
-        state = self.require_state("等待修复选择")
-        if state.get("scope_review_required"):
-            raise WorkflowError("旧审查未确认差异片段，请先重新 Review。")
+    def _continue_review(self):
+        state = self.state
+        if self.closed or state.get("pause_requested"):
+            return
+        review = self.current_reviews()[-1]
+        findings = [item for item in review["result"]["findings"] if item["id"] not in review["skipped_ids"]]
+        if not findings:
+            self.note("控制器", "Review 无待修复问题，正在自动执行本地提交。",
+                      display_text="Review 无待修复问题，正在执行本地提交。")
+            self.finalize([], "", automatic=True)
+            return
         if state["fix_round"] >= state["max_fix_rounds"]:
-            raise WorkflowError("已达到修复轮次上限；请明确追加一轮后再修复。")
-        current = self.current_reviews()[-1]["result"]["findings"]
-        skipped = skipped_review_ids(state, state.get("delivery_round", 1))
-        lookup = {finding["id"]: finding for finding in current if finding["id"] not in skipped}
-        if not selected_ids or any(item not in lookup for item in selected_ids):
-            raise WorkflowError("请至少选择一个有效问题。")
+            self.note("控制器", "Review 已达到自动修复轮次上限，追加一轮可继续修复剩余问题。")
+            return
         if manifest(state["repos"]) != state["review_manifest"]:
             raise WorkflowError("代码已经变化，须先重新 Review。")
-        chosen = [lookup[item] for item in selected_ids]
-        state["decisions"].append({"round": state["fix_round"] + 1, "fix_ids": selected_ids, "note": note,
-                                   "delivery_round": state.get("delivery_round", 1)})
         state["fix_round"] += 1
-        state["phase"] = "fix"
+        state["decisions"].append({"round": state["fix_round"], "fix_ids": [item["id"] for item in findings],
+                                   "note": "", "source": "auto", "delivery_round": state.get("delivery_round", 1)})
+        state.update(phase="fix", review_requested=True)
         for repo in state["repos"]:
             repo.pop("commit_scope", None)
-        self._start_turn(prompt_templates.FIX_INPUT.format(fix=prompts.FIX, chosen=dumps(chosen, ensure_ascii=False), note=note))
+        self._start_turn(prompt_templates.FIX_INPUT.format(fix=prompts.FIX, findings=dumps(findings, ensure_ascii=False)))
 
     def add_round(self):
         state = self.require_state("等待修复选择")
+        review = self.current_reviews()[-1]
+        if state.get("scope_review_required") or "skipped_ids" not in review:
+            raise WorkflowError("请先重新 Review，按当前规则审查后再继续修复。")
+        if (state["fix_round"] < state["max_fix_rounds"]
+                or len(review["result"]["findings"]) == len(review["skipped_ids"])):
+            raise WorkflowError("当前没有达到上限的待修复问题。")
         state["max_fix_rounds"] += 1
         self.note("用户", "明确追加一轮修复，当前上限：" + str(state["max_fix_rounds"]))
-        self.save()
+        self._continue_review()
 
     def rereview(self):
         self.require_state("等待修复选择", "已停止", "已暂停")
@@ -1216,9 +1225,17 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             return
         if not state["commits"]:
             self._guard_compile()
-        findings = self.current_reviews()[-1]["result"]["findings"]
-        skipped = skipped_review_ids(state, state.get("delivery_round", 1))
-        if set(accepted_ids) != {finding["id"] for finding in findings if finding["id"] not in skipped}:
+        review = self.current_reviews()[-1]
+        findings = review["result"]["findings"]
+        if state["commits"] and "skipped_ids" not in review:
+            # 旧版本已部分提交的交付沿用冻结时的问题处置结果。
+            skipped = skipped_review_ids(state, state.get("delivery_round", 1))
+            expected_ids = {finding["id"] for finding in findings if finding["id"] not in skipped}
+        else:
+            if any(finding.get("origin") != "原有问题" for finding in findings):
+                raise WorkflowError("Review 仍有待修复问题，修复并复审后才能提交。")
+            expected_ids = set()
+        if set(accepted_ids) != expected_ids:
             raise WorkflowError("提交范围与当前待处理问题不一致，请刷新后重试。")
         if not automatic:
             state["pause_requested"] = False
@@ -1239,7 +1256,6 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
         if manifest(pending) != expected:
             raise WorkflowError("最后一次 Review 后代码发生改变，不能提交。")
         batch = state.get("commit_batch")
-        review = self.current_reviews()[-1]
         if state["commits"] and not batch:
             raise WorkflowError("历史交付已部分提交，但缺少新规范提交信息，请先人工处理部分提交；不会改写已有 commit 或使用旧标题。")
         if batch:
@@ -1582,19 +1598,6 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             if protocol == 2 and manifest(state["repos"]) != state["review_manifest"]:
                 raise WorkflowError("Review 期间代码发生变化，本次结果不作为提交依据。")
             result = parse_review(text, protocol)
-            if protocol == 3:
-                try:
-                    state["review_manifest"] = select_scope(state["repos"], result["commit_scope"])
-                except ReviewChanged as change:
-                    self.note("控制器", f"{change} 正在按当前差异重新 Review。", display_text="审查依据已更新，正在自动复审。")
-                    self._before_review()
-                    return
-                approved_scope = {repo["name"]: repo["commit_scope"] for repo in state["repos"] if repo.get("change_record")}
-                for scope in result["commit_scope"]:
-                    scope["include"] = approved_scope[scope["repository"]]
-                state.pop("scope_review_required", None)
-            commit_messages = prepare_commit_messages(state, result["commit_messages"])
-            collect_change_summary(self.store, state)
             review_number = len(state["reviews"]) + 1
             reviews = self.current_reviews()
             previous = {finding["id"]: finding for finding in reviews[-1]["result"]["findings"]} if reviews else {}
@@ -1613,10 +1616,25 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
             for old_id, finding in previous.items():
                 if old_id not in seen and old_id not in resolved:
                     result["findings"].append(finding.copy())
+            skipped_ids = [finding["id"] for finding in result["findings"] if finding.get("origin") == "原有问题"]
+            if protocol == 3:
+                try:
+                    state["review_manifest"] = select_scope(state["repos"], result["commit_scope"],
+                                                            record_claims=len(skipped_ids) == len(result["findings"]))
+                except ReviewChanged as change:
+                    self.note("控制器", f"{change} 正在按当前差异重新 Review。", display_text="审查依据已更新，正在自动复审。")
+                    self._before_review()
+                    return
+                approved_scope = {repo["name"]: repo["commit_scope"] for repo in state["repos"] if repo.get("change_record")}
+                for scope in result["commit_scope"]:
+                    scope["include"] = approved_scope[scope["repository"]]
+                state.pop("scope_review_required", None)
+            commit_messages = prepare_commit_messages(state, result["commit_messages"])
+            collect_change_summary(self.store, state)
             state["reviews"].append({"number": review_number, "fix_round": state["fix_round"],
                                      "protocol_version": protocol, "commit_messages": commit_messages,
                                      "delivery_round": state.get("delivery_round", 1), "history_index": history_index,
-                                     "prompt_hash": state["review_prompt_hash"], "result": result,
+                                     "prompt_hash": state["review_prompt_hash"], "result": result, "skipped_ids": skipped_ids,
                                      "manifest": state["review_manifest"].copy()})
             state["stage"] = "等待修复选择"
             self.save()
@@ -1624,11 +1642,7 @@ class Workflow(RepositorySelectionFlow, WorkspaceReleaseFlow, WorkspaceHandoffFl
                 state["review_waiting_compile"] = review_number
                 self._begin_compile()
                 return
-            skipped = skipped_review_ids(state, state.get("delivery_round", 1))
-            if not any(finding["id"] not in skipped for finding in result["findings"]) and not state.get("pause_requested") and not self.closed:
-                self.note("控制器", "Review 无待处理问题，已选择不修复的问题保留记录，自动执行本地提交。",
-                          display_text="Review 无待处理问题，正在执行本地提交。")
-                self.finalize([], "", automatic=True)
+            self._continue_review()
 
     def _close_rpc(self):
         if self.state:

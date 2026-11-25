@@ -114,10 +114,10 @@ class CompileFlow:
             self._guard_compile()
             state.update(phase="review", stage="等待修复选择")
             self.save()
-            from workflow.engine import skipped_review_ids
-            skipped = skipped_review_ids(state, state.get("delivery_round", 1))
-            if not any(item["id"] not in skipped for item in self.current_reviews()[-1]["result"]["findings"]):
-                self.finalize([], "", automatic=True)
+            if "skipped_ids" in self.current_reviews()[-1]:
+                self._continue_review()
+            else:
+                self._begin_review()
             return
         if state.get("followup") and "review_enabled" in state:
             changes = manifest(state["repos"])

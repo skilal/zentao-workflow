@@ -364,14 +364,14 @@ def fragment_details(repo, identifiers, *, review=False):
             for identifier in identifiers]
 
 
-def select_scope(repositories, selections):
+def select_scope(repositories, selections, *, record_claims=True):
     with ExitStack() as locks:
         for path in sorted({repo["path"] for repo in repositories}):
             locks.enter_context(repository_lock(path))
-        return select_locked_scope(repositories, selections)
+        return select_locked_scope(repositories, selections, record_claims=record_claims)
 
 
-def select_locked_scope(repositories, selections):
+def select_locked_scope(repositories, selections, *, record_claims):
     shared = {repo["name"]: repo for repo in repositories if repo.get("change_record")}
     by_repository = {selection["repository"]: selection for selection in selections}
     unknown = by_repository.keys() - shared.keys()
@@ -418,9 +418,11 @@ def select_locked_scope(repositories, selections):
     selected_manifest = {}
     for repo, current, included, excluded in prepared:
         repo["commit_scope"] = included
-        record = load_record(repo)
-        record["scope_claims"] = included
-        record["excluded_claims"] = excluded
-        save_record(repo["change_record"], record)
+        # 待修复的审查仅确定预览范围，修复和复审仍需识别原有的本轮片段。
+        if record_claims:
+            record = load_record(repo)
+            record["scope_claims"] = included
+            record["excluded_claims"] = excluded
+            save_record(repo["change_record"], record)
         selected_manifest.update(fragment_manifest(repo, current.values()))
     return selected_manifest

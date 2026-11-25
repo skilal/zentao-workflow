@@ -225,7 +225,7 @@ class FollowupChecks(TestCase):
         self.assertEqual(self.state["phase"], "review")
         self.assertTrue(any(entry["role"] == "系统" and "计划实施已完成" in entry["text"]
                             for entry in self.state["history"]))
-        self.assertIn("已进入 Review", self.state["history"][-1]["display_text"])
+        self.assertIn("正在审查本轮代码", self.state["history"][-1]["display_text"])
         self.complete(dumps({"summary": "本轮审查通过", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual((self.state["phase"], self.state["stage"]), ("complete", "已完成（静态审查）"))
         self.assertEqual(len(self.engine.current_reviews()), 1)
@@ -635,17 +635,19 @@ class FollowupChecks(TestCase):
         self.complete(dumps({"summary": "无遗留问题", "findings": [], "resolved_previous": [], "commit_messages": commit_messages(self.state)}))
         self.assertEqual(self.state["stage"], "已完成（静态审查）")
 
-    def test_requested_review_findings_still_require_user_selection(self):
+    def test_requested_review_fixes_current_findings_automatically(self):
         self.send("重新 Review 并提交", review_enabled=False)
         Tools(self.state["id"]).call("request_review", {"instruction": "重新 Review 并提交", "commit_message": "", "include_paths": []})
         self.complete("已登记请求。")
         result = deepcopy(self.state["reviews"][0]["result"])
         result["findings"][0].pop("id")
+        result["findings"][0]["origin"] = "本次引入"
         result["commit_messages"] = commit_messages(self.state)
         with patch("workflow.engine.commit") as committing:
             self.complete(dumps(result))
         committing.assert_not_called()
-        self.assertEqual(self.state["stage"], "等待修复选择")
+        self.assertEqual(self.state["stage"], "修复中")
+        self.assertEqual(self.state["decisions"][-1]["source"], "auto")
 
     def test_requested_review_rejects_code_changed_after_request(self):
         self.send("修改提示", review_enabled=False)

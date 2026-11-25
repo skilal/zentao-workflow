@@ -69,6 +69,9 @@ class AutoDeliveryChecks(TestCase):
     def review(self, findings=None, resolved=None):
         self.state.update(phase="review", stage="审查中", review_manifest={}, review_prompt_hash="提示词版本")
         self.flow._start_turn("开始审查")
+        return self.review_output(findings, resolved)
+
+    def review_output(self, findings=None, resolved=None):
         return dumps({"summary": "静态审查结论", "findings": findings or [],
                       "resolved_previous": resolved or [], "commit_messages": commit_messages(self.state)}, ensure_ascii=False)
 
@@ -320,66 +323,78 @@ class AutoDeliveryChecks(TestCase):
             self.complete(text)
         finalize.assert_called_once_with([], "", automatic=True)
 
-    def test_review_with_findings_can_skip_all_without_a_reason(self):
-        text = self.review([finding()])
-        with patch("workflow.engine.manifest", return_value={}), patch("workflow.engine.commit") as operation:
-            self.complete(text)
-            operation.assert_not_called()
-            with self.assertRaises(WorkflowError):
-                self.flow.finalize([], "")
-            self.flow.finalize(["R01-01"], "")
-        self.assertEqual(self.state["acceptance"]["source"], "manual")
-        self.assertEqual(self.state["acceptance"]["reason"], "")
+    def test_legacy_issue_only_records_and_commits_automatically(self):
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([{**finding(), "origin": "原有问题", "severity": "P0"}]))
+        self.assertEqual(self.state["acceptance"], {"ids": ["R01-01"], "reason": "", "source": "auto"})
+        self.assertEqual(public_state(self.state)["reviews"][-1]["skipped_ids"], ["R01-01"])
+        self.assertEqual(self.state["fix_round"], 0)
         self.assertEqual(self.state["phase"], "complete")
 
-    def test_unselected_issue_does_not_block_commit_after_selected_issue_is_fixed(self):
-        text = self.review([finding(), {**finding(), "title": "本轮不修复的问题"}])
+    def test_review_automatically_repairs_all_current_issues_and_records_legacy_issue(self):
+        historical = {**finding(), "title": "基线遗留问题", "origin": "原有问题"}
+        beyond_scope = {**finding(), "title": "多加的配置项", "category": "超出最小范围", "severity": "P3"}
+        unverified = {**finding(), "title": "影响待核实", "origin": "证据不足"}
         with patch("workflow.engine.manifest", return_value={}):
-            self.complete(text)
-            self.flow.fix(["R01-01"], "")
-        text = self.review(resolved=[{"id": "R01-01", "evidence": "已补齐选中的业务分支"}])
-        prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
-        self.assertIn('本轮不修复编号：["R01-02"]', prompt)
-        with patch("workflow.engine.manifest", return_value={}):
-            self.complete(text)
+            self.complete(self.review([finding(), historical, beyond_scope, unverified]))
+            self.assertEqual((self.state["phase"], self.state["stage"]), ("fix", "修复中"))
+            self.assertEqual(self.state["decisions"][-1]["fix_ids"], ["R01-01", "R01-03", "R01-04"])
+            prompt = self.flow.rpc.request.call_args.args[1]["input"][0]["text"]
+            self.assertIn(beyond_scope["title"], prompt)
+            self.assertIn(unverified["title"], prompt)
+            self.assertNotIn(historical["title"], prompt)
+            self.complete("已处理本轮问题。")
+            self.assertEqual(self.state["phase"], "review")
+            self.complete(self.review_output([{**unverified, "previous_id": "R01-04", "origin": "原有问题"}],
+                [{"id": "R01-01", "evidence": "已补齐业务分支"}, {"id": "R01-03", "evidence": "已移除额外配置"}]))
         self.assertEqual(self.state["phase"], "complete")
-        self.assertEqual(self.state["reviews"][-1]["result"]["findings"][0]["id"], "R01-02")
-        self.assertEqual(self.state["acceptance"], {"ids": ["R01-02"], "reason": "", "source": "auto"})
-        self.assertEqual(public_state(self.state)["reviews"][-1]["skipped_ids"], ["R01-02"])
+        self.assertEqual(self.state["acceptance"], {"ids": ["R01-04", "R01-02"], "reason": "", "source": "auto"})
+        self.assertEqual(public_state(self.state)["reviews"][-1]["skipped_ids"], ["R01-04", "R01-02"])
 
-    def test_unresolved_selected_issue_still_waits_and_skipped_issue_cannot_be_selected(self):
-        with patch("workflow.engine.manifest", return_value={}):
-            self.complete(self.review([finding(), {**finding(), "title": "未选问题"}]))
-            self.flow.fix(["R01-01"], "")
-            self.complete(self.review())
-        self.assertEqual(self.state["stage"], "等待修复选择")
-        self.assertEqual(len(self.state["reviews"][-1]["result"]["findings"]), 2)
-        with self.assertRaisesRegex(WorkflowError, "有效问题"):
-            self.flow.fix(["R01-02"], "")
-        with self.assertRaises(WorkflowError):
-            self.flow.finalize([], "", automatic=True)
-
-    def test_new_issue_after_selected_fix_still_waits_for_selection(self):
-        with patch("workflow.engine.manifest", return_value={}):
-            self.complete(self.review([finding(), {**finding(), "title": "未选问题"}]))
-            self.flow.fix(["R01-01"], "")
-            self.complete(self.review([finding()], [{"id": "R01-01", "evidence": "选中问题已修复"}]))
-        self.assertEqual(self.state["stage"], "等待修复选择")
-        payload = public_state(self.state)
-        self.assertEqual(payload["reviews"][-1]["skipped_ids"], ["R01-02"])
-        self.assertEqual([entry["id"] for entry in payload["reviews"][-1]["result"]["findings"]], ["R02-01", "R01-02"])
-
-    def test_skipped_issues_survive_reload_but_do_not_cross_delivery_rounds(self):
-        with patch("workflow.engine.manifest", return_value={}):
-            self.complete(self.review([finding(), {**finding(), "title": "未选问题"}]))
-            self.flow.fix(["R01-01"], "")
-        restored = self.flow.store.load(self.state["id"])
-        self.assertEqual(public_state(restored)["reviews"][-1]["skipped_ids"], ["R01-02"])
-        self.state["delivery_round"] = 2
+    def test_unresolved_issue_reaches_limit_and_requires_an_extra_round(self):
+        self.state["max_fix_rounds"] = 1
         with patch("workflow.engine.manifest", return_value={}):
             self.complete(self.review([finding()]))
-        self.assertEqual(self.state["stage"], "等待修复选择")
-        self.assertEqual(public_state(self.state)["reviews"][-1]["skipped_ids"], [])
+            self.complete("暂未处理。")
+            self.complete(self.review_output())
+            self.assertEqual(self.state["stage"], "等待修复选择")
+            self.assertEqual(self.state["fix_round"], 1)
+            with self.assertRaisesRegex(WorkflowError, "仍有待修复问题"):
+                self.flow.finalize(["R01-01"], "")
+            self.flow.add_round()
+        self.assertEqual((self.state["stage"], self.state["fix_round"], self.state["max_fix_rounds"]), ("修复中", 2, 2))
+        self.assertEqual(self.state["decisions"][-1]["fix_ids"], ["R01-01"])
+
+    def test_new_issue_during_rereview_automatically_starts_next_fix(self):
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([finding()]))
+            self.complete("已补齐分支。")
+            self.complete(self.review_output([finding()], [{"id": "R01-01", "evidence": "旧问题已解决"}]))
+        self.assertEqual((self.state["stage"], self.state["fix_round"]), ("修复中", 2))
+        self.assertEqual(self.state["decisions"][-1]["fix_ids"], ["R02-01"])
+
+    def test_review_repair_starts_after_scope_compile_check(self):
+        self.state["max_fix_rounds"] = 0
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review([finding()]))
+            self.state.update(phase="compile", stage="编译检查中", review_waiting_compile=1, max_fix_rounds=1)
+            with patch("workflow.compile_flow.manifest", return_value={}), patch.object(self.flow, "_guard_compile"):
+                self.flow._after_compile()
+        self.assertNotIn("review_waiting_compile", self.state)
+        self.assertEqual(self.state["stage"], "修复中")
+        self.assertEqual(self.state["decisions"][-1]["fix_ids"], ["R01-01"])
+
+    def test_old_manual_skip_remains_in_history_and_new_review_reassesses_issue(self):
+        current = {**finding(), "id": "R01-02"}
+        self.state.update(fix_round=1, reviews=[{"number": 1, "fix_round": 0, "result": {"findings": [current]}}],
+                          decisions=[{"round": 1, "fix_ids": ["R01-01"], "note": ""}])
+        with patch("workflow.engine.manifest", return_value={}):
+            self.complete(self.review())
+        restored = self.flow.store.load(self.state["id"])
+        history, latest = public_state(restored)["reviews"]
+        self.assertEqual(history["skipped_ids"], ["R01-02"])
+        self.assertEqual(latest["skipped_ids"], [])
+        self.assertEqual(restored["decisions"][-1]["fix_ids"], ["R01-02"])
 
     def test_changed_files_and_invalid_review_results_never_commit(self):
         text = self.review()

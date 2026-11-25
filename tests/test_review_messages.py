@@ -74,7 +74,7 @@ class ReviewMessageChecks(TestCase):
         self.assertEqual(self.state["history"][1]["text"], text)
         self.assertEqual(self.state["history"][1]["phase"], "review")
         self.assertEqual(review["result"]["findings"][0]["id"], "R01-01")
-        finalize.assert_not_called()
+        finalize.assert_called_once_with([], "", automatic=True)
         self.assertEqual(self.flow.store.load(self.state["id"])["reviews"], self.state["reviews"])
 
     def test_invalid_review_never_creates_selectable_results(self):

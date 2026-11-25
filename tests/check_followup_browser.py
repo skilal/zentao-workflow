@@ -14,7 +14,7 @@ from playwright.sync_api import expect, sync_playwright
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from test_followup import FollowupChecks, PNG
-from workflow.mcp_server import Tools
+from review_fixtures import VersionedTools as Tools
 from workflow.web import LocalServer
 
 
@@ -238,7 +238,7 @@ def run():
             fixture.complete("已完成业务规则修改。")
             expect(page.get_by_text("审查中", exact=True).first).to_be_visible()
             expect(page.locator(".conversation-feed").get_by_text("本轮计划实施已完成，继续处理后续检查。", exact=True).last).to_be_visible()
-            expect(page.locator(".conversation-feed").get_by_text("已进入 Review，正在审查本轮代码；无待处理问题后自动本地提交。", exact=True).last).to_be_visible()
+            expect(page.locator(".conversation-feed").get_by_text("正在审查本轮代码，发现可修复问题后自动处理。", exact=True).last).to_be_visible()
             fixture.complete(dumps({"summary": "本轮无问题", "findings": [], "resolved_previous": [],
                                     "commit_messages": [{"repository": repo["name"], "type": "fix", "scope": "业务", "summary": "完善页面处理"}
                                                         for repo in state["repos"] if any(key.startswith(repo["name"] + "/") for key in state["review_manifest"])]}))

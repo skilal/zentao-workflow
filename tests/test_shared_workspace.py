@@ -447,6 +447,48 @@ class SharedWorkspaceChecks(TestCase):
             select_scope([repo], [])
         self.assertNotIn("commit_scope", repo)
 
+    def test_auto_fix_removes_excluded_current_change_and_rereviews_empty_scope(self):
+        self.replace(self.first, "共享.txt", "原始第3行", "超范围")
+        self.replace(self.second, "共享.txt", "原始第12行", "其他会话修改")
+        git(self.path, "add", "共享.txt")
+        staged = git(self.path, "diff", "--cached", binary=True)
+        repo = self.first["repos"][0]
+        self.first.update(snapshot={"sources": [], "materials": [], "blockers": [], "feishu_links": []},
+                          followup={"text": "调整本轮功能"}, review_enabled=True, max_fix_rounds=3)
+        settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
+        flow = Workflow(settings, Mock(), store=self.store)
+        self.addCleanup(flow.close)
+        flow.state = self.first
+
+        def record_turn(*args):
+            self.first["stage"] = {"review": "审查中", "fix": "修复中"}[self.first["phase"]]
+            flow.save()
+
+        with patch.object(flow, "_start_turn", side_effect=record_turn):
+            flow._begin_review()
+            own = next(entry for entry in candidates(repo) if entry["source"] == "本轮")
+            flow.last_message = dumps({"summary": "发现超范围改动", "findings": [{
+                "title": "移除额外修改", "category": "超出最小范围", "origin": "本次引入", "severity": "P3",
+                "previous_id": "", "repository": "前端", "path": "共享.txt", "line": 4,
+                "evidence": "本轮额外修改第 4 行", "suggestion": "恢复该行", "impact": "超出需求范围"}],
+                "resolved_previous": [], "commit_messages": [], "commit_scope": [
+                    {"repository": "前端", "include": [], "exclude": [{"id": own["id"], "reason": "超范围"}]}]})
+            flow._completed({"status": "completed"}, self.first["id"], flow.connection_epoch)
+            self.assertEqual(self.first["stage"], "修复中")
+            self.assertEqual(next(entry for entry in candidates(repo) if entry["id"] == own["id"])["source"], "本轮")
+
+            self.replace(self.first, "共享.txt", "超范围", "原始第3行")
+            flow.last_message = "本轮超范围改动已移除。"
+            flow._completed({"status": "completed"}, self.first["id"], flow.connection_epoch)
+            self.assertEqual(self.first["stage"], "审查中")
+            flow.last_message = dumps({"summary": "已核对原有内容", "findings": [], "commit_scope": [],
+                "commit_messages": [], "resolved_previous": [{"id": "R01-01", "evidence": "第 4 行已恢复"}]})
+            flow._completed({"status": "completed"}, self.first["id"], flow.connection_epoch)
+        self.assertEqual(self.first["stage"], "已完成（静态审查）")
+        self.assertEqual(self.first["commits"]["前端"], "无代码修改")
+        self.assertIn("其他会话修改", (self.path / "共享.txt").read_text(encoding="utf-8"))
+        self.assertEqual(git(self.path, "diff", "--cached", binary=True), staged)
+
     def test_review_refreshes_after_another_session_changes_adjacent_code(self):
         self.replace(self.first, "共享.txt", "原始第3行", "本轮改动")
         settings = loads((ROOT / "settings.example.json").read_text(encoding="utf-8"))
