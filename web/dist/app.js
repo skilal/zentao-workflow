@@ -3,7 +3,7 @@
 const { useState, useEffect, useLayoutEffect, useRef } = React;
 const { Layout, Menu, Card, Button, Space, Tag, Table, Input, Select, Radio, Checkbox,
   Typography, Empty, Alert, Steps, Badge, Image, Form, InputNumber, ConfigProvider,
-  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Dropdown, Switch, Tabs, Grid } = antd;
+  Drawer, Collapse, Spin, notification, Divider, Descriptions, List, Modal, Tooltip, Popover, Dropdown, Switch, Tabs, Grid } = antd;
 const h = React.createElement;
 DOMPurify.addHook("afterSanitizeAttributes", node => {
   if (node.nodeName === "INPUT") {
@@ -1691,6 +1691,15 @@ function WorkflowApp() {
     const baselineDetection = state.repository_detection?.purpose === "baseline" ? state.repository_detection : null;
     const baselinePaths = Object.fromEntries(state.repos.map(repo => [repo.name, draft.baseline_paths?.[repo.name] ??
       (baselineDetection ? baselineDetection.repositories.find(entry => entry.role === repo.role).path : repo.path)]));
+    const unreviewed = stage === "已完成（未审查）";
+    const roundLabel = `第 ${state.delivery_round} 轮已完成`;
+    const roundStatus = state.phase === "complete" ? h(Popover, {
+      title: "本轮执行结果", trigger: "click", placement: "bottomRight",
+      content: h("div", { className: "conversation-result-detail" }, unreviewed
+        ? `${state.review_enabled ? "本轮无代码修改，已跳过 Review" : "本轮自动 Review 已关闭"}，未执行本地提交。`
+        : "Review 已完成，本地提交已完成。")
+    }, h(Button, { size: "small", "aria-label": `${roundLabel}，查看本轮执行结果` },
+      h(Badge, { status: unreviewed ? "default" : "success", text: roundLabel }))) : stageTag(stage);
     return h("div", { className: "card-stack conversation-layout", key: state.id },
       h(Modal, { title: "变更仓库目录与审查基线", open: baselineDirectoriesOpen,
         onCancel: () => setBaselineDirectoriesOpen(false), footer: h(Space, null,
@@ -1712,12 +1721,11 @@ function WorkflowApp() {
           changeDraft({ baseline_paths: {} });
           return act("detect_repositories", { purpose: "baseline", paths });
         } }, "重新检测目录")),
-        h(CardBox, { title: "工作流会话", className: "app-card conversation-card", extra: stageTag(stage) },
-          state.codex && h(Typography.Paragraph, { type: "secondary" }, `模型：${state.codex.model} · 推理强度：${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}（${state.codex.reasoning_effort}）`),
-          state.phase === "complete" && h(Alert, { showIcon: true, type: stage === "已完成（未审查）" ? "info" : "success",
-            message: `第 ${state.delivery_round} 轮已完成`, "aria-label": "本轮执行结果", style: { marginBottom: 16 },
-            description: stage === "已完成（未审查）" ? `${state.review_enabled ? "本轮无代码修改，已跳过 Review" : "本轮自动 Review 已关闭"}；未执行本地提交。` :
-              "Review 已完成，本地提交已完成，可在下方查看审查结论及本地提交记录。" }),
+        h(CardBox, { title: "工作流会话", className: "app-card conversation-card",
+          extra: h("div", { className: "conversation-header-meta" },
+            state.codex && h(Typography.Text, { type: "secondary" },
+              `${state.codex.model} · 推理强度${EFFORT_NAMES[state.codex.reasoning_effort] || state.codex.reasoning_effort}`),
+            roundStatus) },
           h("div", { className: "conversation-feed", ref: feedRef, onScroll: event => {
             const feed = event.currentTarget;
             followBottom.current = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 48;
